@@ -190,7 +190,6 @@ fn build_ui(app: &Application) {
     connection_box.append(&scrolled);
 
     let terminal_box = GtkBox::new(Orientation::Vertical, 0);
-    // TEXT VIEW MUST BE FOCUSABLE AND CAPTURE KEYS
     let text_view = TextView::builder().editable(false).monospace(true).cursor_visible(true).focusable(true).can_focus(true).build();
     let term_scrolled = ScrolledWindow::builder().child(&text_view).vexpand(true).build();
     terminal_box.append(&term_scrolled);
@@ -224,7 +223,6 @@ fn build_ui(app: &Application) {
 
     let itx = input_tx.clone();
     let key_controller = EventControllerKey::new();
-    // ENSURE KEY CONTROLLER CAPTURES ALL KEYS
     key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     key_controller.connect_key_pressed(move |_controller, keyval, _keycode, state| {
         if let Some(data) = keyval_to_bytes(keyval, state) {
@@ -289,33 +287,57 @@ fn build_ui(app: &Application) {
         tv.buffer().set_text(&format!("Connecting to {}@{}...\n", user, host));
         let out_tx = output_tx.clone();
         let in_rx = input_rx.clone();
+        
         std::thread::spawn(move || {
             match connect_ssh(&host, port, &user, &pass) {
-                Ok((_session, mut channel)) => {
+                Ok((mut session, mut channel)) => {
                     let _ = out_tx.send(b"Connection established.\r\n".to_vec());
-                    let mut channel_reader = channel.clone();
-                    let out_tx_reader = out_tx.clone();
-                    std::thread::spawn(move || {
-                        let mut buffer = [0; 8192];
-                        loop {
-                            match channel_reader.read(&mut buffer) {
-                                Ok(0) => break,
-                                Ok(size) => { let _ = out_tx_reader.send(buffer[..size].to_vec()); }
-                                Err(_) => break,
+                    session.set_blocking(false);
+                    
+                    let mut buffer = [0; 8192];
+                    loop {
+                        // Check for output from server
+                        match channel.read(&mut buffer) {
+                            Ok(0) => {
+                                eprintln!("SSH: Channel closed by server");
+                                break;
+                            }
+                            Ok(size) => {
+                                let _ = out_tx.send(buffer[..size].to_vec());
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                // Try writing input to server
+                                while let Ok(data) = in_rx.try_recv() {
+                                    eprintln!("SSH: Sending {} bytes to server", data.len());
+                                    let mut pos = 0;
+                                    while pos < data.len() {
+                                        match channel.write(&data[pos..]) {
+                                            Ok(written) => pos += written,
+                                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                                std::thread::sleep(Duration::from_millis(10));
+                                                continue;
+                                            }
+                                            Err(e) => {
+                                                eprintln!("SSH: Write error: {}", e);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    let _ = channel.flush();
+                                }
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            Err(e) => {
+                                eprintln!("SSH: Read error: {}", e);
+                                break;
                             }
                         }
-                        let _ = out_tx_reader.send(b"\r\n[Connection closed]\r\n".to_vec());
-                    });
-                    while let Ok(data) = in_rx.recv() {
-                        eprintln!("SSH: Received {} bytes from input channel", data.len());
-                        if let Err(e) = channel.write_all(&data) { 
-                            eprintln!("SSH: Write error: {}", e);
-                            break; 
-                        }
-                        let _ = channel.flush();
                     }
+                    let _ = out_tx.send(b"\r\n[Connection closed]\r\n".to_vec());
                 }
-                Err(e) => { let _ = out_tx.send(format!("Connection failed: {}\r\n", e).as_bytes().to_vec()); }
+                Err(e) => {
+                    let _ = out_tx.send(format!("Connection failed: {}\r\n", e).as_bytes().to_vec());
+                }
             }
         });
     });
@@ -353,8 +375,8 @@ fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], host_e: &Entry
     }
     let sessions_vec = sessions.to_vec();
     let h_e_weak = host_e.downgrade();
-    let p_e_weak = port_e.downgrade();
-    let u_e_weak = user_e.downgrade();
+    let p_e_weak = port_entry_downgrade(port_e);
+    let u_e_weak = user_entry_downgrade(user_e);
     list.connect_row_activated(move |_, row| {
         let h_e = match h_e_weak.upgrade() { Some(v) => v, None => return };
         let p_e = match p_e_weak.upgrade() { Some(v) => v, None => return };
@@ -364,6 +386,9 @@ fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], host_e: &Entry
         }
     });
 }
+
+fn port_entry_downgrade(e: &Entry) -> gtk::glib::object::WeakRef<Entry> { e.downgrade() }
+fn user_entry_downgrade(e: &Entry) -> gtk::glib::object::WeakRef<Entry> { e.downgrade() }
 
 fn keyval_to_bytes(keyval: gdk::Key, state: gdk::ModifierType) -> Option<Vec<u8>> {
     use gdk::Key;
