@@ -61,16 +61,27 @@ fn setup_app(app: &Application) {
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
 
-    let menu = gio::Menu::new();
-    menu.append(Some("New Connection"), Some("app.new_connection"));
+    let menubar = gio::Menu::new();
+    
+    // Application/File Menu
+    let file_menu = gio::Menu::new();
+    file_menu.append(Some("New Connection"), Some("app.new_connection"));
     
     let sessions_item = gio::MenuItem::new(Some("Saved Sessions"), None);
     let sessions_submenu = gio::Menu::new();
     setup_sessions_actions(app, &sessions_submenu);
     sessions_item.set_submenu(Some(&sessions_submenu));
-    menu.append_item(&sessions_item);
+    file_menu.append_item(&sessions_item);
+    
+    file_menu.append(Some("Quit"), Some("app.quit"));
+    menubar.append_submenu(Some("File"), &file_menu);
 
-    app.set_menubar(Some(&menu));
+    // Settings Menu
+    let settings_menu = gio::Menu::new();
+    settings_menu.append(Some("Toggle Dark Mode"), Some("app.toggle_dark_mode"));
+    menubar.append_submenu(Some("Settings"), &settings_menu);
+
+    app.set_menubar(Some(&menubar));
 
     let action_new = gio::SimpleAction::new("new_connection", None);
     let app_weak = app.downgrade();
@@ -91,6 +102,15 @@ fn setup_app(app: &Application) {
     });
     app.add_action(&action_quit);
     app.set_accels_for_action("app.quit", &["<Primary>q"]);
+
+    // Dark Mode Toggle Action
+    let toggle_action = gio::SimpleAction::new("toggle_dark_mode", None);
+    toggle_action.connect_activate(move |_, _| {
+        let settings = gtk::Settings::default().expect("Could not get default settings");
+        let is_dark = settings.is_gtk_application_prefer_dark_theme();
+        settings.set_gtk_application_prefer_dark_theme(!is_dark);
+    });
+    app.add_action(&toggle_action);
 }
 
 fn setup_sessions_actions(app: &Application, menu: &gio::Menu) {
