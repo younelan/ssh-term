@@ -2,7 +2,7 @@ use gtk4 as gtk;
 use gtk::prelude::*;
 use gtk::{
     glib, Application, ApplicationWindow, Box as GtkBox, Button, Entry, Label, ListBox, Orientation,
-    ScrolledWindow, Stack, TextView, CssProvider, EventControllerKey, TextBuffer, TextTag,
+    ScrolledWindow, TextView, CssProvider, EventControllerKey, TextBuffer, TextTag, Notebook,
 };
 use serde::{Deserialize, Serialize};
 use ssh2::Session as SshSession;
@@ -136,16 +136,39 @@ fn main() {
         let provider = CssProvider::new();
         provider.load_from_data("
             window { background-color: #1a1a1a; color: #ffffff; }
-            .connection-box { padding: 40px; }
-            entry { border-radius: 8px; padding: 10px; background-color: #2d2d2d; color: #ffffff; border: 1px solid #3d3d3d; margin-bottom: 12px; }
+            .connection-box { padding: 40px; background-color: #1a1a1a; }
+            entry { 
+                border-radius: 8px; 
+                padding: 10px; 
+                background-color: #2d2d2d; 
+                color: #ffffff; 
+                caret-color: #ffffff;
+                border: 1px solid #3d3d3d; 
+                margin-bottom: 12px; 
+            }
+            entry:focus { border-color: #3d5afe; }
             button.suggested-action { background-color: #3d5afe; color: white; border-radius: 8px; padding: 14px; font-weight: bold; margin-top: 10px; }
             button.secondary-action { background-color: #424242; color: white; border-radius: 8px; padding: 10px; margin-top: 10px; }
-            button.destructive-action { background-color: transparent; padding: 4px; border-radius: 4px; }
+            button.destructive-action { background-color: transparent; padding: 4px; border-radius: 4px; color: #ffffff; }
             button.destructive-action:hover { background-color: #e53935; }
             textview { background-color: #000000; color: #0dcf21; font-family: 'Monospace', monospace; font-size: 14px; padding: 10px; }
             listbox { background-color: #242424; border-radius: 8px; border: 1px solid #3d3d3d; margin-top: 10px; }
             .session-row { padding: 8px 12px; border-bottom: 1px solid #333; }
             label.title { font-size: 32px; font-weight: bold; margin-bottom: 40px; color: #3d5afe; }
+            notebook { background: #1a1a1a; }
+            notebook header tabs { background: #1a1a1a; }
+            notebook header tabs tab { 
+                padding: 8px 16px; 
+                border-right: 1px solid #333333; 
+                background-color: #2d2d2d; 
+                color: #aaaaaa; 
+            }
+            notebook header tabs tab label { color: #aaaaaa; }
+            notebook header tabs tab:hover { background-color: #3d3d3d; color: #ffffff; }
+            notebook header tabs tab:hover label { color: #ffffff; }
+            notebook header tabs tab:checked { background-color: #3d5afe; color: white; }
+            notebook header tabs tab:checked label { color: white; }
+            notebook stack { background: #1a1a1a; }
         ");
         gtk::style_context_add_provider_for_display(
             &gtk::gdk::Display::default().expect("Could not connect to a display."),
@@ -159,7 +182,9 @@ fn main() {
 
 fn build_ui(app: &Application) {
     let window = ApplicationWindow::builder().application(app).title("Terminal SSH").default_width(1000).default_height(750).build();
-    let stack = Stack::new();
+    let notebook = Notebook::builder().tab_pos(gtk::PositionType::Top).build();
+    window.set_child(Some(&notebook));
+
     let connection_box = GtkBox::new(Orientation::Vertical, 0);
     connection_box.add_css_class("connection-box");
     let title = Label::builder().label("Terminal SSH").css_classes(["title"]).halign(gtk::Align::Center).build();
@@ -189,29 +214,90 @@ fn build_ui(app: &Application) {
     let scrolled = ScrolledWindow::builder().min_content_height(250).child(&sessions_list).vexpand(true).build();
     connection_box.append(&scrolled);
 
+    notebook.append_page(&connection_box, Some(&Label::new(Some("Connect"))));
+
+    let sessions = Arc::new(Mutex::new(load_sessions()));
+    let s_init = sessions.lock().unwrap();
+    populate_list(&sessions_list, &s_init, &host_entry, &port_entry, &user_entry, sessions.clone());
+    drop(s_init);
+
+    let sessions_weak = Arc::downgrade(&sessions);
+    let h_e_weak = host_entry.downgrade();
+    let p_e_weak = port_entry.downgrade();
+    let u_e_weak = user_entry.downgrade();
+    let list_weak = sessions_list.downgrade();
+    let sess_clone_for_save = sessions.clone();
+    save_btn.connect_clicked(move |_| {
+        let sessions_up = match sessions_weak.upgrade() { Some(v) => v, None => return };
+        let host_e = match h_e_weak.upgrade() { Some(v) => v, None => return };
+        let port_e = match p_e_weak.upgrade() { Some(v) => v, None => return };
+        let user_e = match u_e_weak.upgrade() { Some(v) => v, None => return };
+        let list = match list_weak.upgrade() { Some(v) => v, None => return };
+        let host = host_e.text().to_string();
+        let port = port_e.text().parse::<u16>().unwrap_or(22);
+        let user = user_e.text().to_string();
+        if !host.is_empty() && !user.is_empty() {
+            let mut s = sessions_up.lock().unwrap();
+            if !s.iter().any(|x| x.host == host && x.username == user) {
+                s.push(ConnectionSettings { name: format!("{}@{}", user, host), host, port, username: user });
+                save_sessions(&s);
+                populate_list(&list, &s, &host_e, &port_e, &user_e, sess_clone_for_save.clone());
+            }
+        }
+    });
+
+    let notebook_weak_conn = notebook.downgrade();
+    let h_e_weak = host_entry.downgrade();
+    let p_e_weak = port_entry.downgrade();
+    let u_e_weak = user_entry.downgrade();
+    let pass_e_weak = pass_entry.downgrade();
+    connect_btn.connect_clicked(move |_| {
+        let notebook_up = match notebook_weak_conn.upgrade() { Some(v) => v, None => return };
+        let host_e = match h_e_weak.upgrade() { Some(v) => v, None => return };
+        let port_e = match p_e_weak.upgrade() { Some(v) => v, None => return };
+        let user_e = match u_e_weak.upgrade() { Some(v) => v, None => return };
+        let pass_e = match pass_e_weak.upgrade() { Some(v) => v, None => return };
+        let host = host_e.text().to_string();
+        let port = port_e.text().parse::<u16>().unwrap_or(22);
+        let user = user_e.text().to_string();
+        let pass = pass_e.text().to_string();
+        if host.is_empty() || user.is_empty() { return; }
+        
+        create_terminal_tab(&notebook_up, &host, port, &user, &pass);
+    });
+
+    window.present();
+}
+
+fn create_terminal_tab(notebook: &Notebook, host: &str, port: u16, user: &str, pass: &str) {
     let terminal_box = GtkBox::new(Orientation::Vertical, 0);
     let text_view = TextView::builder().editable(false).monospace(true).cursor_visible(true).focusable(true).can_focus(true).build();
     let term_scrolled = ScrolledWindow::builder().child(&text_view).vexpand(true).build();
     terminal_box.append(&term_scrolled);
 
-    stack.add_titled(&connection_box, Some("connect"), "Connect");
-    stack.add_titled(&terminal_box, Some("terminal"), "Terminal");
-    window.set_child(Some(&stack));
+    let label_box = GtkBox::new(Orientation::Horizontal, 6);
+    let label = Label::new(Some(&format!("{}@{}", user, host)));
+    label_box.append(&label);
+    let close_btn = Button::builder().icon_name("window-close-symbolic").css_classes(["destructive-action"]).build();
+    label_box.append(&close_btn);
+
+    let page_num = notebook.append_page(&terminal_box, Some(&label_box));
+    notebook.set_current_page(Some(page_num));
+    text_view.grab_focus();
 
     let (input_tx, input_rx) = flume::unbounded::<Vec<u8>>();
     let (output_tx, output_rx) = flume::unbounded::<Vec<u8>>();
-
     let term_state = Arc::new(Mutex::new(TerminalState::new(text_view.buffer())));
     let mut parser = Parser::new();
 
-    let text_view_weak = text_view.downgrade();
-    let ts_for_loop = term_state.clone();
-    let output_rx_local = output_rx.clone();
+    let tv_weak = text_view.downgrade();
+    let ts_weak = term_state.clone();
+    let out_rx_clone = output_rx.clone();
     glib::timeout_add_local(Duration::from_millis(10), move || {
-        let tv = match text_view_weak.upgrade() { Some(v) => v, None => return glib::ControlFlow::Break };
+        let tv = match tv_weak.upgrade() { Some(v) => v, None => return glib::ControlFlow::Break };
         let mut updated = false;
-        while let Ok(bytes) = output_rx_local.try_recv() {
-            let mut state = ts_for_loop.lock().unwrap();
+        while let Ok(bytes) = out_rx_clone.try_recv() {
+            let mut state = ts_weak.lock().unwrap();
             parser.advance(&mut *state, &bytes);
             updated = true;
         }
@@ -226,7 +312,6 @@ fn build_ui(app: &Application) {
     key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     key_controller.connect_key_pressed(move |_controller, keyval, _keycode, state| {
         if let Some(data) = keyval_to_bytes(keyval, state) {
-            eprintln!("INPUT: Captured {} bytes for keyval {:?}", data.len(), keyval);
             let _ = itx.send(data);
             return glib::Propagation::Stop;
         }
@@ -234,114 +319,60 @@ fn build_ui(app: &Application) {
     });
     text_view.add_controller(key_controller);
 
-    let sessions = Arc::new(Mutex::new(load_sessions()));
-    let s_init = sessions.lock().unwrap();
-    populate_list(&sessions_list, &s_init, &host_entry, &port_entry, &user_entry, sessions.clone());
-    drop(s_init);
-
-    let sessions_weak = Arc::downgrade(&sessions);
-    let h_e_weak = host_entry.downgrade();
-    let p_e_weak = port_entry.downgrade();
-    let u_e_weak = user_entry.downgrade();
-    let list_weak = sessions_list.downgrade();
-    let sess_clone_for_save = sessions.clone();
-    save_btn.connect_clicked(move |_| {
-        let sessions = match sessions_weak.upgrade() { Some(v) => v, None => return };
-        let host_e = match h_e_weak.upgrade() { Some(v) => v, None => return };
-        let port_e = match p_e_weak.upgrade() { Some(v) => v, None => return };
-        let user_e = match u_e_weak.upgrade() { Some(v) => v, None => return };
-        let list = match list_weak.upgrade() { Some(v) => v, None => return };
-        let host = host_e.text().to_string();
-        let port = port_e.text().parse::<u16>().unwrap_or(22);
-        let user = user_e.text().to_string();
-        if !host.is_empty() && !user.is_empty() {
-            let mut s = sessions.lock().unwrap();
-            if !s.iter().any(|x| x.host == host && x.username == user) {
-                s.push(ConnectionSettings { name: format!("{}@{}", user, host), host, port, username: user });
-                save_sessions(&s);
-                populate_list(&list, &s, &host_e, &port_e, &user_e, sess_clone_for_save.clone());
+    let nb_weak = notebook.downgrade();
+    let tb_weak = terminal_box.downgrade();
+    close_btn.connect_clicked(move |_| {
+        if let (Some(nb), Some(tb)) = (nb_weak.upgrade(), tb_weak.upgrade()) {
+            if let Some(pos) = nb.page_num(&tb) {
+                nb.remove_page(Some(pos));
             }
         }
     });
 
-    let stack_weak = stack.downgrade();
-    let h_e_weak = host_entry.downgrade();
-    let p_e_weak = port_entry.downgrade();
-    let u_e_weak = user_entry.downgrade();
-    let pass_e_weak = pass_entry.downgrade();
-    let tv_weak = text_view.downgrade();
-    connect_btn.connect_clicked(move |_| {
-        let stack = match stack_weak.upgrade() { Some(v) => v, None => return };
-        let host_e = match h_e_weak.upgrade() { Some(v) => v, None => return };
-        let port_e = match p_e_weak.upgrade() { Some(v) => v, None => return };
-        let user_e = match u_e_weak.upgrade() { Some(v) => v, None => return };
-        let pass_e = match pass_e_weak.upgrade() { Some(v) => v, None => return };
-        let tv = match tv_weak.upgrade() { Some(v) => v, None => return };
-        let host = host_e.text().to_string();
-        let port = port_e.text().parse::<u16>().unwrap_or(22);
-        let user = user_e.text().to_string();
-        let pass = pass_e.text().to_string();
-        if host.is_empty() || user.is_empty() { return; }
-        stack.set_visible_child_name("terminal");
-        tv.grab_focus();
-        tv.buffer().set_text(&format!("Connecting to {}@{}...\n", user, host));
-        let out_tx = output_tx.clone();
-        let in_rx = input_rx.clone();
-        
-        std::thread::spawn(move || {
-            match connect_ssh(&host, port, &user, &pass) {
-                Ok((mut session, mut channel)) => {
-                    let _ = out_tx.send(b"Connection established.\r\n".to_vec());
-                    session.set_blocking(false);
-                    
-                    let mut buffer = [0; 8192];
-                    loop {
-                        // Check for output from server
-                        match channel.read(&mut buffer) {
-                            Ok(0) => {
-                                eprintln!("SSH: Channel closed by server");
-                                break;
-                            }
-                            Ok(size) => {
-                                let _ = out_tx.send(buffer[..size].to_vec());
-                            }
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                // Try writing input to server
-                                while let Ok(data) = in_rx.try_recv() {
-                                    eprintln!("SSH: Sending {} bytes to server", data.len());
-                                    let mut pos = 0;
-                                    while pos < data.len() {
-                                        match channel.write(&data[pos..]) {
-                                            Ok(written) => pos += written,
-                                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                                std::thread::sleep(Duration::from_millis(10));
-                                                continue;
-                                            }
-                                            Err(e) => {
-                                                eprintln!("SSH: Write error: {}", e);
-                                                break;
-                                            }
+    let host_s = host.to_string();
+    let user_s = user.to_string();
+    let pass_s = pass.to_string();
+    
+    // Set initial text
+    text_view.buffer().set_text(&format!("Connecting to {}@{}...\n", user, host));
+
+    std::thread::spawn(move || {
+        match connect_ssh(&host_s, port, &user_s, &pass_s) {
+            Ok((session, mut channel)) => {
+                let _ = output_tx.send(b"Connection established.\r\n".to_vec());
+                let _ = session.set_blocking(false);
+                let mut buffer = [0; 8192];
+                loop {
+                    match channel.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(size) => { let _ = output_tx.send(buffer[..size].to_vec()); }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            while let Ok(data) = input_rx.try_recv() {
+                                let mut pos = 0;
+                                while pos < data.len() {
+                                    match channel.write(&data[pos..]) {
+                                        Ok(written) => pos += written,
+                                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                            std::thread::sleep(Duration::from_millis(10));
+                                            continue;
                                         }
+                                        Err(_) => break,
                                     }
-                                    let _ = channel.flush();
                                 }
-                                std::thread::sleep(Duration::from_millis(10));
+                                let _ = channel.flush();
                             }
-                            Err(e) => {
-                                eprintln!("SSH: Read error: {}", e);
-                                break;
-                            }
+                            std::thread::sleep(Duration::from_millis(10));
                         }
+                        Err(_) => break,
                     }
-                    let _ = out_tx.send(b"\r\n[Connection closed]\r\n".to_vec());
                 }
-                Err(e) => {
-                    let _ = out_tx.send(format!("Connection failed: {}\r\n", e).as_bytes().to_vec());
-                }
+                let _ = output_tx.send(b"\r\n[Connection closed]\r\n".to_vec());
             }
-        });
+            Err(e) => {
+                let _ = output_tx.send(format!("Connection failed: {}\r\n", e).as_bytes().to_vec());
+            }
+        }
     });
-    window.present();
 }
 
 fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], host_e: &Entry, port_e: &Entry, user_e: &Entry, sessions_arc: Arc<Mutex<Vec<ConnectionSettings>>>) {
@@ -361,7 +392,7 @@ fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], host_e: &Entry
         let p_e_weak = port_e.downgrade();
         let u_e_weak = user_e.downgrade();
         delete_btn.connect_clicked(move |_| {
-            let list = match list_weak.upgrade() { Some(v) => v, None => return };
+            let list_up = match list_weak.upgrade() { Some(v) => v, None => return };
             let h_e = match h_e_weak.upgrade() { Some(v) => v, None => return };
             let p_e = match p_e_weak.upgrade() { Some(v) => v, None => return };
             let u_e = match u_e_weak.upgrade() { Some(v) => v, None => return };
@@ -369,14 +400,14 @@ fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], host_e: &Entry
             if index < s.len() {
                 s.remove(index);
                 save_sessions(&s);
-                populate_list(&list, &s, &h_e, &p_e, &u_e, s_arc_clone.clone());
+                populate_list(&list_up, &s, &h_e, &p_e, &u_e, s_arc_clone.clone());
             }
         });
     }
     let sessions_vec = sessions.to_vec();
     let h_e_weak = host_e.downgrade();
-    let p_e_weak = port_entry_downgrade(port_e);
-    let u_e_weak = user_entry_downgrade(user_e);
+    let p_e_weak = port_e.downgrade();
+    let u_e_weak = user_e.downgrade();
     list.connect_row_activated(move |_, row| {
         let h_e = match h_e_weak.upgrade() { Some(v) => v, None => return };
         let p_e = match p_e_weak.upgrade() { Some(v) => v, None => return };
@@ -386,9 +417,6 @@ fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], host_e: &Entry
         }
     });
 }
-
-fn port_entry_downgrade(e: &Entry) -> gtk::glib::object::WeakRef<Entry> { e.downgrade() }
-fn user_entry_downgrade(e: &Entry) -> gtk::glib::object::WeakRef<Entry> { e.downgrade() }
 
 fn keyval_to_bytes(keyval: gdk::Key, state: gdk::ModifierType) -> Option<Vec<u8>> {
     use gdk::Key;
