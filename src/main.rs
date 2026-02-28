@@ -57,13 +57,16 @@ struct ConnectionSettings {
     #[serde(default = "default_keepalive")]
     keepalive: u32,
     #[serde(default)]
-    agent_forwarding: bool,
+    pub agent_forwarding: bool,
     #[serde(default = "default_theme")]
-    theme: String,
+    pub theme: String,
+    #[serde(default = "default_method")]
+    pub method: u32, // 0: Password, 1: Key
 }
 
 fn default_keepalive() -> u32 { 0 }
 fn default_theme() -> String { "Default".to_string() }
+fn default_method() -> u32 { 0 }
 
 struct Theme {
     name: &'static str,
@@ -167,13 +170,24 @@ fn save_sessions(sessions: &[ConnectionSettings]) {
 }
 
 struct TerminalState {
-    buffer: TextBuffer,
+    primary_buffer: TextBuffer,
+    alternate_buffer: TextBuffer,
+    is_alternate: bool,
     current_tags: Vec<String>,
+    cursor_x: usize,
+    cursor_y: usize,
+    alt_cursor_x: usize,
+    alt_cursor_y: usize,
+    mouse_tracking_mode: u32, // 0 = off, 1000 = normal tracking, 1002 = button-event tracking, 1006 = SGR coordinates
+    view: glib::WeakRef<TextView>,
 }
 
 impl TerminalState {
-    fn new(buffer: TextBuffer, palette: Vec<String>) -> Self {
-        let tag_table = buffer.tag_table();
+    fn new(view: glib::WeakRef<TextView>, palette: Vec<String>) -> Self {
+        let primary_buffer = view.upgrade().unwrap().buffer();
+        let tag_table = primary_buffer.tag_table();
+        let alternate_buffer = TextBuffer::new(Some(&tag_table));
+
         let codes = [
             "30", "31", "32", "33", "34", "35", "36", "37",
             "90", "91", "92", "93", "94", "95", "96", "97",
@@ -188,11 +202,48 @@ impl TerminalState {
         let bold_tag = TextTag::new(Some("bold"));
         bold_tag.set_weight(700);
         tag_table.add(&bold_tag);
-        Self { buffer, current_tags: Vec::new() }
+        
+        Self { 
+            primary_buffer, 
+            alternate_buffer, 
+            is_alternate: false, 
+            current_tags: Vec::new(),
+            cursor_x: 0,
+            cursor_y: 0,
+            alt_cursor_x: 0,
+            alt_cursor_y: 0,
+            mouse_tracking_mode: 0,
+            view,
+        }
+    }
+
+    fn active_buffer(&self) -> &TextBuffer {
+        if self.is_alternate { &self.alternate_buffer } else { &self.primary_buffer }
+    }
+
+    fn ensure_cursor_position(&self, cx: usize, cy: usize) -> gtk::TextIter {
+        let buffer = self.active_buffer();
+        let line_count = buffer.line_count() as usize;
+        if cy >= line_count {
+            let mut end = buffer.end_iter();
+            let newlines = "\n".repeat((cy + 1).saturating_sub(line_count));
+            buffer.insert(&mut end, &newlines);
+        }
+        
+        if let Some(mut iter) = buffer.iter_at_line(cy as i32) {
+            iter.set_line_index(cx as i32);
+            if !iter.ends_line() { iter.forward_to_line_end(); }
+            let current_idx = iter.line_index() as usize;
+            if cx > current_idx {
+                let spaces = " ".repeat(cx - current_idx);
+                buffer.insert(&mut iter, &spaces);
+            }
+        }
+        buffer.iter_at_line_index(cy as i32, cx as i32).unwrap_or_else(|| buffer.end_iter())
     }
 
     fn update_palette(&mut self, palette: &[String]) {
-        let tag_table = self.buffer.tag_table();
+        let tag_table = self.active_buffer().tag_table();
         let codes = [
             "30", "31", "32", "33", "34", "35", "36", "37",
             "90", "91", "92", "93", "94", "95", "96", "97",
@@ -228,15 +279,38 @@ impl TerminalState {
 
 impl Perform for TerminalState {
     fn print(&mut self, c: char) {
-        let mut iter = self.buffer.end_iter();
+        let cx;
+        let cy;
+        {
+            cx = if self.is_alternate { self.alt_cursor_x } else { self.cursor_x };
+            cy = if self.is_alternate { self.alt_cursor_y } else { self.cursor_y };
+        }
+
+        let mut iter = self.ensure_cursor_position(cx, cy);
+        let buffer = self.active_buffer();
+        
+        if !iter.ends_line() {
+            let mut next = iter.clone();
+            next.forward_char();
+            buffer.delete(&mut iter, &mut next);
+        }
+        
         let start_offset = iter.offset();
-        self.buffer.insert(&mut iter, &c.to_string());
+        buffer.insert(&mut iter, &c.to_string());
+        
+        if self.is_alternate {
+            self.alt_cursor_x += 1;
+        } else {
+            self.cursor_x += 1;
+        }
+        
+        let buffer = self.active_buffer();
         if !self.current_tags.is_empty() {
-            let start_iter = self.buffer.iter_at_offset(start_offset);
-            let end_iter = self.buffer.end_iter();
+            let start_iter = buffer.iter_at_offset(start_offset);
+            let end_iter = buffer.iter_at_offset(start_offset + 1);
             for tag_name in &self.current_tags {
-                if let Some(tag) = self.buffer.tag_table().lookup(tag_name) {
-                    self.buffer.apply_tag(&tag, &start_iter, &end_iter);
+                if let Some(tag) = buffer.tag_table().lookup(tag_name) {
+                    buffer.apply_tag(&tag, &start_iter, &end_iter);
                 }
             }
         }
@@ -244,26 +318,104 @@ impl Perform for TerminalState {
 
     fn execute(&mut self, byte: u8) {
         match byte {
-            b'\n' => { 
-                let mut iter = self.buffer.end_iter(); 
-                self.buffer.insert(&mut iter, "\n"); 
-            }
-            b'\r' => {}
+            b'\n' => { if self.is_alternate { self.alt_cursor_y += 1; } else { self.cursor_y += 1; } }
+            b'\r' => { if self.is_alternate { self.alt_cursor_x = 0; } else { self.cursor_x = 0; } }
             b'\x08' | b'\x7f' => {
-                let mut iter = self.buffer.end_iter();
-                if iter.backward_char() {
-                    let mut end = self.buffer.end_iter();
-                    self.buffer.delete(&mut iter, &mut end);
-                }
+                let cx = if self.is_alternate { &mut self.alt_cursor_x } else { &mut self.cursor_x };
+                if *cx > 0 { *cx -= 1; }
             }
             _ => {}
         }
     }
 
-    fn csi_dispatch(&mut self, params: &vte::Params, _intermediates: &[u8], _ignore: bool, c: char) {
-        if c == 'm' {
-            let p: Vec<i64> = params.iter().map(|it| it[0] as i64).collect();
-            self.apply_sgr(&p);
+    fn csi_dispatch(&mut self, params: &vte::Params, intermediates: &[u8], _ignore: bool, c: char) {
+        let p: Vec<u16> = params.iter().map(|it| it[0]).collect();
+        let arg0 = *p.first().unwrap_or(&0) as usize;
+        let arg1 = *p.get(1).unwrap_or(&0) as usize;
+
+        if intermediates.contains(&b'?') {
+            for param in params.iter() {
+                match param[0] {
+                    1000 => self.mouse_tracking_mode = if c == 'h' { 1000 } else { 0 },
+                    1002 => self.mouse_tracking_mode = if c == 'h' { 1002 } else { 0 },
+                    1006 => self.mouse_tracking_mode = if c == 'h' { 1006 } else { 0 },
+                    1049 => {
+                        if c == 'h' && !self.is_alternate {
+                            self.is_alternate = true;
+                            self.alternate_buffer.set_text("");
+                            self.alt_cursor_x = 0;
+                            self.alt_cursor_y = 0;
+                            if let Some(v) = self.view.upgrade() { v.set_buffer(Some(&self.alternate_buffer)); }
+                        } else if c == 'l' && self.is_alternate {
+                            self.is_alternate = false;
+                            if let Some(v) = self.view.upgrade() { v.set_buffer(Some(&self.primary_buffer)); }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
+
+        let mut cx = if self.is_alternate { self.alt_cursor_x } else { self.cursor_x };
+        let mut cy = if self.is_alternate { self.alt_cursor_y } else { self.cursor_y };
+
+        match c {
+            'm' => {
+                let sgr_p: Vec<i64> = params.iter().map(|it| it[0] as i64).collect();
+                self.apply_sgr(&sgr_p);
+            }
+            'A' => { cy = cy.saturating_sub(arg0.max(1)); }
+            'B' => { cy += arg0.max(1); }
+            'C' => { cx += arg0.max(1); }
+            'D' => { cx = cx.saturating_sub(arg0.max(1)); }
+            'H' | 'f' => {
+                cy = arg0.max(1) - 1;
+                cx = arg1.max(1) - 1;
+            }
+            'J' => {
+                let buffer = self.active_buffer();
+                let mut iter = self.ensure_cursor_position(cx, cy);
+                match arg0 {
+                    0 => { let mut end = buffer.end_iter(); buffer.delete(&mut iter, &mut end); }
+                    1 => { let mut start = buffer.start_iter(); buffer.delete(&mut start, &mut iter); }
+                    2 | 3 => { 
+                        let mut start = buffer.start_iter(); let mut end = buffer.end_iter(); 
+                        buffer.delete(&mut start, &mut end); 
+                        cx = 0; cy = 0; 
+                    }
+                    _ => {}
+                }
+            }
+            'K' => {
+                let buffer = self.active_buffer();
+                let mut iter = self.ensure_cursor_position(cx, cy);
+                match arg0 {
+                    0 => {
+                        let mut end = iter.clone();
+                        end.forward_to_line_end();
+                        buffer.delete(&mut iter, &mut end);
+                    }
+                    2 => {
+                        if let Some(mut start) = buffer.iter_at_line(cy as i32) {
+                            let mut end = start.clone();
+                            end.forward_to_line_end();
+                            buffer.delete(&mut start, &mut end);
+                            cx = 0;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        
+        if self.is_alternate { 
+            self.alt_cursor_x = cx; 
+            self.alt_cursor_y = cy; 
+        } else { 
+            self.cursor_x = cx; 
+            self.cursor_y = cy; 
         }
     }
 }
@@ -457,29 +609,52 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
     conn_tab.set_margin_start(10);
     conn_tab.set_margin_end(10);
     
-    let host_entry = Entry::builder().placeholder_text("Hostname or IP").build();
-    conn_tab.append(&host_entry);
+    let conn_page = GtkBox::new(Orientation::Vertical, 12);
+    conn_page.set_margin_top(20);
+    conn_page.set_margin_bottom(20);
+    conn_page.set_margin_start(20);
+    conn_page.set_margin_end(20);
 
-    let row1 = GtkBox::new(Orientation::Horizontal, 12);
-    let port_entry = Entry::builder().text("22").width_chars(6).build();
+    // Row 1: Host, Port, Method
+    let row1 = GtkBox::new(Orientation::Horizontal, 10);
+    let host_entry = Entry::builder().placeholder_text("Host Address (e.g. 1.2.3.4)").hexpand(true).build();
+    let port_entry = Entry::builder().placeholder_text("Port").width_chars(6).text("22").build();
+    let method_model = StringList::new(&["Password", "Private Key"]);
+    let method_dropdown = DropDown::builder().model(&method_model).build();
+    row1.append(&host_entry);
     row1.append(&port_entry);
+    row1.append(&method_dropdown);
+    conn_page.append(&row1);
+
+    // Row 2: User, Password/Key
+    let row2 = GtkBox::new(Orientation::Horizontal, 10);
     let user_entry = Entry::builder().placeholder_text("Username").hexpand(true).build();
-    row1.append(&user_entry);
-    conn_tab.append(&row1);
-
-    let pass_row = GtkBox::new(Orientation::Horizontal, 12);
     let pass_entry = Entry::builder().placeholder_text("Password").visibility(false).hexpand(true).build();
-    pass_row.append(&pass_entry);
-    let save_pass_check = CheckButton::builder().label("Save").active(true).build();
-    pass_row.append(&save_pass_check);
-    conn_tab.append(&pass_row);
-
-    let key_row = GtkBox::new(Orientation::Horizontal, 12);
-    let key_entry = Entry::builder().placeholder_text("Private Key (optional)").hexpand(true).build();
+    let save_pass_check = CheckButton::builder().label("Save Password").build();
+    
+    let key_box = GtkBox::new(Orientation::Horizontal, 5);
+    key_box.set_hexpand(true);
+    let key_entry = Entry::builder().placeholder_text("Private Key Path").hexpand(true).build();
     let key_btn = Button::builder().icon_name("folder-open-symbolic").build();
-    key_row.append(&key_entry);
-    key_row.append(&key_btn);
-    conn_tab.append(&key_row);
+    key_box.append(&key_entry);
+    key_box.append(&key_btn);
+    
+    row2.append(&user_entry);
+    row2.append(&pass_entry);
+    row2.append(&save_pass_check);
+    row2.append(&key_box);
+    key_box.set_visible(false); // Default to password
+    conn_page.append(&row2);
+
+    let pass_weak = pass_entry.downgrade();
+    let key_box_weak = key_box.downgrade();
+    let sp_weak = save_pass_check.downgrade();
+    method_dropdown.connect_selected_notify(move |d| {
+        let is_key = d.selected() == 1;
+        if let Some(p) = pass_weak.upgrade() { p.set_visible(!is_key); }
+        if let Some(sp) = sp_weak.upgrade() { sp.set_visible(!is_key); }
+        if let Some(k) = key_box_weak.upgrade() { k.set_visible(is_key); }
+    });
 
     let win_for_key = window.clone();
     let key_e_clone = key_entry.clone();
@@ -509,12 +684,13 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
     btn_box.append(&connect_btn);
     let save_btn = Button::builder().label("Save").css_classes(["secondary-action"]).build();
     btn_box.append(&save_btn);
-    conn_tab.append(&btn_box);
+    conn_page.append(&btn_box);
 
-    conn_tab.append(&Label::builder().label("Saved Sessions").css_classes(["section-title"]).halign(gtk::Align::Start).build());
+    conn_page.append(&Label::builder().label("Saved Sessions").css_classes(["section-title"]).halign(gtk::Align::Start).build());
     let sessions_list = ListBox::new();
     let scroll_sessions = ScrolledWindow::builder().min_content_height(250).child(&sessions_list).vexpand(true).build();
-    conn_tab.append(&scroll_sessions);
+    conn_page.append(&scroll_sessions);
+    conn_tab.append(&conn_page);
 
     settings_nb.append_page(&conn_tab, Some(&Label::new(Some("Connection"))));
 
@@ -581,19 +757,21 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
 
     let blink_check = CheckButton::builder().label("Blink").active(true).build();
     behavior_row.append(&blink_check);
-
-    let scroll_entry = Entry::builder().text("1000").width_chars(8).placeholder_text("Scrollback").build();
-    behavior_row.append(&Label::new(Some("Scroll:")));
-    behavior_row.append(&scroll_entry);
     behave_tab.append(&behavior_row);
 
-    let ssh_row = GtkBox::new(Orientation::Horizontal, 12);
-    let keepalive_entry = Entry::builder().text("0").width_chars(6).placeholder_text("Keepalive").build();
-    ssh_row.append(&Label::new(Some("Keepalive (s):")));
-    ssh_row.append(&keepalive_entry);
+    let ka_box = GtkBox::new(Orientation::Horizontal, 10);
+    ka_box.append(&Label::new(Some("Keepalive (s):")));
+    let ka_entry = Entry::builder().text("0").width_chars(6).placeholder_text("Seconds (0 to disable)").build();
+    ka_box.append(&ka_entry);
     let agent_check = CheckButton::builder().label("Forward Agent").active(false).build();
-    ssh_row.append(&agent_check);
-    behave_tab.append(&ssh_row);
+    ka_box.append(&agent_check);
+    behave_tab.append(&ka_box);
+
+    let scroll_box = GtkBox::new(Orientation::Horizontal, 10);
+    scroll_box.append(&Label::new(Some("Scrollback Lines:")));
+    let scroll_entry = Entry::builder().text("1000").width_chars(8).placeholder_text("Lines").build();
+    scroll_box.append(&scroll_entry);
+    behave_tab.append(&scroll_box);
 
     settings_nb.append_page(&behave_tab, Some(&Label::new(Some("Behavior"))));
 
@@ -635,6 +813,7 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
                     scrollback: s_e_for_theme.text().parse().unwrap_or(1000),
                     private_key: None, keepalive: 0, agent_forwarding: false,
                     theme: theme.name.to_string(),
+                    method: 0, // Default to password for mock
                 };
                 update_active_terminals(&sid, &mock_settings);
             }
@@ -662,7 +841,7 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
 
     let sessions_vec = load_sessions();
     let sessions_arc = Arc::new(Mutex::new(sessions_vec.clone()));
-    populate_list(&sessions_list, &sessions_vec, &host_entry, &port_entry, &user_entry, &pass_entry, &save_pass_check, &fg_btn, &bg_btn, &font_dropdown, &cursor_dropdown, &blink_check, &scroll_entry, &palette_buttons, sessions_arc.clone(), &key_entry, &theme_dropdown, &keepalive_entry, &agent_check);
+    populate_list(&sessions_list, &sessions_vec, &host_entry, &port_entry, &user_entry, &pass_entry, &save_pass_check, &fg_btn, &bg_btn, &font_dropdown, &cursor_dropdown, &blink_check, &scroll_entry, &palette_buttons, sessions_arc.clone(), &key_entry, &theme_dropdown, &ka_entry, &agent_check, &method_dropdown);
 
     let h_e_weak = host_entry.downgrade();
     let p_e_weak = port_entry.downgrade();
@@ -678,8 +857,9 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
     let cur_weak = cursor_dropdown.downgrade();
     let blink_weak = blink_check.downgrade();
     let scroll_weak = scroll_entry.downgrade();
-    let ka_weak = keepalive_entry.downgrade();
+    let ka_weak = ka_entry.downgrade();
     let ag_weak = agent_check.downgrade();
+    let method_weak = method_dropdown.downgrade();
     let pal_weaks: Vec<_> = palette_buttons.iter().map(|b| b.downgrade()).collect();
     let sess_clone_for_save = sessions_arc.clone();
     let pal_buttons_clone = palette_buttons.clone();
@@ -700,6 +880,7 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
         let scroll_e = match scroll_weak.upgrade() { Some(v) => v, None => return };
         let ka_e = match ka_weak.upgrade() { Some(v) => v, None => return };
         let ag_c = match ag_weak.upgrade() { Some(v) => v, None => return };
+        let method_d = match method_weak.upgrade() { Some(v) => v, None => return };
         let mut pal = Vec::new();
         for pw in &pal_weaks { if let Some(pb) = pw.upgrade() { pal.push(rgba_to_hex(pb.rgba())); } }
 
@@ -727,8 +908,9 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
                 fg_color: fg, bg_color: bg, font_size,
                 palette: pal,
                 cursor_style: cur_style, cursor_blink: blink, scrollback: scroll,
-                private_key: if key.is_empty() { None } else { Some(key) },
+                private_key: if method_d.selected() == 1 { Some(key) } else { None },
                 keepalive, agent_forwarding: agent, theme: theme_name,
+                method: method_d.selected(),
             };
             let s_name = settings.name.clone();
             if let Some(pos) = s.iter().position(|x| x.host == settings.host && x.username == settings.username) {
@@ -737,7 +919,7 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
                 s.push(settings.clone());
             }
             save_sessions(&s);
-            populate_list(&list, &s, &host_e, &port_e, &user_e, &pass_e, &save_p_c, &fg_b, &bg_b, &font_d, &cur_d, &blink_c, &scroll_e, &pal_buttons_clone, sess_clone_for_save.clone(), &key_e, &theme_d, &ka_e, &ag_c);
+            populate_list(&list, &s, &host_e, &port_e, &user_e, &pass_e, &save_p_c, &fg_b, &bg_b, &font_d, &cur_d, &blink_c, &scroll_e, &pal_buttons_clone, sess_clone_for_save.clone(), &key_e, &theme_d, &ka_e, &ag_c, &method_d);
             update_active_terminals(&s_name, &settings);
         }
     });
@@ -754,9 +936,10 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
     let cur_weak = cursor_dropdown.downgrade();
     let blink_weak = blink_check.downgrade();
     let scroll_weak = scroll_entry.downgrade();
-    let ka_weak = keepalive_entry.downgrade();
+    let ka_weak = ka_entry.downgrade();
     let ag_weak = agent_check.downgrade();
     let theme_weak = theme_dropdown.downgrade();
+    let method_weak = method_dropdown.downgrade();
     let pal_weaks: Vec<_> = palette_buttons.iter().map(|b| b.downgrade()).collect();
     connect_btn.connect_clicked(move |_| {
         let app = match app_weak.upgrade() { Some(v) => v, None => return };
@@ -774,6 +957,7 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
         let ka_e = match ka_weak.upgrade() { Some(v) => v, None => return };
         let ag_c = match ag_weak.upgrade() { Some(v) => v, None => return };
         let theme_d = match theme_weak.upgrade() { Some(v) => v, None => return };
+        let method_d = match method_weak.upgrade() { Some(v) => v, None => return };
         let mut pal = Vec::new();
         for pw in &pal_weaks { if let Some(pb) = pw.upgrade() { pal.push(rgba_to_hex(pb.rgba())); } }
 
@@ -803,8 +987,9 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
             fg_color: fg, bg_color: bg, font_size,
             palette: if pal.len() == 16 { pal } else { default_palette() },
             cursor_style: cur_style, cursor_blink: blink, scrollback: scroll,
-            private_key: if key.is_empty() { None } else { Some(key) },
+            private_key: if method_d.selected() == 1 { Some(key) } else { None },
             keepalive, agent_forwarding: agent, theme: theme_name,
+            method: method_d.selected(),
         }, if pass.is_empty() { None } else { Some(pass) });
     });
 
@@ -913,10 +1098,10 @@ fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, override
     notebook.set_current_page(Some(index));
     text_view.grab_focus();
 
-    let (input_tx, input_rx) = flume::unbounded::<Vec<u8>>();
+    let (input_tx, input_rx) = flume::unbounded::<ConnectionControl>();
     let (output_tx, output_rx) = flume::unbounded::<Vec<u8>>();
     
-    let term_state = Arc::new(Mutex::new(TerminalState::new(text_view.buffer(), settings.palette.clone())));
+    let term_state = Arc::new(Mutex::new(TerminalState::new(text_view.downgrade(), settings.palette.clone())));
     
     // Register for active updates
     let sid = settings.name.clone();
@@ -936,8 +1121,29 @@ fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, override
     let tv_weak = text_view.downgrade();
     let ts_weak = term_state.clone();
     let out_rx_clone = output_rx.clone();
+    let itx_resize = input_tx.clone();
+    let mut last_cols = 0;
+    let mut last_rows = 0;
+    let font_size_u32 = settings.font_size as u32;
+
     glib::timeout_add_local(Duration::from_millis(10), move || {
         let tv = match tv_weak.upgrade() { Some(v) => v, None => return glib::ControlFlow::Break };
+        
+        // PTY Resize checking
+        let width = tv.width();
+        let height = tv.height();
+        if width > 0 && height > 0 {
+            let char_w = (font_size_u32 as f32 * 0.6).max(1.0);
+            let char_h = (font_size_u32 as f32 * 1.5).max(1.0);
+            let cols = (width as f32 / char_w).max(1.0) as u32;
+            let rows = (height as f32 / char_h).max(1.0) as u32;
+            if cols != last_cols || rows != last_rows {
+                last_cols = cols;
+                last_rows = rows;
+                let _ = itx_resize.send(ConnectionControl::Resize(cols, rows, width as u32, height as u32));
+            }
+        }
+
         let mut updated = false;
         while let Ok(bytes) = out_rx_clone.try_recv() {
             let mut state = ts_weak.lock().unwrap();
@@ -969,14 +1175,14 @@ fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, override
                 let itx_clone = itx.clone();
                 clipboard.read_text_async(None::<&gio::Cancellable>, move |result| {
                     if let Ok(Some(text)) = result {
-                        let _ = itx_clone.send(text.into_bytes());
+                        let _ = itx_clone.send(ConnectionControl::Input(text.into_bytes()));
                     }
                 });
                 return glib::Propagation::Stop;
             }
         }
         if let Some(data) = keyval_to_bytes(keyval, state) {
-            let _ = itx.send(data);
+            let _ = itx.send(ConnectionControl::Input(data));
             return glib::Propagation::Stop;
         }
         glib::Propagation::Proceed
@@ -998,16 +1204,23 @@ fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, override
                         Ok(0) => break,
                         Ok(size) => { let _ = output_tx.send(buffer[..size].to_vec()); }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            while let Ok(data) = input_rx.try_recv() {
-                                let mut pos = 0;
-                                while pos < data.len() {
-                                    match channel.write(&data[pos..]) {
-                                        Ok(written) => pos += written,
-                                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                            std::thread::sleep(Duration::from_millis(10));
-                                            continue;
+                            while let Ok(ctrl) = input_rx.try_recv() {
+                                match ctrl {
+                                    ConnectionControl::Input(data) => {
+                                        let mut pos = 0;
+                                        while pos < data.len() {
+                                            match channel.write(&data[pos..]) {
+                                                Ok(written) => pos += written,
+                                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                                    std::thread::sleep(Duration::from_millis(10));
+                                                    continue;
+                                                }
+                                                Err(_) => break,
+                                            }
                                         }
-                                        Err(_) => break,
+                                    },
+                                    ConnectionControl::Resize(cols, rows, width_px, height_px) => {
+                                        let _ = channel.request_pty_size(cols, rows, Some(width_px), Some(height_px));
                                     }
                                 }
                                 let _ = channel.flush();
@@ -1026,7 +1239,7 @@ fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, override
     });
 }
 
-fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], host_e: &Entry, port_e: &Entry, user_e: &Entry, pass_e: &Entry, save_p: &CheckButton, fg_b: &ColorButton, bg_b: &ColorButton, font_d: &DropDown, cur_d: &DropDown, blink_c: &CheckButton, scroll_e: &Entry, palette_btns: &[ColorButton], sessions_arc: Arc<Mutex<Vec<ConnectionSettings>>>, key_e: &Entry, theme_d: &DropDown, ka_e: &Entry, ag_c: &CheckButton) {
+fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], host_e: &Entry, port_e: &Entry, user_e: &Entry, pass_e: &Entry, save_p: &CheckButton, fg_b: &ColorButton, bg_b: &ColorButton, font_d: &DropDown, cur_d: &DropDown, blink_c: &CheckButton, scroll_e: &Entry, palette_btns: &[ColorButton], sessions_arc: Arc<Mutex<Vec<ConnectionSettings>>>, key_e: &Entry, theme_d: &DropDown, ka_e: &Entry, ag_c: &CheckButton, method_d: &DropDown) {
     while let Some(child) = list.first_child() { list.remove(&child); }
     for (index, s) in sessions.iter().enumerate() {
         let row_box = GtkBox::new(Orientation::Horizontal, 10);
@@ -1059,6 +1272,7 @@ fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], host_e: &Entry
         let theme_d_weak = theme_d.downgrade();
         let ka_e_weak = ka_e.downgrade();
         let ag_c_weak = ag_c.downgrade();
+        let method_d_weak = method_d.downgrade();
         let p_buttons = palette_btns.to_vec();
         let name_clone = s.name.clone();
 
@@ -1080,6 +1294,7 @@ fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], host_e: &Entry
         let ls_w2 = list.downgrade();
         let ke_w2 = key_e_weak.clone();
         let pb_w2 = p_buttons.clone();
+        let method_d_w2 = method_d_weak.clone();
 
         save_row_btn.connect_clicked(move |_| {
             let h_e = match h_e_w2.upgrade() { Some(v) => v, None => return };
@@ -1098,6 +1313,7 @@ fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], host_e: &Entry
             let ag_c = match ac_w2.upgrade() { Some(v) => v, None => return };
             let list = match ls_w2.upgrade() { Some(v) => v, None => return };
             let key_e_up = match ke_w2.upgrade() { Some(v) => v, None => return };
+            let method_d_up = match method_d_w2.upgrade() { Some(v) => v, None => return };
             
             let mut pal = Vec::new();
             for btn in &pb_w2 { pal.push(rgba_to_hex(btn.rgba())); }
@@ -1107,7 +1323,7 @@ fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], host_e: &Entry
                 host: h_e.text().to_string(),
                 port: p_e.text().parse().unwrap_or(22),
                 username: u_e.text().to_string(),
-                password: if save_p_c.is_active() { Some(ps_e.text().to_string()) } else { None },
+                password: if save_p_c.is_active() && method_d_up.selected() == 0 { Some(ps_e.text().to_string()) } else { None },
                 fg_color: rgba_to_hex(fg_b.rgba()),
                 bg_color: rgba_to_hex(bg_b.rgba()),
                 font_size: font_d.selected_item().and_then(|i| i.downcast::<gtk::StringObject>().ok()).map(|s| s.string().parse().unwrap_or(14)).unwrap_or(14),
@@ -1115,17 +1331,18 @@ fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], host_e: &Entry
                 cursor_style: cur_d.selected_item().and_then(|i| i.downcast::<gtk::StringObject>().ok()).map(|s| s.string().to_string()).unwrap_or_else(|| "Block".to_string()),
                 cursor_blink: blink_c.is_active(),
                 scrollback: scroll_e.text().parse().unwrap_or(1000),
-                private_key: if key_e_up.text().to_string().is_empty() { None } else { Some(key_e_up.text().to_string()) },
+                private_key: if method_d_up.selected() == 1 { Some(key_e_up.text().to_string()) } else { None },
                 keepalive: ka_e.text().parse().unwrap_or(0),
                 agent_forwarding: ag_c.is_active(),
                 theme: theme_d.selected_item().and_then(|i| i.downcast::<gtk::StringObject>().ok()).map(|s| s.string().to_string()).unwrap_or_else(|| "Custom".to_string()),
+                method: method_d_up.selected(),
             };
 
             let mut s_vec = s_arc_for_save.lock().unwrap();
             if index < s_vec.len() {
                 s_vec[index] = settings.clone();
                 save_sessions(&s_vec);
-                populate_list(&list, &s_vec, &h_e, &p_e, &u_e, &ps_e, &save_p_c, &fg_b, &bg_b, &font_d, &cur_d, &blink_c, &scroll_e, &pb_w2, s_arc_for_save.clone(), &key_e_up, &theme_d, &ka_e, &ag_c);
+                populate_list(&list, &s_vec, &h_e, &p_e, &u_e, &ps_e, &save_p_c, &fg_b, &bg_b, &font_d, &cur_d, &blink_c, &scroll_e, &pb_w2, s_arc_for_save.clone(), &key_e_up, &theme_d, &ka_e, &ag_c, &method_d_up);
                 update_active_terminals(&settings.name, &settings);
             }
         });
@@ -1147,12 +1364,13 @@ fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], host_e: &Entry
             let theme_up = match theme_d_weak.upgrade() { Some(v) => v, None => return };
             let ka_up = match ka_e_weak.upgrade() { Some(v) => v, None => return };
             let ag_up = match ag_c_weak.upgrade() { Some(v) => v, None => return };
+            let method_up = match method_d_weak.upgrade() { Some(v) => v, None => return };
             
             let mut s = s_arc_clone.lock().unwrap();
             if index < s.len() {
                 s.remove(index);
                 save_sessions(&s);
-                populate_list(&list_up, &s, &h_e, &p_e, &u_e, &ps_e, &save_p_up, &fg, &bg, &font, &cur, &blink, &scroll, &p_buttons, s_arc_clone.clone(), &key_up, &theme_up, &ka_up, &ag_up);
+                populate_list(&list_up, &s, &h_e, &p_e, &u_e, &ps_e, &save_p_up, &fg, &bg, &font, &cur, &blink, &scroll, &p_buttons, s_arc_clone.clone(), &key_up, &theme_up, &ka_up, &ag_up, &method_up);
             }
         });
     }
@@ -1173,6 +1391,7 @@ fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], host_e: &Entry
     let theme_d_weak = theme_d.downgrade();
     let ka_e_weak = ka_e.downgrade();
     let ag_c_weak = ag_c.downgrade();
+    let method_d_weak = method_d.downgrade();
     let pal_buttons = palette_btns.to_vec();
     
     list.connect_row_activated(move |_, row| {
@@ -1191,12 +1410,14 @@ fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], host_e: &Entry
         let theme_up = match theme_d_weak.upgrade() { Some(v) => v, None => return };
         let ka_up = match ka_e_weak.upgrade() { Some(v) => v, None => return };
         let ag_up = match ag_c_weak.upgrade() { Some(v) => v, None => return };
+        let method_up = match method_d_weak.upgrade() { Some(v) => v, None => return };
 
         if let Some(s) = sessions_vec.get(row.index() as usize) {
             h_e.set_text(&s.host); p_e.set_text(&s.port.to_string()); u_e.set_text(&s.username);
             ps_e.set_text(s.password.as_deref().unwrap_or(""));
             key_up.set_text(s.private_key.as_deref().unwrap_or(""));
             save_p.set_active(s.password.is_some());
+            method_up.set_selected(s.method);
             fg.set_rgba(&hex_to_rgba(&s.fg_color));
             bg.set_rgba(&hex_to_rgba(&s.bg_color));
             
@@ -1267,6 +1488,11 @@ fn hex_to_rgba(hex: &str) -> gtk::gdk::RGBA {
     gtk::gdk::RGBA::builder().red(r).green(g).blue(b).alpha(1.0).build()
 }
 
+enum ConnectionControl {
+    Input(Vec<u8>),
+    Resize(u32, u32, u32, u32),
+}
+
 fn keyval_to_bytes(keyval: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> Option<Vec<u8>> {
     use gtk::gdk::Key;
     let is_ctrl = state.contains(gtk::gdk::ModifierType::CONTROL_MASK);
@@ -1279,6 +1505,24 @@ fn keyval_to_bytes(keyval: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> Opti
         Key::Right => Some(b"\x1b[C".to_vec()),
         Key::Up => Some(b"\x1b[A".to_vec()),
         Key::Down => Some(b"\x1b[B".to_vec()),
+        Key::Home => Some(b"\x1b[H".to_vec()),
+        Key::End => Some(b"\x1b[F".to_vec()),
+        Key::Page_Up => Some(b"\x1b[5~".to_vec()),
+        Key::Page_Down => Some(b"\x1b[6~".to_vec()),
+        Key::Insert => Some(b"\x1b[2~".to_vec()),
+        Key::Delete => Some(b"\x1b[3~".to_vec()),
+        Key::F1 => Some(b"\x1bOP".to_vec()),
+        Key::F2 => Some(b"\x1bOQ".to_vec()),
+        Key::F3 => Some(b"\x1bOR".to_vec()),
+        Key::F4 => Some(b"\x1bOS".to_vec()),
+        Key::F5 => Some(b"\x1b[15~".to_vec()),
+        Key::F6 => Some(b"\x1b[17~".to_vec()),
+        Key::F7 => Some(b"\x1b[18~".to_vec()),
+        Key::F8 => Some(b"\x1b[19~".to_vec()),
+        Key::F9 => Some(b"\x1b[20~".to_vec()),
+        Key::F10 => Some(b"\x1b[21~".to_vec()),
+        Key::F11 => Some(b"\x1b[23~".to_vec()),
+        Key::F12 => Some(b"\x1b[24~".to_vec()),
         _ => {
             if is_ctrl {
                 let val = keyval.to_unicode().unwrap_or('\0');
@@ -1332,7 +1576,12 @@ fn update_active_terminals(session_id: &str, settings: &ConnectionSettings) {
                 ));
                 if let Ok(mut state) = t.term_state.lock() {
                     state.update_palette(&settings.palette);
-                    state.buffer.tag_table().foreach(|tag| {
+                    state.primary_buffer.tag_table().foreach(|tag| {
+                        if tag.name().map(|n| n == "bold").unwrap_or(false) {
+                            tag.set_foreground(None); 
+                        }
+                    });
+                    state.alternate_buffer.tag_table().foreach(|tag| {
                         if tag.name().map(|n| n == "bold").unwrap_or(false) {
                             tag.set_foreground(None); 
                         }
