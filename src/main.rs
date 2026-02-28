@@ -1,6 +1,7 @@
 use gtk4 as gtk;
 use gtk::gio;
 use gtk::prelude::*;
+use glib::prelude::IsA; // Added this line as per instruction
 use gtk::{
     glib, Application, ApplicationWindow, Box as GtkBox, Button, Entry, Label, ListBox, Orientation,
     ScrolledWindow, TextView, CssProvider, EventControllerKey, TextBuffer, TextTag, HeaderBar, 
@@ -615,6 +616,9 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
     conn_page.set_margin_start(20);
     conn_page.set_margin_end(20);
 
+    let name_entry = Entry::builder().placeholder_text("Session Name (e.g. Prod Server)").hexpand(true).build();
+    conn_page.append(&name_entry);
+
     // Row 1: Host, Port, Method
     let row1 = GtkBox::new(Orientation::Horizontal, 10);
     let host_entry = Entry::builder().placeholder_text("Host Address (e.g. 1.2.3.4)").hexpand(true).build();
@@ -781,6 +785,10 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
     let pal_clone = palette_buttons.clone();
     let h_e_for_theme = host_entry.clone();
     let u_e_for_theme = user_entry.clone();
+    let name_e_clone = name_entry.clone();
+    let host_e_clone = host_entry.clone();
+    let port_e_clone = port_entry.clone();
+    let user_e_clone = user_entry.clone();
     let f_d_for_theme = font_dropdown.clone();
     let c_d_for_theme = cursor_dropdown.clone();
     let b_c_for_theme = blink_check.clone();
@@ -841,8 +849,9 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
 
     let sessions_vec = load_sessions();
     let sessions_arc = Arc::new(Mutex::new(sessions_vec.clone()));
-    populate_list(&sessions_list, &sessions_vec, &host_entry, &port_entry, &user_entry, &pass_entry, &save_pass_check, &fg_btn, &bg_btn, &font_dropdown, &cursor_dropdown, &blink_check, &scroll_entry, &palette_buttons, sessions_arc.clone(), &key_entry, &theme_dropdown, &ka_entry, &agent_check, &method_dropdown);
+    populate_list(&sessions_list, &sessions_vec, &name_entry, &host_entry, &port_entry, &user_entry, &pass_entry, &save_pass_check, &fg_btn, &bg_btn, &font_dropdown, &cursor_dropdown, &blink_check, &scroll_entry, &palette_buttons, sessions_arc.clone(), &key_entry, &theme_dropdown, &ka_entry, &agent_check, &method_dropdown);
 
+    let name_e_weak = name_entry.downgrade();
     let h_e_weak = host_entry.downgrade();
     let p_e_weak = port_entry.downgrade();
     let u_e_weak = user_entry.downgrade();
@@ -881,6 +890,7 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
         let ka_e = match ka_weak.upgrade() { Some(v) => v, None => return };
         let ag_c = match ag_weak.upgrade() { Some(v) => v, None => return };
         let method_d = match method_weak.upgrade() { Some(v) => v, None => return };
+        let name_e = match name_e_weak.upgrade() { Some(v) => v, None => return };
         let mut pal = Vec::new();
         for pw in &pal_weaks { if let Some(pb) = pw.upgrade() { pal.push(rgba_to_hex(pb.rgba())); } }
 
@@ -898,12 +908,14 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
         let keepalive = ka_e.text().parse::<u32>().unwrap_or(0);
         let agent = ag_c.is_active();
         let theme_name = theme_d.selected_item().unwrap().downcast::<gtk::StringObject>().unwrap().string().to_string();
+        let name_val = name_e.text().to_string();
+        let name = if name_val.trim().is_empty() { format!("{}@{}", user, host) } else { name_val };
 
         if !host.is_empty() && !user.is_empty() {
             let mut s = sess_clone_for_save.lock().unwrap();
             let save_pass = save_p_c.is_active();
             let settings = ConnectionSettings { 
-                name: format!("{}@{}", user, host), host, port, username: user,
+                name: name.clone(), host, port, username: user,
                 password: if save_pass && !pass.is_empty() { Some(pass) } else { None },
                 fg_color: fg, bg_color: bg, font_size,
                 palette: pal,
@@ -919,7 +931,7 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
                 s.push(settings.clone());
             }
             save_sessions(&s);
-            populate_list(&list, &s, &host_e, &port_e, &user_e, &pass_e, &save_p_c, &fg_b, &bg_b, &font_d, &cur_d, &blink_c, &scroll_e, &pal_buttons_clone, sess_clone_for_save.clone(), &key_e, &theme_d, &ka_e, &ag_c, &method_d);
+            populate_list(&list, &s, &name_e, &host_e, &port_e, &user_e, &pass_e, &save_p_c, &fg_b, &bg_b, &font_d, &cur_d, &blink_c, &scroll_e, &pal_buttons_clone, sess_clone_for_save.clone(), &key_e, &theme_d, &ka_e, &ag_c, &method_d);
             update_active_terminals(&s_name, &settings);
         }
     });
@@ -958,6 +970,9 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
         let ag_c = match ag_weak.upgrade() { Some(v) => v, None => return };
         let theme_d = match theme_weak.upgrade() { Some(v) => v, None => return };
         let method_d = match method_weak.upgrade() { Some(v) => v, None => return };
+        let name_val = name_e_clone.text().to_string();
+        let name = if name_val.trim().is_empty() { format!("{}@{}", user_e_clone.text(), host_e_clone.text()) } else { name_val };
+        
         let mut pal = Vec::new();
         for pw in &pal_weaks { if let Some(pb) = pw.upgrade() { pal.push(rgba_to_hex(pb.rgba())); } }
 
@@ -982,7 +997,7 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
         if host.is_empty() || user.is_empty() { return; }
         
         handle_connect(&app, &ConnectionSettings {
-            name: format!("{}@{}", user, host), host, port, username: user,
+            name: name, host, port, username: user,
             password: if pass.is_empty() { None } else { Some(pass.clone()) },
             fg_color: fg, bg_color: bg, font_size,
             palette: if pal.len() == 16 { pal } else { default_palette() },
@@ -1239,7 +1254,7 @@ fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, override
     });
 }
 
-fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], host_e: &Entry, port_e: &Entry, user_e: &Entry, pass_e: &Entry, save_p: &CheckButton, fg_b: &ColorButton, bg_b: &ColorButton, font_d: &DropDown, cur_d: &DropDown, blink_c: &CheckButton, scroll_e: &Entry, palette_btns: &[ColorButton], sessions_arc: Arc<Mutex<Vec<ConnectionSettings>>>, key_e: &Entry, theme_d: &DropDown, ka_e: &Entry, ag_c: &CheckButton, method_d: &DropDown) {
+fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], name_e: &Entry, host_e: &Entry, port_e: &Entry, user_e: &Entry, pass_e: &Entry, save_p: &CheckButton, fg_b: &ColorButton, bg_b: &ColorButton, font_d: &DropDown, cur_d: &DropDown, blink_c: &CheckButton, scroll_e: &Entry, palette_btns: &[ColorButton], sessions_arc: Arc<Mutex<Vec<ConnectionSettings>>>, key_e: &Entry, theme_d: &DropDown, ka_e: &Entry, ag_c: &CheckButton, method_d: &DropDown) {
     while let Some(child) = list.first_child() { list.remove(&child); }
     for (index, s) in sessions.iter().enumerate() {
         let row_box = GtkBox::new(Orientation::Horizontal, 10);
@@ -1247,16 +1262,30 @@ fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], host_e: &Entry
         let label = Label::builder().label(&s.name).halign(gtk::Align::Start).hexpand(true).build();
         row_box.append(&label);
         
-        let save_row_btn = Button::builder().icon_name("document-save-symbolic").css_classes(["secondary-action"]).tooltip_text("Save current settings to this session").build();
-        row_box.append(&save_row_btn);
-        
-        let delete_btn = Button::builder().icon_name("user-trash-symbolic").css_classes(["destructive-action"]).tooltip_text("Delete session").build();
-        row_box.append(&delete_btn);
+        let menu_btn = MenuButton::builder()
+            .icon_name("view-more-symbolic")
+            .tooltip_text("Session Options")
+            .css_classes(["flat"])
+            .halign(gtk::Align::End)
+            .build();
+        row_box.append(&menu_btn);
+
+        let menu = gio::Menu::new();
+        let action_group = gio::SimpleActionGroup::new();
+        menu_btn.insert_action_group("row", Some(&action_group));
+        menu_btn.set_menu_model(Some(&menu));
+
+        menu.append(Some("Save Current Settings"), Some("row.save"));
+        menu.append(Some("Rename Session"), Some("row.rename"));
+        menu.append(Some("Clone Session"), Some("row.clone"));
+        menu.append(Some("Delete"), Some("row.delete"));
+
         let row = gtk::ListBoxRow::builder().child(&row_box).build();
         list.append(&row);
         
         let s_arc_clone = sessions_arc.clone();
         let list_weak = list.downgrade();
+        let name_e_weak = name_e.downgrade();
         let h_e_weak = host_e.downgrade();
         let p_e_weak = port_e.downgrade();
         let u_e_weak = user_e.downgrade();
@@ -1277,6 +1306,7 @@ fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], host_e: &Entry
         let name_clone = s.name.clone();
 
         let s_arc_for_save = sessions_arc.clone();
+        let n_e_w2 = name_e_weak.clone();
         let h_e_w2 = h_e_weak.clone();
         let p_e_w2 = p_e_weak.clone();
         let u_e_w2 = u_e_weak.clone();
@@ -1296,7 +1326,8 @@ fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], host_e: &Entry
         let pb_w2 = p_buttons.clone();
         let method_d_w2 = method_d_weak.clone();
 
-        save_row_btn.connect_clicked(move |_| {
+        let action_save = gio::SimpleAction::new("save", None);
+        action_save.connect_activate(move |_, _| {
             let h_e = match h_e_w2.upgrade() { Some(v) => v, None => return };
             let p_e = match p_e_w2.upgrade() { Some(v) => v, None => return };
             let u_e = match u_e_w2.upgrade() { Some(v) => v, None => return };
@@ -1314,6 +1345,7 @@ fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], host_e: &Entry
             let list = match ls_w2.upgrade() { Some(v) => v, None => return };
             let key_e_up = match ke_w2.upgrade() { Some(v) => v, None => return };
             let method_d_up = match method_d_w2.upgrade() { Some(v) => v, None => return };
+            let name_e_up = match n_e_w2.upgrade() { Some(v) => v, None => return };
             
             let mut pal = Vec::new();
             for btn in &pb_w2 { pal.push(rgba_to_hex(btn.rgba())); }
@@ -1342,40 +1374,241 @@ fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], host_e: &Entry
             if index < s_vec.len() {
                 s_vec[index] = settings.clone();
                 save_sessions(&s_vec);
-                populate_list(&list, &s_vec, &h_e, &p_e, &u_e, &ps_e, &save_p_c, &fg_b, &bg_b, &font_d, &cur_d, &blink_c, &scroll_e, &pb_w2, s_arc_for_save.clone(), &key_e_up, &theme_d, &ka_e, &ag_c, &method_d_up);
+                populate_list(&list, &s_vec, &name_e_up, &h_e, &p_e, &u_e, &ps_e, &save_p_c, &fg_b, &bg_b, &font_d, &cur_d, &blink_c, &scroll_e, &pb_w2, s_arc_for_save.clone(), &key_e_up, &theme_d, &ka_e, &ag_c, &method_d_up);
                 update_active_terminals(&settings.name, &settings);
             }
         });
+        action_group.add_action(&action_save);
 
-        delete_btn.connect_clicked(move |_| {
-            let list_up = match list_weak.upgrade() { Some(v) => v, None => return };
-            let h_e = match h_e_weak.upgrade() { Some(v) => v, None => return };
-            let p_e = match p_e_weak.upgrade() { Some(v) => v, None => return };
-            let u_e = match u_e_weak.upgrade() { Some(v) => v, None => return };
-            let ps_e = match ps_e_weak.upgrade() { Some(v) => v, None => return };
-            let save_p_up = match save_p_weak.upgrade() { Some(v) => v, None => return };
-            let fg = match fg_weak.upgrade() { Some(v) => v, None => return };
-            let bg = match bg_weak.upgrade() { Some(v) => v, None => return };
-            let font = match font_weak.upgrade() { Some(v) => v, None => return };
-            let cur = match cur_weak.upgrade() { Some(v) => v, None => return };
-            let blink = match blink_weak.upgrade() { Some(v) => v, None => return };
-            let scroll = match scroll_weak.upgrade() { Some(v) => v, None => return };
-            let key_up = match key_e_weak.upgrade() { Some(v) => v, None => return };
-            let theme_up = match theme_d_weak.upgrade() { Some(v) => v, None => return };
-            let ka_up = match ka_e_weak.upgrade() { Some(v) => v, None => return };
-            let ag_up = match ag_c_weak.upgrade() { Some(v) => v, None => return };
-            let method_up = match method_d_weak.upgrade() { Some(v) => v, None => return };
+        let action_delete = gio::SimpleAction::new("delete", None);
+        let list_w3 = list.downgrade();
+        let n_e_w_del = name_e_weak.clone();
+        let h_e_w_del = h_e_weak.clone();
+        let p_e_w_del = p_e_weak.clone();
+        let u_e_w_del = u_e_weak.clone();
+        let ps_e_w_del = ps_e_weak.clone();
+        let sp_w_del = save_p_weak.clone();
+        let fg_w_del = fg_weak.clone();
+        let bg_w_del = bg_weak.clone();
+        let f_d_w_del = font_weak.clone();
+        let c_d_w_del = cur_weak.clone();
+        let bc_w_del = blink_weak.clone();
+        let sc_w_del = scroll_weak.clone();
+        let ke_w_del = key_e_weak.clone();
+        let th_w_del = theme_d_weak.clone();
+        let ka_w_del = ka_e_weak.clone();
+        let ac_w_del = ag_c_weak.clone();
+        let md_w_del = method_d_weak.clone();
+        let s_arc_for_del = sessions_arc.clone();
+        let pb_w_del = p_buttons.clone();
+        action_delete.connect_activate(move |_, _| {
+            let list_up = match list_w3.upgrade() { Some(v) => v, None => return };
+            let name_up = match n_e_w_del.upgrade() { Some(v) => v, None => return };
+            let h_e = match h_e_w_del.upgrade() { Some(v) => v, None => return };
+            let p_e = match p_e_w_del.upgrade() { Some(v) => v, None => return };
+            let u_e = match u_e_w_del.upgrade() { Some(v) => v, None => return };
+            let ps_e = match ps_e_w_del.upgrade() { Some(v) => v, None => return };
+            let save_p_up = match sp_w_del.upgrade() { Some(v) => v, None => return };
+            let fg = match fg_w_del.upgrade() { Some(v) => v, None => return };
+            let bg = match bg_w_del.upgrade() { Some(v) => v, None => return };
+            let font = match f_d_w_del.upgrade() { Some(v) => v, None => return };
+            let cur = match c_d_w_del.upgrade() { Some(v) => v, None => return };
+            let blink = match bc_w_del.upgrade() { Some(v) => v, None => return };
+            let scroll = match sc_w_del.upgrade() { Some(v) => v, None => return };
+            let key_up = match ke_w_del.upgrade() { Some(v) => v, None => return };
+            let theme_up = match th_w_del.upgrade() { Some(v) => v, None => return };
+            let ka_up = match ka_w_del.upgrade() { Some(v) => v, None => return };
+            let ag_up = match ac_w_del.upgrade() { Some(v) => v, None => return };
+            let method_up = match md_w_del.upgrade() { Some(v) => v, None => return };
             
-            let mut s = s_arc_clone.lock().unwrap();
+            let mut s = s_arc_for_del.lock().unwrap();
             if index < s.len() {
                 s.remove(index);
                 save_sessions(&s);
-                populate_list(&list_up, &s, &h_e, &p_e, &u_e, &ps_e, &save_p_up, &fg, &bg, &font, &cur, &blink, &scroll, &p_buttons, s_arc_clone.clone(), &key_up, &theme_up, &ka_up, &ag_up, &method_up);
+                populate_list(&list_up, &s, &name_up, &h_e, &p_e, &u_e, &ps_e, &save_p_up, &fg, &bg, &font, &cur, &blink, &scroll, &pb_w_del, s_arc_for_del.clone(), &key_up, &theme_up, &ka_up, &ag_up, &method_up);
             }
         });
+        action_group.add_action(&action_delete);
+
+        // Rename Action (Dialog Prompt)
+        let s_arc_ren = sessions_arc.clone();
+        let list_w_ren = list.downgrade();
+        let n_e_w_ren = name_e_weak.clone();
+        let win_weak_ren = find_parent_window(list); 
+        let action_rename = gio::SimpleAction::new("rename", None);
+        let current_name = s.name.clone();
+        
+        let h_e_ren = h_e_weak.clone();
+        let p_e_ren = p_e_weak.clone();
+        let u_e_ren = u_e_weak.clone();
+        let ps_e_ren = ps_e_weak.clone();
+        let sp_ren = save_p_weak.clone();
+        let fg_ren = fg_weak.clone();
+        let bg_ren = bg_weak.clone();
+        let f_d_ren = font_weak.clone();
+        let c_d_ren = cur_weak.clone();
+        let bc_ren = blink_weak.clone();
+        let sc_ren = scroll_weak.clone();
+        let pb_ren = p_buttons.clone();
+        let ke_ren = key_e_weak.clone();
+        let th_ren = theme_d_weak.clone();
+        let ka_ren = ka_e_weak.clone();
+        let ac_ren = ag_c_weak.clone();
+        let md_ren = method_d_weak.clone();
+
+        action_rename.connect_activate(move |_, _| {
+            let win = match win_weak_ren.upgrade() { Some(w) => w, None => return };
+            let dialog = gtk::MessageDialog::builder()
+                .transient_for(&win)
+                .modal(true)
+                .message_type(gtk::MessageType::Question)
+                .buttons(gtk::ButtonsType::OkCancel)
+                .text("Rename Session")
+                .secondary_text("Enter the new name for this session:")
+                .build();
+                
+            let entry = Entry::builder().text(&current_name).margin_top(10).margin_bottom(10).margin_start(10).margin_end(10).build();
+            dialog.content_area().append(&entry);
+            entry.grab_focus();
+            
+            let s_arc_ren_inner = s_arc_ren.clone();
+            let n_e_weak_ren_inner = n_e_w_ren.clone();
+            let l_w_ren_inner = list_w_ren.clone();
+            
+            // Re-clone UI references for the dialog closure
+            let h_e_ren_i = h_e_ren.clone();
+            let p_e_ren_i = p_e_ren.clone();
+            let u_e_ren_i = u_e_ren.clone();
+            let ps_e_ren_i = ps_e_ren.clone();
+            let sp_ren_i = sp_ren.clone();
+            let fg_ren_i = fg_ren.clone();
+            let bg_ren_i = bg_ren.clone();
+            let f_d_ren_i = f_d_ren.clone();
+            let c_d_ren_i = c_d_ren.clone();
+            let bc_ren_i = bc_ren.clone();
+            let sc_ren_i = sc_ren.clone();
+            let pb_ren_i = pb_ren.clone();
+            let ke_ren_i = ke_ren.clone();
+            let th_ren_i = th_ren.clone();
+            let ka_ren_i = ka_ren.clone();
+            let ac_ren_i = ac_ren.clone();
+            let md_ren_i = md_ren.clone();
+
+            dialog.connect_response(move |d, res| {
+                if res == gtk::ResponseType::Ok {
+                    let new_name = entry.text().to_string();
+                    if !new_name.trim().is_empty() {
+                        let mut s = s_arc_ren_inner.lock().unwrap();
+                        if index < s.len() {
+                            s[index].name = new_name;
+                            save_sessions(&s);
+                            
+                            if let (Some(ls_up), Some(ne_up), Some(he_up), Some(pe_up), Some(ue_up), Some(pse_up), Some(sp_up), Some(fg_up), Some(bg_up), Some(fd_up), Some(cd_up), Some(bc_up), Some(sc_up), Some(ke_up), Some(th_up), Some(ka_up), Some(ac_up), Some(md_up)) = (
+                                l_w_ren_inner.upgrade(), n_e_weak_ren_inner.upgrade(), h_e_ren_i.upgrade(), p_e_ren_i.upgrade(), u_e_ren_i.upgrade(), ps_e_ren_i.upgrade(), sp_ren_i.upgrade(), fg_ren_i.upgrade(), bg_ren_i.upgrade(), f_d_ren_i.upgrade(), c_d_ren_i.upgrade(), bc_ren_i.upgrade(), sc_ren_i.upgrade(), ke_ren_i.upgrade(), th_ren_i.upgrade(), ka_ren_i.upgrade(), ac_ren_i.upgrade(), md_ren_i.upgrade()
+                            ) {
+                                populate_list(&ls_up, &s, &ne_up, &he_up, &pe_up, &ue_up, &pse_up, &sp_up, &fg_up, &bg_up, &fd_up, &cd_up, &bc_up, &sc_up, &pb_ren_i, s_arc_ren_inner.clone(), &ke_up, &th_up, &ka_up, &ac_up, &md_up);
+                            }
+                        }
+                    }
+                }
+                d.destroy();
+            });
+            dialog.show();
+        });
+        action_group.add_action(&action_rename);
+
+        // Clone Action
+        let s_arc_cl = sessions_arc.clone();
+        let list_w_cl = list.downgrade();
+        let n_e_w_cl = name_e_weak.clone();
+        let win_weak_cl = find_parent_window(list); 
+        let action_clone = gio::SimpleAction::new("clone", None);
+        let s_to_clone = s.clone();
+        
+        let h_e_cl = h_e_weak.clone();
+        let p_e_cl = p_e_weak.clone();
+        let u_e_cl = u_e_weak.clone();
+        let ps_e_cl = ps_e_weak.clone();
+        let sp_cl = save_p_weak.clone();
+        let fg_cl = fg_weak.clone();
+        let bg_cl = bg_weak.clone();
+        let f_d_cl = font_weak.clone();
+        let c_d_cl = cur_weak.clone();
+        let bc_cl = blink_weak.clone();
+        let sc_cl = scroll_weak.clone();
+        let pb_cl = p_buttons.clone();
+        let ke_cl = key_e_weak.clone();
+        let th_cl = theme_d_weak.clone();
+        let ka_cl = ka_e_weak.clone();
+        let ac_cl = ag_c_weak.clone();
+        let md_cl = method_d_weak.clone();
+
+        action_clone.connect_activate(move |_, _| {
+            let win = match win_weak_cl.upgrade() { Some(w) => w, None => return };
+            let dialog = gtk::MessageDialog::builder()
+                .transient_for(&win)
+                .modal(true)
+                .message_type(gtk::MessageType::Question)
+                .buttons(gtk::ButtonsType::OkCancel)
+                .text("Clone Session")
+                .secondary_text("Enter a name for the new cloned session:")
+                .build();
+                
+            let default_clone_name = format!("{} (Copy)", s_to_clone.name);
+            let entry = Entry::builder().text(&default_clone_name).margin_top(10).margin_bottom(10).margin_start(10).margin_end(10).build();
+            dialog.content_area().append(&entry);
+            entry.grab_focus();
+            
+            let s_arc_cl_inner = s_arc_cl.clone();
+            let stc_inner = s_to_clone.clone();
+            let l_w_cl_inner = list_w_cl.clone();
+            let n_e_w_cl_inner = n_e_w_cl.clone();
+            
+            let h_e_cl_i = h_e_cl.clone();
+            let p_e_cl_i = p_e_cl.clone();
+            let u_e_cl_i = u_e_cl.clone();
+            let ps_e_cl_i = ps_e_cl.clone();
+            let sp_cl_i = sp_cl.clone();
+            let fg_cl_i = fg_cl.clone();
+            let bg_cl_i = bg_cl.clone();
+            let f_d_cl_i = f_d_cl.clone();
+            let c_d_cl_i = c_d_cl.clone();
+            let bc_cl_i = bc_cl.clone();
+            let sc_cl_i = sc_cl.clone();
+            let pb_cl_i = pb_cl.clone();
+            let ke_cl_i = ke_cl.clone();
+            let th_cl_i = th_cl.clone();
+            let ka_cl_i = ka_cl.clone();
+            let ac_cl_i = ac_cl.clone();
+            let md_cl_i = md_cl.clone();
+
+            dialog.connect_response(move |d, res| {
+                if res == gtk::ResponseType::Ok {
+                    let new_name = entry.text().to_string();
+                    if !new_name.trim().is_empty() {
+                        let mut cloned_settings = stc_inner.clone();
+                        cloned_settings.name = new_name;
+                        
+                        let mut s = s_arc_cl_inner.lock().unwrap();
+                        s.push(cloned_settings);
+                        save_sessions(&s);
+                        
+                        if let (Some(ls_up), Some(ne_up), Some(he_up), Some(pe_up), Some(ue_up), Some(pse_up), Some(sp_up), Some(fg_up), Some(bg_up), Some(fd_up), Some(cd_up), Some(bc_up), Some(sc_up), Some(ke_up), Some(th_up), Some(ka_up), Some(ac_up), Some(md_up)) = (
+                            l_w_cl_inner.upgrade(), n_e_w_cl_inner.upgrade(), h_e_cl_i.upgrade(), p_e_cl_i.upgrade(), u_e_cl_i.upgrade(), ps_e_cl_i.upgrade(), sp_cl_i.upgrade(), fg_cl_i.upgrade(), bg_cl_i.upgrade(), f_d_cl_i.upgrade(), c_d_cl_i.upgrade(), bc_cl_i.upgrade(), sc_cl_i.upgrade(), ke_cl_i.upgrade(), th_cl_i.upgrade(), ka_cl_i.upgrade(), ac_cl_i.upgrade(), md_cl_i.upgrade()
+                        ) {
+                            populate_list(&ls_up, &s, &ne_up, &he_up, &pe_up, &ue_up, &pse_up, &sp_up, &fg_up, &bg_up, &fd_up, &cd_up, &bc_up, &sc_up, &pb_cl_i, s_arc_cl_inner.clone(), &ke_up, &th_up, &ka_up, &ac_up, &md_up);
+                        }
+                    }
+                }
+                d.destroy();
+            });
+            dialog.show();
+        });
+        action_group.add_action(&action_clone);
     }
     
     let sessions_vec = sessions.to_vec();
+    let name_e_weak = name_e.downgrade();
     let h_e_weak = host_e.downgrade();
     let p_e_weak = port_e.downgrade();
     let u_e_weak = user_entry_downgrade(user_e); 
@@ -1413,6 +1646,8 @@ fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], host_e: &Entry
         let method_up = match method_d_weak.upgrade() { Some(v) => v, None => return };
 
         if let Some(s) = sessions_vec.get(row.index() as usize) {
+            let n_e = match name_e_weak.upgrade() { Some(v) => v, None => return };
+            n_e.set_text(&s.name);
             h_e.set_text(&s.host); p_e.set_text(&s.port.to_string()); u_e.set_text(&s.username);
             ps_e.set_text(s.password.as_deref().unwrap_or(""));
             key_up.set_text(s.private_key.as_deref().unwrap_or(""));
@@ -1453,6 +1688,17 @@ fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], host_e: &Entry
             }
         }
     });
+}
+
+fn find_parent_window<W: glib::prelude::IsA<gtk::Widget>>(widget: &W) -> glib::object::WeakRef<gtk::ApplicationWindow> {
+    let mut current = widget.parent();
+    while let Some(parent) = current {
+        if let Ok(win) = parent.clone().downcast::<gtk::ApplicationWindow>() {
+            return win.downgrade();
+        }
+        current = parent.parent();
+    }
+    glib::object::WeakRef::new()
 }
 
 fn user_entry_downgrade(e: &Entry) -> glib::object::WeakRef<Entry> { e.downgrade() }
