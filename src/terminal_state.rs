@@ -15,6 +15,12 @@ pub struct TerminalState {
     pub mouse_tracking_mode: u32,
     pub view: glib::WeakRef<TextView>,
     pub tab_label: glib::WeakRef<Label>,
+    pub scroll_top: usize,
+    pub scroll_bottom: usize,
+    pub saved_cursor_x: usize,
+    pub saved_cursor_y: usize,
+    pub saved_tags: Vec<String>,
+    pub bracketed_paste_mode: bool,
 }
 
 impl TerminalState {
@@ -53,6 +59,18 @@ impl TerminalState {
         bold_tag.set_weight(700);
         tag_table.add(&bold_tag);
         
+        let dim_tag = TextTag::new(Some("dim"));
+        dim_tag.set_weight(300);
+        tag_table.add(&dim_tag);
+        
+        let und_tag = TextTag::new(Some("underline"));
+        und_tag.set_underline(gtk::pango::Underline::Single);
+        tag_table.add(&und_tag);
+        
+        let st_tag = TextTag::new(Some("strikethrough"));
+        st_tag.set_strikethrough(true);
+        tag_table.add(&st_tag);
+        
         Self { 
             primary_buffer, 
             alternate_buffer, 
@@ -65,6 +83,12 @@ impl TerminalState {
             mouse_tracking_mode: 0,
             view,
             tab_label,
+            scroll_top: 0,
+            scroll_bottom: usize::MAX,
+            saved_cursor_x: 0,
+            saved_cursor_y: 0,
+            saved_tags: Vec::new(),
+            bracketed_paste_mode: false,
         }
     }
 
@@ -77,20 +101,30 @@ impl TerminalState {
         let line_count = buffer.line_count() as usize;
         if cy >= line_count {
             let mut end = buffer.end_iter();
+            let start_offset = end.offset();
             let newlines = "\n".repeat((cy + 1).saturating_sub(line_count));
             buffer.insert(&mut end, &newlines);
+            buffer.remove_all_tags(&buffer.iter_at_offset(start_offset), &end);
         }
         
-        if let Some(mut iter) = buffer.iter_at_line(cy as i32) {
-            iter.set_line_index(cx as i32);
-            if !iter.ends_line() { iter.forward_to_line_end(); }
-            let current_idx = iter.line_index() as usize;
-            if cx > current_idx {
-                let spaces = " ".repeat(cx - current_idx);
-                buffer.insert(&mut iter, &spaces);
+        let mut shadow_iter = buffer.iter_at_line(cy as i32).unwrap_or_else(|| buffer.end_iter());
+        let mut current_offset = 0;
+        
+        while current_offset < cx {
+            if shadow_iter.ends_line() || shadow_iter.is_end() {
+                break;
             }
+            shadow_iter.forward_char();
+            current_offset += 1;
         }
-        buffer.iter_at_line_index(cy as i32, cx as i32).unwrap_or_else(|| buffer.end_iter())
+        
+        if current_offset < cx {
+            let start_offset = shadow_iter.offset();
+            let spaces = " ".repeat(cx - current_offset);
+            buffer.insert(&mut shadow_iter, &spaces);
+            buffer.remove_all_tags(&buffer.iter_at_offset(start_offset), &shadow_iter);
+        }
+        shadow_iter
     }
 
     pub fn update_palette(&mut self, palette: &[String]) {
@@ -136,6 +170,12 @@ impl TerminalState {
             match param {
                 0 => self.current_tags.clear(),
                 1 => if !self.current_tags.contains(&"bold".to_string()) { self.current_tags.push("bold".to_string()); },
+                2 => if !self.current_tags.contains(&"dim".to_string()) { self.current_tags.push("dim".to_string()); },
+                4 => if !self.current_tags.contains(&"underline".to_string()) { self.current_tags.push("underline".to_string()); },
+                9 => if !self.current_tags.contains(&"strikethrough".to_string()) { self.current_tags.push("strikethrough".to_string()); },
+                22 => self.current_tags.retain(|t| t != "bold" && t != "dim"),
+                24 => self.current_tags.retain(|t| t != "underline"),
+                29 => self.current_tags.retain(|t| t != "strikethrough"),
                 30..=37 | 90..=97 => {
                     self.current_tags.retain(|t| !t.starts_with("fg-"));
                     self.current_tags.push(format!("fg-{}", param));
@@ -164,6 +204,14 @@ impl TerminalState {
             }
         }
     }
+
+    pub fn update_visual_cursor(&self) {
+        let buffer = self.active_buffer();
+        let cx = if self.is_alternate { self.alt_cursor_x } else { self.cursor_x };
+        let cy = if self.is_alternate { self.alt_cursor_y } else { self.cursor_y };
+        let iter = self.ensure_cursor_position(cx, cy);
+        buffer.place_cursor(&iter);
+    }
 }
 
 impl Perform for TerminalState {
@@ -187,6 +235,9 @@ impl Perform for TerminalState {
         let start_offset = iter.offset();
         buffer.insert(&mut iter, &c.to_string());
         
+        let start_iter = buffer.iter_at_offset(start_offset);
+        buffer.remove_all_tags(&start_iter, &iter);
+        
         if self.is_alternate {
             self.alt_cursor_x += 1;
         } else {
@@ -195,7 +246,6 @@ impl Perform for TerminalState {
         
         let buffer = self.active_buffer();
         if !self.current_tags.is_empty() {
-            let start_iter = buffer.iter_at_offset(start_offset);
             let end_iter = buffer.iter_at_offset(start_offset + 1);
             for tag_name in &self.current_tags {
                 if let Some(tag) = buffer.tag_table().lookup(tag_name) {
@@ -203,11 +253,29 @@ impl Perform for TerminalState {
                 }
             }
         }
+        self.update_visual_cursor();
     }
 
     fn execute(&mut self, byte: u8) {
         match byte {
-            b'\n' => { if self.is_alternate { self.alt_cursor_y += 1; } else { self.cursor_y += 1; } }
+            b'\n' => {
+                let cy = if self.is_alternate { self.alt_cursor_y } else { self.cursor_y };
+                if cy == self.scroll_bottom && self.scroll_bottom != usize::MAX {
+                    let top = self.scroll_top;
+                    let buffer = self.active_buffer();
+                    if let Some(mut start) = buffer.iter_at_line(top as i32) {
+                        let mut end = start.clone();
+                        end.forward_visible_line();
+                        buffer.delete(&mut start, &mut end);
+                        let mut insert_iter = self.ensure_cursor_position(0, cy);
+                        let start_offset = insert_iter.offset();
+                        buffer.insert(&mut insert_iter, "\n");
+                        buffer.remove_all_tags(&buffer.iter_at_offset(start_offset), &insert_iter);
+                    }
+                } else {
+                    if self.is_alternate { self.alt_cursor_y += 1; } else { self.cursor_y += 1; }
+                }
+            }
             b'\r' => { if self.is_alternate { self.alt_cursor_x = 0; } else { self.cursor_x = 0; } }
             b'\x08' | b'\x7f' => {
                 let cx = if self.is_alternate { &mut self.alt_cursor_x } else { &mut self.cursor_x };
@@ -215,6 +283,7 @@ impl Perform for TerminalState {
             }
             _ => {}
         }
+        self.update_visual_cursor();
     }
 
     fn csi_dispatch(&mut self, params: &vte::Params, intermediates: &[u8], _ignore: bool, c: char) {
@@ -225,11 +294,39 @@ impl Perform for TerminalState {
         if intermediates.contains(&b'?') {
             for param in params.iter() {
                 match param[0] {
+                    7 => {
+                        if let Some(v) = self.view.upgrade() {
+                            v.set_wrap_mode(if c == 'h' { gtk::WrapMode::Char } else { gtk::WrapMode::None });
+                        }
+                    }
                     1000 => self.mouse_tracking_mode = if c == 'h' { 1000 } else { 0 },
                     1002 => self.mouse_tracking_mode = if c == 'h' { 1002 } else { 0 },
                     1006 => self.mouse_tracking_mode = if c == 'h' { 1006 } else { 0 },
+                    1047 => {
+                        if c == 'h' && !self.is_alternate {
+                            self.is_alternate = true;
+                            if let Some(v) = self.view.upgrade() { v.set_buffer(Some(&self.alternate_buffer)); }
+                        } else if c == 'l' && self.is_alternate {
+                            self.is_alternate = false;
+                            if let Some(v) = self.view.upgrade() { v.set_buffer(Some(&self.primary_buffer)); }
+                        }
+                    }
+                    1048 => {
+                        if c == 'h' {
+                            self.saved_cursor_x = self.cursor_x;
+                            self.saved_cursor_y = self.cursor_y;
+                            self.saved_tags = self.current_tags.clone();
+                        } else if c == 'l' {
+                            self.cursor_x = self.saved_cursor_x;
+                            self.cursor_y = self.saved_cursor_y;
+                            self.current_tags = self.saved_tags.clone();
+                        }
+                    }
                     1049 => {
                         if c == 'h' && !self.is_alternate {
+                            self.saved_cursor_x = self.cursor_x;
+                            self.saved_cursor_y = self.cursor_y;
+                            self.saved_tags = self.current_tags.clone();
                             self.is_alternate = true;
                             self.alternate_buffer.set_text("");
                             self.alt_cursor_x = 0;
@@ -237,9 +334,13 @@ impl Perform for TerminalState {
                             if let Some(v) = self.view.upgrade() { v.set_buffer(Some(&self.alternate_buffer)); }
                         } else if c == 'l' && self.is_alternate {
                             self.is_alternate = false;
+                            self.cursor_x = self.saved_cursor_x;
+                            self.cursor_y = self.saved_cursor_y;
+                            self.current_tags = self.saved_tags.clone();
                             if let Some(v) = self.view.upgrade() { v.set_buffer(Some(&self.primary_buffer)); }
                         }
                     }
+                    2004 => self.bracketed_paste_mode = c == 'h',
                     _ => {}
                 }
             }
@@ -296,12 +397,22 @@ impl Perform for TerminalState {
                     _ => {}
                 }
             }
+            'r' => {
+                let top = arg0.max(1);
+                let bottom = if arg1 == 0 { usize::MAX } else { arg1 };
+                self.scroll_top = top - 1;
+                self.scroll_bottom = if bottom == usize::MAX { usize::MAX } else { bottom - 1 };
+                cx = 0;
+                cy = 0;
+            }
             '@' => {
                 let count = arg0.max(1);
                 let buffer = self.active_buffer();
                 let mut iter = self.ensure_cursor_position(cx, cy);
                 let spaces = " ".repeat(count);
+                let start_offset = iter.offset();
                 buffer.insert(&mut iter, &spaces);
+                buffer.remove_all_tags(&buffer.iter_at_offset(start_offset), &iter);
             }
             'P' => {
                 let count = arg0.max(1);
@@ -316,19 +427,44 @@ impl Perform for TerminalState {
             'L' => {
                 let count = arg0.max(1);
                 let buffer = self.active_buffer();
-                let mut iter = self.ensure_cursor_position(0, cy);
-                let newlines = "\n".repeat(count);
-                buffer.insert(&mut iter, &newlines);
+                let bottom = if self.scroll_bottom == usize::MAX { buffer.line_count().saturating_sub(1) as usize } else { self.scroll_bottom };
+                if cy <= bottom {
+                    let mut iter = self.ensure_cursor_position(0, cy);
+                    let newlines = "\n".repeat(count);
+                    let start_offset = iter.offset();
+                    buffer.insert(&mut iter, &newlines);
+                    buffer.remove_all_tags(&buffer.iter_at_offset(start_offset), &iter);
+                    
+                    if let Some(mut del_start) = buffer.iter_at_line((bottom + 1) as i32) {
+                        let mut del_end = del_start.clone();
+                        for _ in 0..count {
+                            if !del_end.is_end() { del_end.forward_visible_line(); }
+                        }
+                        buffer.delete(&mut del_start, &mut del_end);
+                    }
+                }
             }
             'M' => {
                 let count = arg0.max(1);
                 let buffer = self.active_buffer();
-                if let Some(mut start) = buffer.iter_at_line(cy as i32) {
-                    let mut end = start.clone();
-                    for _ in 0..count {
-                        if !end.is_end() { end.forward_visible_line(); }
+                let bottom = if self.scroll_bottom == usize::MAX { buffer.line_count().saturating_sub(1) as usize } else { self.scroll_bottom };
+                if cy <= bottom {
+                    if let Some(mut start) = buffer.iter_at_line(cy as i32) {
+                        let mut end = start.clone();
+                        for _ in 0..count {
+                            if !end.is_end() { end.forward_visible_line(); }
+                        }
+                        if let Some(limit) = buffer.iter_at_line((bottom + 1) as i32) {
+                            if end.offset() > limit.offset() { end = limit; }
+                        }
+                        buffer.delete(&mut start, &mut end);
+                        
+                        let mut insert_iter = self.ensure_cursor_position(0, bottom);
+                        let newlines = "\n".repeat(count);
+                        let start_offset = insert_iter.offset();
+                        buffer.insert(&mut insert_iter, &newlines);
+                        buffer.remove_all_tags(&buffer.iter_at_offset(start_offset), &insert_iter);
                     }
-                    buffer.delete(&mut start, &mut end);
                 }
             }
             'X' => {
@@ -342,25 +478,53 @@ impl Perform for TerminalState {
                 buffer.delete(&mut start, &mut end);
                 let spaces = " ".repeat(count);
                 let mut insert_iter = self.ensure_cursor_position(cx, cy);
+                let start_offset = insert_iter.offset();
                 buffer.insert(&mut insert_iter, &spaces);
+                buffer.remove_all_tags(&buffer.iter_at_offset(start_offset), &insert_iter);
             }
             'S' => {
                 let count = arg0.max(1);
                 let buffer = self.active_buffer();
-                if let Some(mut start) = buffer.iter_at_line(0) {
+                let top = self.scroll_top;
+                let bottom = if self.scroll_bottom == usize::MAX { buffer.line_count().saturating_sub(1) as usize } else { self.scroll_bottom };
+                
+                if let Some(mut start) = buffer.iter_at_line(top as i32) {
                     let mut end = start.clone();
                     for _ in 0..count {
                         if !end.is_end() { end.forward_visible_line(); }
                     }
+                    if let Some(limit) = buffer.iter_at_line((bottom + 1) as i32) {
+                        if end.offset() > limit.offset() { end = limit; }
+                    }
                     buffer.delete(&mut start, &mut end);
+                    
+                    let mut insert_iter = self.ensure_cursor_position(0, bottom);
+                    let newlines = "\n".repeat(count);
+                    let start_offset = insert_iter.offset();
+                    buffer.insert(&mut insert_iter, &newlines);
+                    buffer.remove_all_tags(&buffer.iter_at_offset(start_offset), &insert_iter);
                 }
             }
             'T' => {
                 let count = arg0.max(1);
                 let buffer = self.active_buffer();
-                let mut start = buffer.start_iter();
-                let newlines = "\n".repeat(count);
-                buffer.insert(&mut start, &newlines);
+                let top = self.scroll_top;
+                let bottom = if self.scroll_bottom == usize::MAX { buffer.line_count().saturating_sub(1) as usize } else { self.scroll_bottom };
+                
+                if let Some(mut start) = buffer.iter_at_line(top as i32) {
+                    let newlines = "\n".repeat(count);
+                    let start_offset = start.offset();
+                    buffer.insert(&mut start, &newlines);
+                    buffer.remove_all_tags(&buffer.iter_at_offset(start_offset), &start);
+                    
+                    if let Some(mut del_start) = buffer.iter_at_line((bottom + 1) as i32) {
+                        let mut del_end = del_start.clone();
+                        for _ in 0..count {
+                            if !del_end.is_end() { del_end.forward_visible_line(); }
+                        }
+                        buffer.delete(&mut del_start, &mut del_end);
+                    }
+                }
             }
             _ => {}
         }
@@ -372,6 +536,7 @@ impl Perform for TerminalState {
             self.cursor_x = cx; 
             self.cursor_y = cy; 
         }
+        self.update_visual_cursor();
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
@@ -384,5 +549,64 @@ impl Perform for TerminalState {
                 }
             }
         }
+    }
+
+    fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
+        if intermediates.is_empty() {
+            match byte {
+                b'7' => {
+                    self.saved_cursor_x = self.cursor_x;
+                    self.saved_cursor_y = self.cursor_y;
+                    self.saved_tags = self.current_tags.clone();
+                }
+                b'8' => {
+                    if !self.is_alternate {
+                        self.cursor_x = self.saved_cursor_x;
+                        self.cursor_y = self.saved_cursor_y;
+                        self.current_tags = self.saved_tags.clone();
+                    }
+                }
+                b'D' => {
+                    // Index (IND)
+                    let cy = if self.is_alternate { self.alt_cursor_y } else { self.cursor_y };
+                    if cy == self.scroll_bottom && self.scroll_bottom != usize::MAX {
+                        let top = self.scroll_top;
+                        let buffer = self.active_buffer();
+                        if let Some(mut start) = buffer.iter_at_line(top as i32) {
+                            let mut end = start.clone();
+                            end.forward_visible_line();
+                            buffer.delete(&mut start, &mut end);
+                            let mut insert_iter = self.ensure_cursor_position(0, cy);
+                            buffer.insert(&mut insert_iter, "\n");
+                        }
+                    } else {
+                        if self.is_alternate { self.alt_cursor_y += 1; } else { self.cursor_y += 1; }
+                    }
+                }
+                b'M' => {
+                    // Reverse Index (RI)
+                    let cy = if self.is_alternate { self.alt_cursor_y } else { self.cursor_y };
+                    if cy == self.scroll_top {
+                        let bottom = if self.scroll_bottom == usize::MAX { self.active_buffer().line_count().saturating_sub(1) as usize } else { self.scroll_bottom };
+                        let buffer = self.active_buffer();
+                        if let Some(mut start) = buffer.iter_at_line(self.scroll_top as i32) {
+                            let start_offset = start.offset();
+                            buffer.insert(&mut start, "\n");
+                            buffer.remove_all_tags(&buffer.iter_at_offset(start_offset), &start);
+                            if let Some(mut del_start) = buffer.iter_at_line((bottom + 1) as i32) {
+                                let mut del_end = del_start.clone();
+                                del_end.forward_visible_line();
+                                buffer.delete(&mut del_start, &mut del_end);
+                            }
+                        }
+                    } else if cy > 0 {
+                        let new_cy = cy - 1;
+                        if self.is_alternate { self.alt_cursor_y = new_cy; } else { self.cursor_y = new_cy; }
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.update_visual_cursor();
     }
 }

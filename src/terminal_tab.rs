@@ -253,9 +253,16 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
         } else if is_paste {
             let clipboard = tv_for_key.clipboard();
             let itx_clone = itx.clone();
+            let ts_paste = s_arc_key.clone();
             clipboard.read_text_async(None::<&gtk::gio::Cancellable>, move |result| {
                 if let Ok(Some(text)) = result {
-                    let _ = itx_clone.send(ConnectionControl::Input(text.into_bytes()));
+                    let is_bracketed = ts_paste.lock().unwrap().bracketed_paste_mode;
+                    let mut data = Vec::new();
+                    if is_bracketed { data.extend_from_slice(b"\x1b[200~"); }
+                    data.extend_from_slice(text.as_bytes());
+                    if is_bracketed { data.extend_from_slice(b"\x1b[201~"); }
+                    
+                    let _ = itx_clone.send(ConnectionControl::Input(data));
                 }
             });
             return glib::Propagation::Stop;

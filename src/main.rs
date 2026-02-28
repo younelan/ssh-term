@@ -5,7 +5,7 @@ pub mod terminal_state;
 pub mod terminal_tab;
 pub mod session_manager_ui;
 
-use crate::config::{ConnectionSettings, THEMES};
+use crate::config::{ConnectionSettings, THEMES, AppConfig, load_app_config, save_app_config};
 use crate::app_state::{CONN_WIN, TARGET_NB};
 use crate::terminal_tab::add_terminal_tab;
 use crate::session_manager_ui::{
@@ -19,7 +19,7 @@ use gtk::prelude::*;
 use gtk::{
     glib, Application, ApplicationWindow, Box as GtkBox, Button, Entry, ListBox, Orientation,
     HeaderBar, ColorButton, DropDown, StringList, Notebook, MenuButton, CheckButton, Grid,
-    Label, ScrolledWindow
+    Label, ScrolledWindow, CssProvider, gdk
 };
 use std::sync::{Arc, Mutex};
 
@@ -53,13 +53,16 @@ fn setup_app(app: &Application) {
         popover button.flat { border-radius: 6px; padding: 6px 12px; }
         popover button.flat:hover { background-color: alpha(currentColor, 0.05); }
     "#;
-    let provider = gtk::CssProvider::new();
+    let provider = CssProvider::new();
     provider.load_from_data(css);
     gtk::style_context_add_provider_for_display(
-        &gtk::gdk::Display::default().expect("Could not connect to a display."),
+        &gdk::Display::default().expect("Could not connect to a display."),
         &provider,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
+    
+    let app_config = load_app_config();
+    apply_app_theme(&app_config.theme);
 
     let menubar = gio::Menu::new();
     
@@ -78,7 +81,7 @@ fn setup_app(app: &Application) {
 
     // Settings Menu
     let settings_menu = gio::Menu::new();
-    settings_menu.append(Some("Toggle Dark Mode"), Some("app.toggle_dark_mode"));
+    settings_menu.append(Some("Preferences..."), Some("app.settings"));
     menubar.append_submenu(Some("Settings"), &settings_menu);
 
     app.set_menubar(Some(&menubar));
@@ -103,14 +106,99 @@ fn setup_app(app: &Application) {
     app.add_action(&action_quit);
     app.set_accels_for_action("app.quit", &["<Primary>q"]);
 
-    // Dark Mode Toggle Action
-    let toggle_action = gio::SimpleAction::new("toggle_dark_mode", None);
-    toggle_action.connect_activate(move |_, _| {
-        let settings = gtk::Settings::default().expect("Could not get default settings");
-        let is_dark = settings.is_gtk_application_prefer_dark_theme();
-        settings.set_gtk_application_prefer_dark_theme(!is_dark);
+    let action_settings = gio::SimpleAction::new("settings", None);
+    let app_weak3 = app.downgrade();
+    action_settings.connect_activate(move |_, _| {
+        if let Some(app) = app_weak3.upgrade() {
+            show_settings_window(&app);
+        }
     });
-    app.add_action(&toggle_action);
+    app.add_action(&action_settings);
+    app.set_accels_for_action("app.settings", &["<Primary>comma"]);
+}
+
+fn apply_app_theme(theme_name: &str) {
+    let settings = gtk::Settings::default().expect("Could not get default settings");
+    let (is_dark, css_data) = match theme_name {
+        "Light" => (false, ""),
+        "Dark Blue" => (
+            true,
+            r#"
+            @define-color window_bg_color #0a192f;
+            @define-color view_bg_color #112240;
+            @define-color headerbar_bg_color #020c1b;
+            "#
+        ),
+        "Coffee" => (
+            true,
+            r#"
+            @define-color window_bg_color #2c211b;
+            @define-color view_bg_color #3e2e25;
+            @define-color headerbar_bg_color #1e1511;
+            "#
+        ),
+        _ => (true, ""), // Default to Dark
+    };
+
+    settings.set_gtk_application_prefer_dark_theme(is_dark);
+
+    let provider = CssProvider::new();
+    provider.load_from_data(css_data);
+    gtk::style_context_add_provider_for_display(
+        &gdk::Display::default().expect("Could not connect to a display."),
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1, // Override default app styles
+    );
+}
+
+fn show_settings_window(app: &Application) {
+    let window = ApplicationWindow::builder()
+        .application(app)
+        .title("App Settings")
+        .default_width(300)
+        .default_height(200)
+        .modal(true)
+        .build();
+
+    let vbox = GtkBox::new(Orientation::Vertical, 12);
+    vbox.set_margin_top(20); vbox.set_margin_bottom(20); 
+    vbox.set_margin_start(20); vbox.set_margin_end(20);
+
+    let theme_label = Label::new(Some("Select App Theme:"));
+    vbox.append(&theme_label);
+
+    let theme_model = StringList::new(&["Light", "Dark", "Dark Blue", "Coffee"]);
+    let theme_dropdown = DropDown::builder().model(&theme_model).build();
+    
+    let current_cfg = load_app_config();
+    let idx = match current_cfg.theme.as_str() {
+        "Light" => 0,
+        "Dark" => 1,
+        "Dark Blue" => 2,
+        "Coffee" => 3,
+        _ => 1,
+    };
+    theme_dropdown.set_selected(idx);
+    vbox.append(&theme_dropdown);
+
+    let save_btn = Button::builder().label("Apply & Save").css_classes(["suggested-action"]).build();
+    let win_weak = window.downgrade();
+    save_btn.connect_clicked(move |_| {
+        if let Some(item) = theme_dropdown.selected_item() {
+            if let Ok(strobj) = item.downcast::<gtk::StringObject>() {
+                let text = strobj.string().to_string();
+                apply_app_theme(&text);
+                save_app_config(&AppConfig { theme: text });
+            }
+        }
+        if let Some(w) = win_weak.upgrade() {
+            w.close();
+        }
+    });
+
+    vbox.append(&save_btn);
+    window.set_child(Some(&vbox));
+    window.present();
 }
 
 fn setup_sessions_actions(app: &Application, menu: &gio::Menu) {

@@ -156,3 +156,33 @@ pub fn save_sessions(sessions: &[ConnectionSettings]) {
         let _ = std::fs::write(path, content);
     }
 }
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AppConfig {
+    #[serde(default = "default_app_theme")]
+    pub theme: String,
+}
+
+fn default_app_theme() -> String { "Dark".to_string() }
+
+pub fn get_app_config_path() -> std::path::PathBuf {
+    let mut path = dirs_next::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    path.push(".terminal_ssh_app_config.json");
+    path
+}
+
+pub fn load_app_config() -> AppConfig {
+    let path = get_app_config_path();
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        serde_json::from_str(&content).unwrap_or_else(|_| AppConfig { theme: default_app_theme() })
+    } else {
+        AppConfig { theme: default_app_theme() }
+    }
+}
+
+pub fn save_app_config(cfg: &AppConfig) {
+    let path = get_app_config_path();
+    if let Ok(content) = serde_json::to_string_pretty(cfg) {
+        let _ = std::fs::write(path, content);
+    }
+}
