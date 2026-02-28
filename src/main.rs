@@ -63,11 +63,14 @@ struct ConnectionSettings {
     pub theme: String,
     #[serde(default = "default_method")]
     pub method: u32, // 0: Password, 1: Key
+    #[serde(default = "default_term_type")]
+    pub term_type: String,
 }
 
 fn default_keepalive() -> u32 { 0 }
 fn default_theme() -> String { "Default".to_string() }
 fn default_method() -> u32 { 0 }
+fn default_term_type() -> String { "xterm-256color".to_string() }
 
 struct Theme {
     name: &'static str,
@@ -148,6 +151,25 @@ fn default_palette() -> Vec<String> {
     ]
 }
 
+fn get_256_color(idx: u8, palette: &[String]) -> String {
+    if (idx as usize) < palette.len() {
+        return palette[idx as usize].clone();
+    }
+    if idx >= 16 && idx <= 231 {
+        let n = idx - 16;
+        let b = n % 6;
+        let g = (n / 6) % 6;
+        let r = (n / 36) % 6;
+        let val = |x| if x == 0 { 0 } else { 55 + x * 40 };
+        return format!("#{:02x}{:02x}{:02x}", val(r), val(g), val(b));
+    }
+    if idx >= 232 {
+        let gray = 8 + (idx - 232) * 10;
+        return format!("#{:02x}{:02x}{:02x}", gray, gray, gray);
+    }
+    "#ffffff".to_string()
+}
+
 fn get_config_path() -> PathBuf {
     let mut path = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("."));
     path.push(".terminal_ssh_sessions.json");
@@ -181,10 +203,11 @@ struct TerminalState {
     alt_cursor_y: usize,
     mouse_tracking_mode: u32, // 0 = off, 1000 = normal tracking, 1002 = button-event tracking, 1006 = SGR coordinates
     view: glib::WeakRef<TextView>,
+    tab_label: glib::WeakRef<Label>,
 }
 
 impl TerminalState {
-    fn new(view: glib::WeakRef<TextView>, palette: Vec<String>) -> Self {
+    fn new(view: glib::WeakRef<TextView>, tab_label: glib::WeakRef<Label>, palette: Vec<String>) -> Self {
         let primary_buffer = view.upgrade().unwrap().buffer();
         let tag_table = primary_buffer.tag_table();
         let alternate_buffer = TextBuffer::new(Some(&tag_table));
@@ -198,7 +221,22 @@ impl TerminalState {
                 let tag = TextTag::new(Some(&format!("fg-{}", code)));
                 tag.set_foreground(Some(color));
                 tag_table.add(&tag);
+                
+                let tag_bg = TextTag::new(Some(&format!("bg-{}", code.parse::<u32>().unwrap() + 10)));
+                tag_bg.set_background(Some(color));
+                tag_table.add(&tag_bg);
             }
+        }
+        
+        for i in 0..=255 {
+            let color = get_256_color(i, &palette);
+            let tag_fg = TextTag::new(Some(&format!("fg-256-{}", i)));
+            tag_fg.set_foreground(Some(&color));
+            tag_table.add(&tag_fg);
+            
+            let tag_bg = TextTag::new(Some(&format!("bg-256-{}", i)));
+            tag_bg.set_background(Some(&color));
+            tag_table.add(&tag_bg);
         }
         let bold_tag = TextTag::new(Some("bold"));
         bold_tag.set_weight(700);
@@ -215,6 +253,7 @@ impl TerminalState {
             alt_cursor_y: 0,
             mouse_tracking_mode: 0,
             view,
+            tab_label,
         }
     }
 
@@ -255,6 +294,21 @@ impl TerminalState {
                 if let Some(tag) = tag_table.lookup(&tag_name) {
                     tag.set_foreground(Some(color));
                 }
+                
+                let bg_name = format!("bg-{}", code.parse::<u32>().unwrap() + 10);
+                if let Some(tag) = tag_table.lookup(&bg_name) {
+                    tag.set_background(Some(color));
+                }
+            }
+        }
+        
+        for i in 0..=255 {
+            let color = get_256_color(i, palette);
+            if let Some(tag) = tag_table.lookup(&format!("fg-256-{}", i)) {
+                tag.set_foreground(Some(&color));
+            }
+            if let Some(tag) = tag_table.lookup(&format!("bg-256-{}", i)) {
+                tag.set_background(Some(&color));
             }
         }
     }
@@ -264,13 +318,36 @@ impl TerminalState {
             self.current_tags.clear();
             return;
         }
-        for &param in params {
+        let mut i = 0;
+        while i < params.len() {
+            let param = params[i];
+            i += 1;
             match param {
                 0 => self.current_tags.clear(),
                 1 => if !self.current_tags.contains(&"bold".to_string()) { self.current_tags.push("bold".to_string()); },
                 30..=37 | 90..=97 => {
                     self.current_tags.retain(|t| !t.starts_with("fg-"));
                     self.current_tags.push(format!("fg-{}", param));
+                }
+                38 => {
+                    if i + 1 < params.len() && params[i] == 5 {
+                        let color_idx = params[i + 1];
+                        i += 2;
+                        self.current_tags.retain(|t| !t.starts_with("fg-"));
+                        self.current_tags.push(format!("fg-256-{}", color_idx));
+                    }
+                }
+                40..=47 | 100..=107 => {
+                    self.current_tags.retain(|t| !t.starts_with("bg-"));
+                    self.current_tags.push(format!("bg-{}", param));
+                }
+                48 => {
+                    if i + 1 < params.len() && params[i] == 5 {
+                        let color_idx = params[i + 1];
+                        i += 2;
+                        self.current_tags.retain(|t| !t.starts_with("bg-"));
+                        self.current_tags.push(format!("bg-256-{}", color_idx));
+                    }
                 }
                 _ => {}
             }
@@ -408,6 +485,72 @@ impl Perform for TerminalState {
                     _ => {}
                 }
             }
+            '@' => {
+                let count = arg0.max(1);
+                let buffer = self.active_buffer();
+                let mut iter = self.ensure_cursor_position(cx, cy);
+                let spaces = " ".repeat(count);
+                buffer.insert(&mut iter, &spaces);
+            }
+            'P' => {
+                let count = arg0.max(1);
+                let buffer = self.active_buffer();
+                let mut start = self.ensure_cursor_position(cx, cy);
+                let mut end = start.clone();
+                for _ in 0..count {
+                    if !end.ends_line() { end.forward_char(); }
+                }
+                buffer.delete(&mut start, &mut end);
+            }
+            'L' => {
+                let count = arg0.max(1);
+                let buffer = self.active_buffer();
+                let mut iter = self.ensure_cursor_position(0, cy);
+                let newlines = "\n".repeat(count);
+                buffer.insert(&mut iter, &newlines);
+            }
+            'M' => {
+                let count = arg0.max(1);
+                let buffer = self.active_buffer();
+                if let Some(mut start) = buffer.iter_at_line(cy as i32) {
+                    let mut end = start.clone();
+                    for _ in 0..count {
+                        if !end.is_end() { end.forward_visible_line(); }
+                    }
+                    buffer.delete(&mut start, &mut end);
+                }
+            }
+            'X' => {
+                let count = arg0.max(1);
+                let buffer = self.active_buffer();
+                let mut start = self.ensure_cursor_position(cx, cy);
+                let mut end = start.clone();
+                for _ in 0..count {
+                    if !end.ends_line() { end.forward_char(); }
+                }
+                buffer.delete(&mut start, &mut end);
+                let spaces = " ".repeat(count);
+                let mut insert_iter = self.ensure_cursor_position(cx, cy);
+                buffer.insert(&mut insert_iter, &spaces);
+            }
+            'S' => {
+                let count = arg0.max(1);
+                let buffer = self.active_buffer();
+                if let Some(mut start) = buffer.iter_at_line(0) {
+                    let mut end = start.clone();
+                    for _ in 0..count {
+                        if !end.is_end() { end.forward_visible_line(); }
+                    }
+                    buffer.delete(&mut start, &mut end);
+                }
+            }
+            'T' => {
+                let count = arg0.max(1);
+                let buffer = self.active_buffer();
+                let mut start = buffer.start_iter();
+                let newlines = "\n".repeat(count);
+                buffer.insert(&mut start, &newlines);
+            }
             _ => {}
         }
         
@@ -417,6 +560,18 @@ impl Perform for TerminalState {
         } else { 
             self.cursor_x = cx; 
             self.cursor_y = cy; 
+        }
+    }
+
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        if params.len() >= 2 {
+            if params[0] == b"0" || params[0] == b"2" {
+                if let Ok(title) = std::str::from_utf8(params[1]) {
+                    if let Some(lbl) = self.tab_label.upgrade() {
+                        lbl.set_text(title);
+                    }
+                }
+            }
         }
     }
 }
@@ -616,15 +771,21 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
     conn_page.set_margin_start(20);
     conn_page.set_margin_end(20);
 
+    let name_row = GtkBox::new(Orientation::Horizontal, 10);
     let name_entry = Entry::builder().placeholder_text("Session Name (e.g. Prod Server)").hexpand(true).build();
-    conn_page.append(&name_entry);
+    let term_model = StringList::new(&["xterm-256color", "xterm", "vt100", "linux", "rxvt-unicode-256color", "tmux-256color"]);
+    let term_dropdown = DropDown::builder().model(&term_model).build();
+    name_row.append(&name_entry);
+    name_row.append(&term_dropdown);
+    conn_page.append(&name_row);
 
     // Row 1: Host, Port, Method
     let row1 = GtkBox::new(Orientation::Horizontal, 10);
     let host_entry = Entry::builder().placeholder_text("Host Address (e.g. 1.2.3.4)").hexpand(true).build();
-    let port_entry = Entry::builder().placeholder_text("Port").width_chars(6).text("22").build();
+    let port_entry = Entry::builder().placeholder_text("Port").max_length(5).width_chars(5).max_width_chars(5).text("22").halign(gtk::Align::Start).build();
     let method_model = StringList::new(&["Password", "Private Key"]);
     let method_dropdown = DropDown::builder().model(&method_model).build();
+
     row1.append(&host_entry);
     row1.append(&port_entry);
     row1.append(&method_dropdown);
@@ -822,9 +983,11 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
                     private_key: None, keepalive: 0, agent_forwarding: false,
                     theme: theme.name.to_string(),
                     method: 0, // Default to password for mock
+                    term_type: "xterm-256color".to_string(),
                 };
                 update_active_terminals(&sid, &mock_settings);
             }
+
         }
     });
 
@@ -869,6 +1032,7 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
     let ka_weak = ka_entry.downgrade();
     let ag_weak = agent_check.downgrade();
     let method_weak = method_dropdown.downgrade();
+    let term_weak = term_dropdown.downgrade();
     let pal_weaks: Vec<_> = palette_buttons.iter().map(|b| b.downgrade()).collect();
     let sess_clone_for_save = sessions_arc.clone();
     let pal_buttons_clone = palette_buttons.clone();
@@ -890,6 +1054,7 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
         let ka_e = match ka_weak.upgrade() { Some(v) => v, None => return };
         let ag_c = match ag_weak.upgrade() { Some(v) => v, None => return };
         let method_d = match method_weak.upgrade() { Some(v) => v, None => return };
+        let term_d = match term_weak.upgrade() { Some(v) => v, None => return };
         let name_e = match name_e_weak.upgrade() { Some(v) => v, None => return };
         let mut pal = Vec::new();
         for pw in &pal_weaks { if let Some(pb) = pw.upgrade() { pal.push(rgba_to_hex(pb.rgba())); } }
@@ -923,6 +1088,7 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
                 private_key: if method_d.selected() == 1 { Some(key) } else { None },
                 keepalive, agent_forwarding: agent, theme: theme_name,
                 method: method_d.selected(),
+                term_type: term_d.selected_item().and_then(|i| i.downcast::<gtk::StringObject>().ok()).map(|s| s.string().to_string()).unwrap_or_else(|| "xterm-256color".to_string()),
             };
             let s_name = settings.name.clone();
             if let Some(pos) = s.iter().position(|x| x.host == settings.host && x.username == settings.username) {
@@ -952,6 +1118,7 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
     let ag_weak = agent_check.downgrade();
     let theme_weak = theme_dropdown.downgrade();
     let method_weak = method_dropdown.downgrade();
+    let term_weak = term_dropdown.downgrade();
     let pal_weaks: Vec<_> = palette_buttons.iter().map(|b| b.downgrade()).collect();
     connect_btn.connect_clicked(move |_| {
         let app = match app_weak.upgrade() { Some(v) => v, None => return };
@@ -970,6 +1137,7 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
         let ag_c = match ag_weak.upgrade() { Some(v) => v, None => return };
         let theme_d = match theme_weak.upgrade() { Some(v) => v, None => return };
         let method_d = match method_weak.upgrade() { Some(v) => v, None => return };
+        let term_d = match term_weak.upgrade() { Some(v) => v, None => return };
         let name_val = name_e_clone.text().to_string();
         let name = if name_val.trim().is_empty() { format!("{}@{}", user_e_clone.text(), host_e_clone.text()) } else { name_val };
         
@@ -1005,6 +1173,7 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
             private_key: if method_d.selected() == 1 { Some(key) } else { None },
             keepalive, agent_forwarding: agent, theme: theme_name,
             method: method_d.selected(),
+            term_type: term_d.selected_item().and_then(|i| i.downcast::<gtk::StringObject>().ok()).map(|s| s.string().to_string()).unwrap_or_else(|| "xterm-256color".to_string()),
         }, if pass.is_empty() { None } else { Some(pass) });
     });
 
@@ -1109,14 +1278,69 @@ fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, override
 
     let scrolled = ScrolledWindow::builder().child(&text_view).vexpand(true).build();
     let label = Label::new(Some(&settings.name));
-    let index = notebook.append_page(&scrolled, Some(&label));
+    let label_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    label_box.append(&label);
+    
+    let index = notebook.append_page(&scrolled, Some(&label_box));
     notebook.set_current_page(Some(index));
     text_view.grab_focus();
+
+    // Right-Click Context Menu for active Terminal View
+    let context_menu = gio::Menu::new();
+    let theme_submenu = gio::Menu::new();
+    let action_group = gio::SimpleActionGroup::new();
+    label_box.insert_action_group("term", Some(&action_group));
+
+    let sid_for_menu = settings.name.clone();
+    
+    for (theme_idx, theme) in THEMES.iter().enumerate() {
+        let action_name = format!("set_theme_{}", theme_idx);
+        theme_submenu.append(Some(theme.name), Some(&format!("term.{}", action_name)));
+
+        let action_theme = gio::SimpleAction::new(&action_name, None);
+        let theme_name = theme.name.to_string();
+        let theme_fg = theme.fg.to_string();
+        let theme_bg = theme.bg.to_string();
+        let theme_pal = theme.palette.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let sid_clone = sid_for_menu.clone();
+
+        action_theme.connect_activate(move |_, _| {
+            let mut sessions = load_sessions();
+            let mut updated_settings = None;
+            if let Some(s) = sessions.iter_mut().find(|s| s.name == sid_clone) {
+                s.theme = theme_name.clone();
+                s.fg_color = theme_fg.clone();
+                s.bg_color = theme_bg.clone();
+                s.palette = theme_pal.clone();
+                updated_settings = Some(s.clone());
+            }
+            if let Some(s) = updated_settings {
+                save_sessions(&sessions);
+                update_active_terminals(&sid_clone, &s);
+            }
+        });
+        action_group.add_action(&action_theme);
+    }
+    context_menu.append_submenu(Some("Quick Set Theme"), &theme_submenu);
+
+    let popover = gtk::PopoverMenu::from_model(Some(&context_menu));
+    popover.set_parent(&label_box);
+    popover.set_has_arrow(false);
+    
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(3); // Right click
+    let p_weak = popover.downgrade();
+    gesture.connect_pressed(move |_, _, _, _| {
+        if let Some(p) = p_weak.upgrade() {
+            p.popup();
+        }
+    });
+    label_box.add_controller(gesture);
 
     let (input_tx, input_rx) = flume::unbounded::<ConnectionControl>();
     let (output_tx, output_rx) = flume::unbounded::<Vec<u8>>();
     
-    let term_state = Arc::new(Mutex::new(TerminalState::new(text_view.downgrade(), settings.palette.clone())));
+    let term_state = Arc::new(Mutex::new(TerminalState::new(text_view.downgrade(), label.downgrade(), settings.palette.clone())));
     
     // Register for active updates
     let sid = settings.name.clone();
@@ -1141,6 +1365,7 @@ fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, override
     let mut last_rows = 0;
     let font_size_u32 = settings.font_size as u32;
 
+    let ts_weak_loop = ts_weak.clone();
     glib::timeout_add_local(Duration::from_millis(10), move || {
         let tv = match tv_weak.upgrade() { Some(v) => v, None => return glib::ControlFlow::Break };
         
@@ -1161,7 +1386,7 @@ fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, override
 
         let mut updated = false;
         while let Ok(bytes) = out_rx_clone.try_recv() {
-            let mut state = ts_weak.lock().unwrap();
+            let mut state = ts_weak_loop.lock().unwrap();
             parser.advance(&mut *state, &bytes);
             updated = true;
         }
@@ -1175,27 +1400,86 @@ fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, override
     let tv_for_key = text_view.clone();
     let key_controller = EventControllerKey::new();
     key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let s_arc_key = ts_weak.clone();
+    let original_font_size = font_size_u32;
+    let sid_for_key = sid_for_menu.clone();
     key_controller.connect_key_pressed(move |_controller, keyval, _keycode, state| {
         let is_ctrl = state.contains(gtk::gdk::ModifierType::CONTROL_MASK);
-        if is_ctrl {
-            if keyval == gtk::gdk::Key::c || keyval == gtk::gdk::Key::C {
-                let clipboard = tv_for_key.clipboard();
-                if let Some((start, end)) = tv_for_key.buffer().selection_bounds() {
-                    let text = tv_for_key.buffer().text(&start, &end, false);
-                    clipboard.set_text(&text);
-                }
-                return glib::Propagation::Stop;
-            } else if keyval == gtk::gdk::Key::v || keyval == gtk::gdk::Key::V {
-                let clipboard = tv_for_key.clipboard();
-                let itx_clone = itx.clone();
-                clipboard.read_text_async(None::<&gio::Cancellable>, move |result| {
-                    if let Ok(Some(text)) = result {
-                        let _ = itx_clone.send(ConnectionControl::Input(text.into_bytes()));
-                    }
-                });
-                return glib::Propagation::Stop;
+        let is_shift = state.contains(gtk::gdk::ModifierType::SHIFT_MASK);
+        let is_cmd = state.contains(gtk::gdk::ModifierType::META_MASK) || state.contains(gtk::gdk::ModifierType::SUPER_MASK);
+
+        let is_copy = (is_ctrl && is_shift && (keyval == gtk::gdk::Key::c || keyval == gtk::gdk::Key::C)) ||
+                      (is_cmd && (keyval == gtk::gdk::Key::c || keyval == gtk::gdk::Key::C));
+        let is_paste = (is_ctrl && is_shift && (keyval == gtk::gdk::Key::v || keyval == gtk::gdk::Key::V)) ||
+                       (is_cmd && (keyval == gtk::gdk::Key::v || keyval == gtk::gdk::Key::V));
+
+        let is_zoom_in = (is_ctrl || is_cmd) && (keyval == gtk::gdk::Key::equal || keyval == gtk::gdk::Key::plus || keyval == gtk::gdk::Key::KP_Add);
+        let is_zoom_out = (is_ctrl || is_cmd) && (keyval == gtk::gdk::Key::minus || keyval == gtk::gdk::Key::KP_Subtract);
+        let is_zoom_reset = (is_ctrl || is_cmd) && (keyval == gtk::gdk::Key::_0 || keyval == gtk::gdk::Key::KP_0);
+        let is_clear = (is_ctrl || is_cmd) && (keyval == gtk::gdk::Key::k || keyval == gtk::gdk::Key::K);
+
+        if is_copy {
+            let clipboard = tv_for_key.clipboard();
+            if let Some((start, end)) = tv_for_key.buffer().selection_bounds() {
+                let text = tv_for_key.buffer().text(&start, &end, false);
+                clipboard.set_text(&text);
             }
+            return glib::Propagation::Stop;
+        } else if is_paste {
+            let clipboard = tv_for_key.clipboard();
+            let itx_clone = itx.clone();
+            clipboard.read_text_async(None::<&gio::Cancellable>, move |result| {
+                if let Ok(Some(text)) = result {
+                    let _ = itx_clone.send(ConnectionControl::Input(text.into_bytes()));
+                }
+            });
+            return glib::Propagation::Stop;
+        } else if is_clear {
+            let mut state = s_arc_key.lock().unwrap();
+            
+            // Native GTK clear - we clear both primary and alternate
+            let mut p_end = state.primary_buffer.end_iter();
+            let mut p_start = state.primary_buffer.start_iter();
+            state.primary_buffer.delete(&mut p_start, &mut p_end);
+            
+            let mut a_end = state.alternate_buffer.end_iter();
+            let mut a_start = state.alternate_buffer.start_iter();
+            state.alternate_buffer.delete(&mut a_start, &mut a_end);
+            
+            state.cursor_x = 0; state.cursor_y = 0;
+            state.alt_cursor_x = 0; state.alt_cursor_y = 0;
+            return glib::Propagation::Stop;
+        } else if is_zoom_in || is_zoom_out || is_zoom_reset {
+            let sid_to_update = sid_for_key.clone();
+            
+            ACTIVE_TERMINALS.with(|at| {
+                let mut list = at.borrow_mut();
+                if let Some(term) = list.iter_mut().find(|t| t.session_id == sid_to_update) {
+                    // Extract current setting from JSON to have base knowledge
+                    let mut sessions = load_sessions();
+                    if let Some(s) = sessions.iter_mut().find(|s| s.name == sid_to_update) {
+                        let new_size = if is_zoom_reset {
+                            original_font_size as i32
+                        } else if is_zoom_in {
+                            s.font_size + 1
+                        } else {
+                            (s.font_size - 1).clone().max(6)
+                        };
+                        
+                        s.font_size = new_size;
+                        
+                        term.css_provider.load_from_data(&format!(
+                            "textview, textview text {{ background-color: {}; color: {}; font-size: {}pt; }}",
+                            s.bg_color, s.fg_color, new_size
+                        ));
+                        
+                        save_sessions(&sessions);
+                    }
+                }
+            });
+            return glib::Propagation::Stop;
         }
+
         if let Some(data) = keyval_to_bytes(keyval, state) {
             let _ = itx.send(ConnectionControl::Input(data));
             return glib::Propagation::Stop;
@@ -1209,7 +1493,7 @@ fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, override
     text_view.buffer().set_text(&format!("Connecting to {}...\n", settings.name));
 
     std::thread::spawn(move || {
-        match connect_ssh(&s_clone.host, s_clone.port, &s_clone.username, final_pass.as_deref().unwrap_or(""), s_clone.private_key.as_deref(), s_clone.keepalive, s_clone.agent_forwarding) {
+        match connect_ssh(&s_clone.host, s_clone.port, &s_clone.username, final_pass.as_deref().unwrap_or(""), s_clone.private_key.as_deref(), s_clone.keepalive, s_clone.agent_forwarding, &s_clone.term_type) {
             Ok((session, mut channel)) => {
                 let _ = output_tx.send(b"Connection established.\r\n".to_vec());
                 let _ = session.set_blocking(false);
@@ -1368,6 +1652,7 @@ fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], name_e: &Entry
                 agent_forwarding: ag_c.is_active(),
                 theme: theme_d.selected_item().and_then(|i| i.downcast::<gtk::StringObject>().ok()).map(|s| s.string().to_string()).unwrap_or_else(|| "Custom".to_string()),
                 method: method_d_up.selected(),
+                term_type: s_arc_for_save.lock().unwrap().get(index).map(|s| s.term_type.clone()).unwrap_or_else(|| "xterm-256color".to_string()),
             };
 
             let mut s_vec = s_arc_for_save.lock().unwrap();
@@ -1605,6 +1890,76 @@ fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], name_e: &Entry
             dialog.show();
         });
         action_group.add_action(&action_clone);
+
+        // Right-Click Context Menu for Theme
+        row_box.insert_action_group("row", Some(&action_group));
+        let context_menu = gio::Menu::new();
+        let theme_submenu = gio::Menu::new();
+        
+        for (theme_idx, theme) in THEMES.iter().enumerate() {
+            let action_name = format!("set_theme_{}", theme_idx);
+            theme_submenu.append(Some(theme.name), Some(&format!("row.{}", action_name)));
+
+            let action_theme = gio::SimpleAction::new(&action_name, None);
+            let s_arc_th = sessions_arc.clone();
+            let theme_name = theme.name.to_string();
+            let theme_fg = theme.fg.to_string();
+            let theme_bg = theme.bg.to_string();
+            let theme_pal = theme.palette.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            
+            let l_w_th = list.downgrade();
+            let n_e_w_th = name_e_weak.clone();
+            let h_e_w_th = h_e_weak.clone();
+            let p_e_w_th = p_e_weak.clone();
+            let u_e_w_th = u_e_weak.clone();
+            let ps_e_w_th = ps_e_weak.clone();
+            let sp_w_th = save_p_weak.clone();
+            let fg_w_th = fg_weak.clone();
+            let bg_w_th = bg_weak.clone();
+            let f_d_w_th = font_weak.clone();
+            let c_d_w_th = cur_weak.clone();
+            let bc_w_th = blink_weak.clone();
+            let sc_w_th = scroll_weak.clone();
+            let pb_w_th = p_buttons.clone();
+            let ke_w_th = key_e_weak.clone();
+            let th_w_th = theme_d_weak.clone();
+            let ka_w_th = ka_e_weak.clone();
+            let ac_w_th = ag_c_weak.clone();
+            let md_w_th = method_d_weak.clone();
+
+            action_theme.connect_activate(move |_, _| {
+                let mut s = s_arc_th.lock().unwrap();
+                if index < s.len() {
+                    s[index].theme = theme_name.clone();
+                    s[index].fg_color = theme_fg.clone();
+                    s[index].bg_color = theme_bg.clone();
+                    s[index].palette = theme_pal.clone();
+                    save_sessions(&s);
+                    
+                    if let (Some(ls_up), Some(ne_up), Some(he_up), Some(pe_up), Some(ue_up), Some(pse_up), Some(sp_up), Some(fg_up), Some(bg_up), Some(fd_up), Some(cd_up), Some(bc_up), Some(sc_up), Some(ke_up), Some(th_up), Some(ka_up), Some(ac_up), Some(md_up)) = (
+                        l_w_th.upgrade(), n_e_w_th.upgrade(), h_e_w_th.upgrade(), p_e_w_th.upgrade(), u_e_w_th.upgrade(), ps_e_w_th.upgrade(), sp_w_th.upgrade(), fg_w_th.upgrade(), bg_w_th.upgrade(), f_d_w_th.upgrade(), c_d_w_th.upgrade(), bc_w_th.upgrade(), sc_w_th.upgrade(), ke_w_th.upgrade(), th_w_th.upgrade(), ka_w_th.upgrade(), ac_w_th.upgrade(), md_w_th.upgrade()
+                    ) {
+                        populate_list(&ls_up, &s, &ne_up, &he_up, &pe_up, &ue_up, &pse_up, &sp_up, &fg_up, &bg_up, &fd_up, &cd_up, &bc_up, &sc_up, &pb_w_th, s_arc_th.clone(), &ke_up, &th_up, &ka_up, &ac_up, &md_up);
+                    }
+                }
+            });
+            action_group.add_action(&action_theme);
+        }
+        context_menu.append_submenu(Some("Quick Set Theme"), &theme_submenu);
+
+        let popover = gtk::PopoverMenu::from_model(Some(&context_menu));
+        popover.set_parent(&row_box);
+        popover.set_has_arrow(false);
+        
+        let gesture = gtk::GestureClick::new();
+        gesture.set_button(3); // Right click
+        let p_weak = popover.downgrade();
+        gesture.connect_pressed(move |_, _, _, _| {
+            if let Some(p) = p_weak.upgrade() {
+                p.popup();
+            }
+        });
+        row_box.add_controller(gesture);
     }
     
     let sessions_vec = sessions.to_vec();
@@ -1771,17 +2126,34 @@ fn keyval_to_bytes(keyval: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> Opti
         Key::F12 => Some(b"\x1b[24~".to_vec()),
         _ => {
             if is_ctrl {
+                if let Some(lower) = keyval.to_lower().to_unicode() {
+                    if lower >= 'a' && lower <= 'z' {
+                        return Some(vec![(lower as u8) - b'a' + 1]);
+                    }
+                }
+                
                 let val = keyval.to_unicode().unwrap_or('\0');
-                if val >= 'a' && val <= 'z' { return Some(vec![(val as u8) - b'a' + 1]); }
-                if val >= 'A' && val <= 'Z' { return Some(vec![(val as u8) - b'A' + 1]); }
+                if val == '[' { return Some(vec![27]); }
+                if val == '\\' { return Some(vec![28]); }
+                if val == ']' { return Some(vec![29]); }
+                if val == '^' { return Some(vec![30]); }
+                if val == '_' { return Some(vec![31]); }
+                if val == '?' { return Some(vec![127]); }
+                if val == ' ' || val == '@' { return Some(vec![0]); }
+                
+                return None;
             }
-            if let Some(c) = keyval.to_unicode() { if c >= ' ' { return Some(c.to_string().into_bytes()); } }
+            if let Some(c) = keyval.to_unicode() { 
+                if c >= ' ' { 
+                    return Some(c.to_string().into_bytes()); 
+                } 
+            }
             None
         }
     }
 }
 
-fn connect_ssh(host: &str, port: u16, user: &str, pass: &str, key_path: Option<&str>, keepalive: u32, agent_forwarding: bool) -> Result<(ssh2::Session, ssh2::Channel), Box<dyn std::error::Error + Send + Sync>> {
+fn connect_ssh(host: &str, port: u16, user: &str, pass: &str, key_path: Option<&str>, keepalive: u32, agent_forwarding: bool, term_type: &str) -> Result<(ssh2::Session, ssh2::Channel), Box<dyn std::error::Error + Send + Sync>> {
     let tcp = TcpStream::connect(format!("{}:{}", host, port))?;
     let mut sess = SshSession::new()?;
     sess.set_tcp_stream(tcp);
@@ -1803,7 +2175,7 @@ fn connect_ssh(host: &str, port: u16, user: &str, pass: &str, key_path: Option<&
     if agent_forwarding {
         let _ = channel.request_auth_agent_forwarding();
     }
-    channel.request_pty("xterm-256color", None, Some((80, 24, 0, 0)))?;
+    channel.request_pty(term_type, None, Some((80, 24, 0, 0)))?;
     channel.shell()?;
     Ok((sess, channel))
 }
