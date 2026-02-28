@@ -1,8 +1,10 @@
 use gtk4 as gtk;
+use gtk::gio;
 use gtk::prelude::*;
 use gtk::{
     glib, Application, ApplicationWindow, Box as GtkBox, Button, Entry, Label, ListBox, Orientation,
-    ScrolledWindow, TextView, CssProvider, EventControllerKey, TextBuffer, TextTag, Notebook,
+    ScrolledWindow, TextView, CssProvider, EventControllerKey, TextBuffer, TextTag, HeaderBar, 
+    ColorButton, DropDown, StringList, Notebook, MenuButton, CheckButton, Grid,
 };
 use serde::{Deserialize, Serialize};
 use ssh2::Session as SshSession;
@@ -14,12 +16,132 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use vte::{Parser, Perform};
 
+thread_local! {
+    static CONN_WIN: std::cell::RefCell<Option<ApplicationWindow>> = std::cell::RefCell::new(None);
+    static TARGET_NB: std::cell::RefCell<glib::object::WeakRef<Notebook>> = std::cell::RefCell::new(glib::object::WeakRef::new());
+    static ACTIVE_TERMINALS: std::cell::RefCell<Vec<ActiveTerminal>> = std::cell::RefCell::new(Vec::new());
+    static IS_PROGRAMMATIC: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+struct ActiveTerminal {
+    session_id: String,
+    text_view: glib::object::WeakRef<TextView>,
+    css_provider: CssProvider,
+    term_state: Arc<Mutex<TerminalState>>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct ConnectionSettings {
     name: String,
     host: String,
     port: u16,
     username: String,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default = "default_fg")]
+    fg_color: String,
+    #[serde(default = "default_bg")]
+    bg_color: String,
+    #[serde(default = "default_font_size")]
+    font_size: i32,
+    #[serde(default = "default_palette")]
+    palette: Vec<String>,
+    #[serde(default = "default_cursor_style")]
+    cursor_style: String,
+    #[serde(default = "default_cursor_blink")]
+    cursor_blink: bool,
+    #[serde(default = "default_scrollback")]
+    scrollback: i32,
+    #[serde(default)]
+    private_key: Option<String>,
+    #[serde(default = "default_keepalive")]
+    keepalive: u32,
+    #[serde(default)]
+    agent_forwarding: bool,
+    #[serde(default = "default_theme")]
+    theme: String,
+}
+
+fn default_keepalive() -> u32 { 0 }
+fn default_theme() -> String { "Default".to_string() }
+
+struct Theme {
+    name: &'static str,
+    fg: &'static str,
+    bg: &'static str,
+    palette: [&'static str; 16],
+}
+
+const THEMES: [Theme; 6] = [
+    Theme {
+        name: "Basic",
+        fg: "#ffffff",
+        bg: "#000000",
+        palette: [
+            "#000000", "#cc0000", "#4e9a06", "#c4a000", "#3465a4", "#75507b", "#06989a", "#d3d7cf",
+            "#555753", "#ef2929", "#8ae234", "#fce94f", "#729fcf", "#ad7fa8", "#34e2e2", "#eeeeec",
+        ],
+    },
+    Theme {
+        name: "Peppermint",
+        fg: "#b3fffd",
+        bg: "#050808",
+        palette: [
+            "#222222", "#ff3333", "#33ff33", "#ffff33", "#3333ff", "#ff33ff", "#33ffff", "#ffffff",
+            "#444444", "#ff6666", "#66ff66", "#ffff66", "#6666ff", "#ff66ff", "#66ffff", "#ffffff",
+        ],
+    },
+    Theme {
+        name: "Novel",
+        fg: "#3b2311",
+        bg: "#dfdbc3",
+        palette: [
+            "#000000", "#cc0000", "#4e9a06", "#c4a000", "#3465a4", "#75507b", "#06989a", "#d3d7cf",
+            "#555753", "#ef2929", "#8ae234", "#fce94f", "#729fcf", "#ad7fa8", "#34e2e2", "#eeeeec",
+        ],
+    },
+    Theme {
+        name: "Silver Aerogel",
+        fg: "#000000",
+        bg: "#adadad",
+        palette: [
+            "#000000", "#941100", "#11a200", "#7d7a00", "#0048ad", "#c800c8", "#008787", "#ffffff",
+            "#474747", "#ff0000", "#00ff00", "#ffff00", "#0000ff", "#ff00ff", "#00ffff", "#ffffff",
+        ],
+    },
+    Theme {
+        name: "Homebrew",
+        fg: "#2aff42",
+        bg: "#000000",
+        palette: [
+            "#000000", "#cc0000", "#4e9a06", "#c4a000", "#3465a4", "#75507b", "#06989a", "#d3d7cf",
+            "#555753", "#ef2929", "#8ae234", "#fce94f", "#729fcf", "#ad7fa8", "#34e2e2", "#eeeeec",
+        ],
+    },
+    Theme {
+        name: "Dracula",
+        fg: "#f8f8f2",
+        bg: "#282a36",
+        palette: [
+            "#21222c", "#ff5555", "#50fa7b", "#f1fa8c", "#bd93f9", "#ff79c6", "#8be9fd", "#f8f8f2",
+            "#6272a4", "#ff6e6e", "#69ff94", "#ffffa5", "#d6acff", "#ff92df", "#a4ffff", "#ffffff",
+        ],
+    },
+];
+
+fn default_fg() -> String { "#00ff00".to_string() }
+fn default_bg() -> String { "#000000".to_string() }
+fn default_font_size() -> i32 { 14 }
+fn default_cursor_style() -> String { "Block".to_string() }
+fn default_cursor_blink() -> bool { true }
+fn default_scrollback() -> i32 { 1000 }
+fn default_palette() -> Vec<String> {
+    vec![
+        "#2e3436".to_string(), "#cc0000".to_string(), "#4e9a06".to_string(), "#c4a000".to_string(),
+        "#3465a4".to_string(), "#75507b".to_string(), "#06989a".to_string(), "#d3d7cf".to_string(),
+        "#555753".to_string(), "#ef2929".to_string(), "#8ae234".to_string(), "#fce94f".to_string(),
+        "#729fcf".to_string(), "#ad7fa8".to_string(), "#34e2e2".to_string(), "#eeeeec".to_string(),
+    ]
 }
 
 fn get_config_path() -> PathBuf {
@@ -50,23 +172,39 @@ struct TerminalState {
 }
 
 impl TerminalState {
-    fn new(buffer: TextBuffer) -> Self {
+    fn new(buffer: TextBuffer, palette: Vec<String>) -> Self {
         let tag_table = buffer.tag_table();
-        let colors = [
-            ("30", "#2e3436"), ("31", "#cc0000"), ("32", "#4e9a06"), ("33", "#c4a000"),
-            ("34", "#3465a4"), ("35", "#75507b"), ("36", "#06989a"), ("37", "#d3d7cf"),
-            ("90", "#555753"), ("91", "#ef2929"), ("92", "#8ae234"), ("93", "#fce94f"),
-            ("94", "#729fcf"), ("95", "#ad7fa8"), ("96", "#34e2e2"), ("97", "#eeeeec"),
+        let codes = [
+            "30", "31", "32", "33", "34", "35", "36", "37",
+            "90", "91", "92", "93", "94", "95", "96", "97",
         ];
-        for (code, color) in colors {
-            let tag = TextTag::new(Some(&format!("fg-{}", code)));
-            tag.set_foreground(Some(color));
-            tag_table.add(&tag);
+        for (i, &code) in codes.iter().enumerate() {
+            if let Some(color) = palette.get(i) {
+                let tag = TextTag::new(Some(&format!("fg-{}", code)));
+                tag.set_foreground(Some(color));
+                tag_table.add(&tag);
+            }
         }
         let bold_tag = TextTag::new(Some("bold"));
         bold_tag.set_weight(700);
         tag_table.add(&bold_tag);
         Self { buffer, current_tags: Vec::new() }
+    }
+
+    fn update_palette(&mut self, palette: &[String]) {
+        let tag_table = self.buffer.tag_table();
+        let codes = [
+            "30", "31", "32", "33", "34", "35", "36", "37",
+            "90", "91", "92", "93", "94", "95", "96", "97",
+        ];
+        for (i, &code) in codes.iter().enumerate() {
+            if let Some(color) = palette.get(i) {
+                let tag_name = format!("fg-{}", code);
+                if let Some(tag) = tag_table.lookup(&tag_name) {
+                    tag.set_foreground(Some(color));
+                }
+            }
+        }
     }
 
     fn apply_sgr(&mut self, params: &[i64]) {
@@ -132,162 +270,667 @@ impl Perform for TerminalState {
 
 fn main() {
     let app = Application::builder().application_id("org.terminal.ssh").build();
-    app.connect_startup(|_| {
-        let provider = CssProvider::new();
-        provider.load_from_data("
-            window { background-color: #1a1a1a; color: #ffffff; }
-            .connection-box { padding: 40px; background-color: #1a1a1a; }
-            entry { 
-                border-radius: 8px; 
-                padding: 10px; 
-                background-color: #2d2d2d; 
-                color: #ffffff; 
-                caret-color: #ffffff;
-                border: 1px solid #3d3d3d; 
-                margin-bottom: 12px; 
-            }
-            entry:focus { border-color: #3d5afe; }
-            button.suggested-action { background-color: #3d5afe; color: white; border-radius: 8px; padding: 14px; font-weight: bold; margin-top: 10px; }
-            button.secondary-action { background-color: #424242; color: white; border-radius: 8px; padding: 10px; margin-top: 10px; }
-            button.destructive-action { background-color: transparent; padding: 4px; border-radius: 4px; color: #ffffff; }
-            button.destructive-action:hover { background-color: #e53935; }
-            textview { background-color: #000000; color: #0dcf21; font-family: 'Monospace', monospace; font-size: 14px; padding: 10px; }
-            listbox { background-color: #242424; border-radius: 8px; border: 1px solid #3d3d3d; margin-top: 10px; }
-            .session-row { padding: 8px 12px; border-bottom: 1px solid #333; }
-            label.title { font-size: 32px; font-weight: bold; margin-bottom: 40px; color: #3d5afe; }
-            notebook { background: #1a1a1a; }
-            notebook header tabs { background: #1a1a1a; }
-            notebook header tabs tab { 
-                padding: 8px 16px; 
-                border-right: 1px solid #333333; 
-                background-color: #2d2d2d; 
-                color: #aaaaaa; 
-            }
-            notebook header tabs tab label { color: #aaaaaa; }
-            notebook header tabs tab:hover { background-color: #3d3d3d; color: #ffffff; }
-            notebook header tabs tab:hover label { color: #ffffff; }
-            notebook header tabs tab:checked { background-color: #3d5afe; color: white; }
-            notebook header tabs tab:checked label { color: white; }
-            notebook stack { background: #1a1a1a; }
-        ");
-        gtk::style_context_add_provider_for_display(
-            &gtk::gdk::Display::default().expect("Could not connect to a display."),
-            &provider,
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
+    app.connect_startup(setup_app);
+    app.connect_activate(|app| {
+        ensure_connect_window(app, None);
     });
-    app.connect_activate(build_ui);
     app.run();
 }
 
-fn build_ui(app: &Application) {
-    let window = ApplicationWindow::builder().application(app).title("Terminal SSH").default_width(1000).default_height(750).build();
-    let notebook = Notebook::builder().tab_pos(gtk::PositionType::Top).build();
-    window.set_child(Some(&notebook));
+fn setup_app(app: &Application) {
+    let provider = CssProvider::new();
+    provider.load_from_data("
+        window { background-color: #1a1a1a; color: #ffffff; }
+        .connection-box { background-color: #1a1a1a; }
+        entry { 
+            border-radius: 8px; 
+            padding: 10px; 
+            background-color: #2d2d2d; 
+            color: #ffffff; 
+            caret-color: #ffffff;
+            border: 1px solid #3d3d3d; 
+            margin-bottom: 12px; 
+        }
+        entry:focus { border-color: #3d5afe; color: #ffffff; }
+        
+        popover, popover.menu, popover contents { 
+            background-color: #2d2d2d; 
+            color: white; 
+            border: 1px solid #3d3d3d;
+        }
+        
+        listview, listview row { 
+            background-color: transparent; 
+            color: white; 
+        }
+        
+        listview row label { 
+            color: white; 
+        }
+
+        listview row:hover, listview row:selected { 
+            background-color: #3d5afe; 
+            color: white; 
+        }
+        
+        listview row:selected label { 
+            color: white; 
+        }
+
+        label.section-title { font-weight: bold; margin-top: 20px; margin-bottom: 10px; color: #3d5afe; font-size: 14px; text-transform: uppercase; }
+        .session-row { padding: 8px; border-radius: 6px; }
+        .session-row:hover { background-color: #2d2d2d; }
+        button.suggested-action { background-color: #3d5afe; color: white; border-radius: 8px; padding: 14px; font-weight: bold; margin-top: 10px; }
+        button.secondary-action { background-color: #424242; color: #448aff; border-radius: 8px; padding: 10px; margin-top: 0px; }
+        button.destructive-action { background-color: transparent; padding: 4px; border-radius: 4px; color: #ff5252; }
+        button.destructive-action:hover { background-color: #e53935; }
+        textview { background-color: #000000; color: #0dcf21; font-family: 'Monospace', monospace; font-size: 14px; padding: 10px; }
+        textview:focus { caret-color: #3d5afe; }
+        .cursor-active { background-color: #ffffff; color: #000000; }
+        listbox { background-color: #242424; border-radius: 8px; border: 1px solid #3d3d3d; margin-top: 10px; }
+        .session-row { padding: 8px 12px; border-bottom: 1px solid #333; }
+        headerbar { background: #2d2d2d; color: white; border-bottom: 1px solid #3d3d3d; }
+        
+        notebook { background-color: #1a1a1a; border: none; }
+        notebook > header { background: #2d2d2d; padding: 5px; }
+        notebook > header tab { 
+            padding: 8px 16px; 
+            margin: 0 2px; 
+            border-radius: 6px 6px 0 0; 
+            background: #3d3d3d; 
+            color: #888; 
+        }
+        notebook > header tab:checked { 
+            background: #3d5afe; 
+            color: white; 
+        }
+        notebook > header tab:hover { 
+            background: #4d4d4d; 
+        }
+        notebook stack { background: #1a1a1a; padding: 30px; }
+        
+        grid { margin-top: 10px; }
+        colorbutton { border-radius: 4px; }
+        label.palette-label { font-size: 10px; color: #888; margin-top: 5px; }
+    ");
+    gtk::style_context_add_provider_for_display(
+        &gtk::gdk::Display::default().expect("Could not connect to a display."),
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+
+    let menubar = gio::Menu::new();
+    
+    let file_menu = gio::Menu::new();
+    file_menu.append(Some("New Connection"), Some("app.new_connection"));
+    file_menu.append(Some("Quit"), Some("app.quit"));
+    menubar.append_submenu(Some("File"), &file_menu);
+    
+    let sessions_menu = gio::Menu::new();
+    setup_sessions_actions(app, &sessions_menu);
+    menubar.append_submenu(Some("Sessions"), &sessions_menu);
+    
+    app.set_menubar(Some(&menubar));
+
+    let action_new = gio::SimpleAction::new("new_connection", None);
+    let app_weak = app.downgrade();
+    action_new.connect_activate(move |_, _| {
+        if let Some(app) = app_weak.upgrade() {
+            ensure_connect_window(&app, None);
+        }
+    });
+    app.add_action(&action_new);
+    app.set_accels_for_action("app.new_connection", &["<Primary>n"]);
+
+    let action_quit = gio::SimpleAction::new("quit", None);
+    let app_weak2 = app.downgrade();
+    action_quit.connect_activate(move |_, _| {
+        if let Some(app) = app_weak2.upgrade() {
+            app.quit();
+        }
+    });
+    app.add_action(&action_quit);
+    app.set_accels_for_action("app.quit", &["<Primary>q"]);
+}
+
+fn setup_sessions_actions(app: &Application, menu: &gio::Menu) {
+    let sessions = load_sessions();
+    for s in sessions {
+        let name_safe = s.name.replace(' ', "_").replace('@', "_").replace('.', "_");
+        let action_name = format!("connect_{}", name_safe);
+        menu.append(Some(&s.name), Some(&format!("app.{}", action_name)));
+
+        let action = gio::SimpleAction::new(&action_name, None);
+        let app_weak = app.downgrade();
+        let s_clone = s.clone();
+        action.connect_activate(move |_, _| {
+            if let Some(app) = app_weak.upgrade() {
+                handle_connect(&app, &s_clone, s_clone.password.clone());
+            }
+        });
+        app.add_action(&action);
+    }
+}
+
+fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
+    TARGET_NB.with(|cell| *cell.borrow_mut() = match target_nb {
+        Some(nb) => nb.downgrade(),
+        None => glib::object::WeakRef::new(),
+    });
+    
+    let existing = CONN_WIN.with(|cell| cell.borrow().clone());
+    if let Some(win) = existing {
+        win.present();
+        return;
+    }
+
+    let window = ApplicationWindow::builder()
+        .application(app)
+        .title("SSH Connection Manager")
+        .default_width(600)
+        .default_height(650)
+        .build();
+    let header = HeaderBar::new();
+    header.set_show_title_buttons(true);
+    
+    let close_btn = Button::builder().icon_name("window-close-symbolic").tooltip_text("Close").build();
+    let win_weak = window.downgrade();
+    close_btn.connect_clicked(move |_| {
+        if let Some(win) = win_weak.upgrade() {
+            win.close();
+        }
+    });
+    header.pack_end(&close_btn);
+    window.set_titlebar(Some(&header));
 
     let connection_box = GtkBox::new(Orientation::Vertical, 0);
     connection_box.add_css_class("connection-box");
-    let title = Label::builder().label("Terminal SSH").css_classes(["title"]).halign(gtk::Align::Center).build();
-    connection_box.append(&title);
+    window.set_child(Some(&connection_box));
 
+    let settings_nb = Notebook::new();
+    connection_box.append(&settings_nb);
+
+    // Tab 1: Connection (includes Connect button and Sessions List)
+    let conn_tab = GtkBox::new(Orientation::Vertical, 12);
+    conn_tab.set_margin_top(10);
+    conn_tab.set_margin_bottom(10);
+    conn_tab.set_margin_start(10);
+    conn_tab.set_margin_end(10);
+    
     let host_entry = Entry::builder().placeholder_text("Hostname or IP").build();
-    connection_box.append(&host_entry);
+    conn_tab.append(&host_entry);
 
     let row1 = GtkBox::new(Orientation::Horizontal, 12);
     let port_entry = Entry::builder().text("22").width_chars(6).build();
     row1.append(&port_entry);
     let user_entry = Entry::builder().placeholder_text("Username").hexpand(true).build();
     row1.append(&user_entry);
-    connection_box.append(&row1);
+    conn_tab.append(&row1);
 
-    let pass_entry = Entry::builder().placeholder_text("Password").visibility(false).build();
-    connection_box.append(&pass_entry);
+    let pass_row = GtkBox::new(Orientation::Horizontal, 12);
+    let pass_entry = Entry::builder().placeholder_text("Password").visibility(false).hexpand(true).build();
+    pass_row.append(&pass_entry);
+    let save_pass_check = CheckButton::builder().label("Save").active(true).build();
+    pass_row.append(&save_pass_check);
+    conn_tab.append(&pass_row);
+
+    let key_row = GtkBox::new(Orientation::Horizontal, 12);
+    let key_entry = Entry::builder().placeholder_text("Private Key (optional)").hexpand(true).build();
+    let key_btn = Button::builder().icon_name("folder-open-symbolic").build();
+    key_row.append(&key_entry);
+    key_row.append(&key_btn);
+    conn_tab.append(&key_row);
+
+    let win_for_key = window.clone();
+    let key_e_clone = key_entry.clone();
+    key_btn.connect_clicked(move |_| {
+        let dialog = gtk::FileChooserDialog::new(
+            Some("Select Private Key"),
+            Some(&win_for_key),
+            gtk::FileChooserAction::Open,
+            &[("Open", gtk::ResponseType::Accept), ("Cancel", gtk::ResponseType::Cancel)],
+        );
+        let key_e = key_e_clone.clone();
+        dialog.connect_response(move |d, res| {
+            if res == gtk::ResponseType::Accept {
+                if let Some(file) = d.file() {
+                    if let Some(path) = file.path() {
+                        key_e.set_text(&path.to_string_lossy());
+                    }
+                }
+            }
+            d.destroy();
+        });
+        dialog.show();
+    });
 
     let btn_box = GtkBox::new(Orientation::Horizontal, 12);
     let connect_btn = Button::builder().label("Connect").css_classes(["suggested-action"]).hexpand(true).build();
     btn_box.append(&connect_btn);
     let save_btn = Button::builder().label("Save").css_classes(["secondary-action"]).build();
     btn_box.append(&save_btn);
-    connection_box.append(&btn_box);
+    conn_tab.append(&btn_box);
 
+    conn_tab.append(&Label::builder().label("Saved Sessions").css_classes(["section-title"]).halign(gtk::Align::Start).build());
     let sessions_list = ListBox::new();
-    let scrolled = ScrolledWindow::builder().min_content_height(250).child(&sessions_list).vexpand(true).build();
-    connection_box.append(&scrolled);
+    let scroll_sessions = ScrolledWindow::builder().min_content_height(250).child(&sessions_list).vexpand(true).build();
+    conn_tab.append(&scroll_sessions);
 
-    notebook.append_page(&connection_box, Some(&Label::new(Some("Connect"))));
+    settings_nb.append_page(&conn_tab, Some(&Label::new(Some("Connection"))));
 
-    let sessions = Arc::new(Mutex::new(load_sessions()));
-    let s_init = sessions.lock().unwrap();
-    populate_list(&sessions_list, &s_init, &host_entry, &port_entry, &user_entry, sessions.clone());
-    drop(s_init);
+    // Tab 2: Appearance
+    let app_tab = GtkBox::new(Orientation::Vertical, 12);
+    app_tab.set_margin_top(10);
+    app_tab.set_margin_bottom(10);
+    app_tab.set_margin_start(10);
+    app_tab.set_margin_end(10);
+    
+    let theme_row = GtkBox::new(Orientation::Horizontal, 12);
+    theme_row.append(&Label::new(Some("Theme:")));
+    let theme_names: Vec<String> = THEMES.iter().map(|t| t.name.to_string()).chain(std::iter::once("Custom".to_string())).collect();
+    let theme_list = StringList::new(&theme_names.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+    let theme_dropdown = DropDown::builder().model(&theme_list).selected(0).build();
+    theme_row.append(&theme_dropdown);
+    app_tab.append(&theme_row);
 
-    let sessions_weak = Arc::downgrade(&sessions);
-    let h_e_weak = host_entry.downgrade();
-    let p_e_weak = port_entry.downgrade();
-    let u_e_weak = user_entry.downgrade();
-    let list_weak = sessions_list.downgrade();
-    let sess_clone_for_save = sessions.clone();
-    save_btn.connect_clicked(move |_| {
-        let sessions_up = match sessions_weak.upgrade() { Some(v) => v, None => return };
-        let host_e = match h_e_weak.upgrade() { Some(v) => v, None => return };
-        let port_e = match p_e_weak.upgrade() { Some(v) => v, None => return };
-        let user_e = match u_e_weak.upgrade() { Some(v) => v, None => return };
-        let list = match list_weak.upgrade() { Some(v) => v, None => return };
-        let host = host_e.text().to_string();
-        let port = port_e.text().parse::<u16>().unwrap_or(22);
-        let user = user_e.text().to_string();
-        if !host.is_empty() && !user.is_empty() {
-            let mut s = sessions_up.lock().unwrap();
-            if !s.iter().any(|x| x.host == host && x.username == user) {
-                s.push(ConnectionSettings { name: format!("{}@{}", user, host), host, port, username: user });
-                save_sessions(&s);
-                populate_list(&list, &s, &host_e, &port_e, &user_e, sess_clone_for_save.clone());
+    let custom_row = GtkBox::new(Orientation::Horizontal, 12);
+    let fg_btn = ColorButton::builder().rgba(&gtk::gdk::RGBA::GREEN).build();
+    custom_row.append(&Label::new(Some("Text:")));
+    custom_row.append(&fg_btn);
+
+    let bg_btn = ColorButton::builder().rgba(&gtk::gdk::RGBA::BLACK).build();
+    custom_row.append(&Label::new(Some("BG:")));
+    custom_row.append(&bg_btn);
+
+    let font_list = StringList::new(&["10", "12", "14", "16", "18", "20", "24"]);
+    let font_dropdown = DropDown::builder().model(&font_list).selected(2).build();
+    custom_row.append(&Label::new(Some("Font:")));
+    custom_row.append(&font_dropdown);
+    app_tab.append(&custom_row);
+
+    app_tab.append(&Label::builder().label("ANSI Palette").css_classes(["section-title"]).halign(gtk::Align::Start).build());
+    let palette_grid = Grid::new();
+    palette_grid.set_column_spacing(15);
+    palette_grid.set_row_spacing(10);
+    let mut palette_buttons = Vec::new();
+    let default_p = default_palette();
+    for i in 0..16 {
+        let col_box = GtkBox::new(Orientation::Vertical, 2);
+        let btn = ColorButton::builder().rgba(&hex_to_rgba(&default_p[i])).build();
+        let lbl = Label::builder().label(&format!("{}", i)).css_classes(["palette-label"]).build();
+        col_box.append(&btn);
+        col_box.append(&lbl);
+        palette_grid.attach(&col_box, (i % 8) as i32, (i / 8) as i32, 1, 1);
+        palette_buttons.push(btn);
+    }
+    app_tab.append(&palette_grid);
+    settings_nb.append_page(&app_tab, Some(&Label::new(Some("Appearance"))));
+
+    // Tab 3: Behavior
+    let behave_tab = GtkBox::new(Orientation::Vertical, 12);
+    behave_tab.set_margin_top(10);
+    behave_tab.set_margin_bottom(10);
+    behave_tab.set_margin_start(10);
+    behave_tab.set_margin_end(10);
+    
+    let behavior_row = GtkBox::new(Orientation::Horizontal, 12);
+    let cursor_styles = StringList::new(&["Block", "I-Beam", "Underline"]);
+    let cursor_dropdown = DropDown::builder().model(&cursor_styles).selected(0).build();
+    behavior_row.append(&Label::new(Some("Cursor:")));
+    behavior_row.append(&cursor_dropdown);
+
+    let blink_check = CheckButton::builder().label("Blink").active(true).build();
+    behavior_row.append(&blink_check);
+
+    let scroll_entry = Entry::builder().text("1000").width_chars(8).placeholder_text("Scrollback").build();
+    behavior_row.append(&Label::new(Some("Scroll:")));
+    behavior_row.append(&scroll_entry);
+    behave_tab.append(&behavior_row);
+
+    let ssh_row = GtkBox::new(Orientation::Horizontal, 12);
+    let keepalive_entry = Entry::builder().text("0").width_chars(6).placeholder_text("Keepalive").build();
+    ssh_row.append(&Label::new(Some("Keepalive (s):")));
+    ssh_row.append(&keepalive_entry);
+    let agent_check = CheckButton::builder().label("Forward Agent").active(false).build();
+    ssh_row.append(&agent_check);
+    behave_tab.append(&ssh_row);
+
+    settings_nb.append_page(&behave_tab, Some(&Label::new(Some("Behavior"))));
+
+    // Theme switching logic
+    let fg_clone = fg_btn.clone();
+    let bg_clone = bg_btn.clone();
+    let pal_clone = palette_buttons.clone();
+    let h_e_for_theme = host_entry.clone();
+    let u_e_for_theme = user_entry.clone();
+    let f_d_for_theme = font_dropdown.clone();
+    let c_d_for_theme = cursor_dropdown.clone();
+    let b_c_for_theme = blink_check.clone();
+    let s_e_for_theme = scroll_entry.clone();
+
+    theme_dropdown.connect_selected_notify(move |d| {
+        let idx = d.selected();
+        if idx < THEMES.len() as u32 {
+            IS_PROGRAMMATIC.with(|f| f.set(true));
+            let theme = &THEMES[idx as usize];
+            fg_clone.set_rgba(&hex_to_rgba(theme.fg));
+            bg_clone.set_rgba(&hex_to_rgba(theme.bg));
+            for (i, &p) in theme.palette.iter().enumerate() {
+                pal_clone[i].set_rgba(&hex_to_rgba(p));
+            }
+            IS_PROGRAMMATIC.with(|f| f.set(false));
+            
+            // Proactively update preview/active terms if name matches
+            let host = h_e_for_theme.text().to_string();
+            let user = u_e_for_theme.text().to_string();
+            if !host.is_empty() && !user.is_empty() {
+                let sid = format!("{}@{}", user, host);
+                let mock_settings = ConnectionSettings {
+                    name: sid.clone(), host, port: 22, username: user, password: None,
+                    fg_color: theme.fg.to_string(), bg_color: theme.bg.to_string(),
+                    font_size: f_d_for_theme.selected_item().and_then(|i| i.downcast::<gtk::StringObject>().ok()).map(|s| s.string().parse().unwrap_or(14)).unwrap_or(14),
+                    palette: theme.palette.iter().map(|s| s.to_string()).collect(),
+                    cursor_style: c_d_for_theme.selected_item().and_then(|i| i.downcast::<gtk::StringObject>().ok()).map(|s| s.string().to_string()).unwrap_or_else(|| "Block".to_string()),
+                    cursor_blink: b_c_for_theme.is_active(),
+                    scrollback: s_e_for_theme.text().parse().unwrap_or(1000),
+                    private_key: None, keepalive: 0, agent_forwarding: false,
+                    theme: theme.name.to_string(),
+                };
+                update_active_terminals(&sid, &mock_settings);
             }
         }
     });
 
-    let notebook_weak_conn = notebook.downgrade();
+    let theme_d_for_color = theme_dropdown.clone();
+    let update_custom = move || {
+        if IS_PROGRAMMATIC.with(|f| f.get()) { return; }
+        let custom_pos = THEMES.len() as u32;
+        if theme_d_for_color.selected() != custom_pos {
+            theme_d_for_color.set_selected(custom_pos);
+        }
+    };
+
+    let up_c = Arc::new(update_custom);
+    let up_c1 = up_c.clone();
+    fg_btn.connect_rgba_notify(move |_| { (*up_c1)(); });
+    let up_c2 = up_c.clone();
+    bg_btn.connect_rgba_notify(move |_| { (*up_c2)(); });
+    for b in &palette_buttons {
+        let up_ci = up_c.clone();
+        b.connect_rgba_notify(move |_| { (*up_ci)(); });
+    }
+
+    let sessions_vec = load_sessions();
+    let sessions_arc = Arc::new(Mutex::new(sessions_vec.clone()));
+    populate_list(&sessions_list, &sessions_vec, &host_entry, &port_entry, &user_entry, &pass_entry, &save_pass_check, &fg_btn, &bg_btn, &font_dropdown, &cursor_dropdown, &blink_check, &scroll_entry, &palette_buttons, sessions_arc.clone(), &key_entry, &theme_dropdown, &keepalive_entry, &agent_check);
+
     let h_e_weak = host_entry.downgrade();
     let p_e_weak = port_entry.downgrade();
     let u_e_weak = user_entry.downgrade();
-    let pass_e_weak = pass_entry.downgrade();
-    connect_btn.connect_clicked(move |_| {
-        let notebook_up = match notebook_weak_conn.upgrade() { Some(v) => v, None => return };
+    let ps_e_weak = pass_entry.downgrade();
+    let key_e_weak = key_entry.downgrade();
+    let sp_c_weak = save_pass_check.downgrade();
+    let theme_weak = theme_dropdown.downgrade();
+    let list_weak = sessions_list.downgrade();
+    let fg_weak = fg_btn.downgrade();
+    let bg_weak = bg_btn.downgrade();
+    let font_weak = font_dropdown.downgrade();
+    let cur_weak = cursor_dropdown.downgrade();
+    let blink_weak = blink_check.downgrade();
+    let scroll_weak = scroll_entry.downgrade();
+    let ka_weak = keepalive_entry.downgrade();
+    let ag_weak = agent_check.downgrade();
+    let pal_weaks: Vec<_> = palette_buttons.iter().map(|b| b.downgrade()).collect();
+    let sess_clone_for_save = sessions_arc.clone();
+    let pal_buttons_clone = palette_buttons.clone();
+    save_btn.connect_clicked(move |_| {
         let host_e = match h_e_weak.upgrade() { Some(v) => v, None => return };
         let port_e = match p_e_weak.upgrade() { Some(v) => v, None => return };
         let user_e = match u_e_weak.upgrade() { Some(v) => v, None => return };
-        let pass_e = match pass_e_weak.upgrade() { Some(v) => v, None => return };
+        let pass_e = match ps_e_weak.upgrade() { Some(v) => v, None => return };
+        let key_e = match key_e_weak.upgrade() { Some(v) => v, None => return };
+        let save_p_c = match sp_c_weak.upgrade() { Some(v) => v, None => return };
+        let theme_d = match theme_weak.upgrade() { Some(v) => v, None => return };
+        let list = match list_weak.upgrade() { Some(v) => v, None => return };
+        let fg_b = match fg_weak.upgrade() { Some(v) => v, None => return };
+        let bg_b = match bg_weak.upgrade() { Some(v) => v, None => return };
+        let font_d = match font_weak.upgrade() { Some(v) => v, None => return };
+        let cur_d = match cur_weak.upgrade() { Some(v) => v, None => return };
+        let blink_c = match blink_weak.upgrade() { Some(v) => v, None => return };
+        let scroll_e = match scroll_weak.upgrade() { Some(v) => v, None => return };
+        let ka_e = match ka_weak.upgrade() { Some(v) => v, None => return };
+        let ag_c = match ag_weak.upgrade() { Some(v) => v, None => return };
+        let mut pal = Vec::new();
+        for pw in &pal_weaks { if let Some(pb) = pw.upgrade() { pal.push(rgba_to_hex(pb.rgba())); } }
+
         let host = host_e.text().to_string();
         let port = port_e.text().parse::<u16>().unwrap_or(22);
         let user = user_e.text().to_string();
         let pass = pass_e.text().to_string();
-        if host.is_empty() || user.is_empty() { return; }
-        
-        create_terminal_tab(&notebook_up, &host, port, &user, &pass);
+        let key = key_e.text().to_string();
+        let fg = rgba_to_hex(fg_b.rgba());
+        let bg = rgba_to_hex(bg_b.rgba());
+        let font_size = font_d.selected_item().unwrap().downcast::<gtk::StringObject>().unwrap().string().parse::<i32>().unwrap_or(14);
+        let cur_style = cur_d.selected_item().unwrap().downcast::<gtk::StringObject>().unwrap().string().to_string();
+        let blink = blink_c.is_active();
+        let scroll = scroll_e.text().parse::<i32>().unwrap_or(1000);
+        let keepalive = ka_e.text().parse::<u32>().unwrap_or(0);
+        let agent = ag_c.is_active();
+        let theme_name = theme_d.selected_item().unwrap().downcast::<gtk::StringObject>().unwrap().string().to_string();
+
+        if !host.is_empty() && !user.is_empty() {
+            let mut s = sess_clone_for_save.lock().unwrap();
+            let save_pass = save_p_c.is_active();
+            let settings = ConnectionSettings { 
+                name: format!("{}@{}", user, host), host, port, username: user,
+                password: if save_pass && !pass.is_empty() { Some(pass) } else { None },
+                fg_color: fg, bg_color: bg, font_size,
+                palette: pal,
+                cursor_style: cur_style, cursor_blink: blink, scrollback: scroll,
+                private_key: if key.is_empty() { None } else { Some(key) },
+                keepalive, agent_forwarding: agent, theme: theme_name,
+            };
+            let s_name = settings.name.clone();
+            if let Some(pos) = s.iter().position(|x| x.host == settings.host && x.username == settings.username) {
+                s[pos] = settings.clone();
+            } else {
+                s.push(settings.clone());
+            }
+            save_sessions(&s);
+            populate_list(&list, &s, &host_e, &port_e, &user_e, &pass_e, &save_p_c, &fg_b, &bg_b, &font_d, &cur_d, &blink_c, &scroll_e, &pal_buttons_clone, sess_clone_for_save.clone(), &key_e, &theme_d, &ka_e, &ag_c);
+            update_active_terminals(&s_name, &settings);
+        }
     });
 
+    let app_weak = app.downgrade();
+    let h_e_weak = host_entry.downgrade();
+    let p_e_weak = port_entry.downgrade();
+    let u_e_weak = user_entry.downgrade();
+    let pass_e_weak = pass_entry.downgrade();
+    let key_e_weak = key_entry.downgrade();
+    let fg_weak = fg_btn.downgrade();
+    let bg_weak = bg_btn.downgrade();
+    let font_weak = font_dropdown.downgrade();
+    let cur_weak = cursor_dropdown.downgrade();
+    let blink_weak = blink_check.downgrade();
+    let scroll_weak = scroll_entry.downgrade();
+    let ka_weak = keepalive_entry.downgrade();
+    let ag_weak = agent_check.downgrade();
+    let theme_weak = theme_dropdown.downgrade();
+    let pal_weaks: Vec<_> = palette_buttons.iter().map(|b| b.downgrade()).collect();
+    connect_btn.connect_clicked(move |_| {
+        let app = match app_weak.upgrade() { Some(v) => v, None => return };
+        let host_e = match h_e_weak.upgrade() { Some(v) => v, None => return };
+        let port_e = match p_e_weak.upgrade() { Some(v) => v, None => return };
+        let user_e = match u_e_weak.upgrade() { Some(v) => v, None => return };
+        let pass_e = match pass_e_weak.upgrade() { Some(v) => v, None => return };
+        let key_e = match key_e_weak.upgrade() { Some(v) => v, None => return };
+        let fg_b = match fg_weak.upgrade() { Some(v) => v, None => return };
+        let bg_b = match bg_weak.upgrade() { Some(v) => v, None => return };
+        let font_d = match font_weak.upgrade() { Some(v) => v, None => return };
+        let cur_d = match cur_weak.upgrade() { Some(v) => v, None => return };
+        let blink_c = match blink_weak.upgrade() { Some(v) => v, None => return };
+        let scroll_e = match scroll_weak.upgrade() { Some(v) => v, None => return };
+        let ka_e = match ka_weak.upgrade() { Some(v) => v, None => return };
+        let ag_c = match ag_weak.upgrade() { Some(v) => v, None => return };
+        let theme_d = match theme_weak.upgrade() { Some(v) => v, None => return };
+        let mut pal = Vec::new();
+        for pw in &pal_weaks { if let Some(pb) = pw.upgrade() { pal.push(rgba_to_hex(pb.rgba())); } }
+
+        let host = host_e.text().to_string();
+        let port = port_e.text().parse::<u16>().unwrap_or(22);
+        let user = user_e.text().to_string();
+        let pass = pass_e.text().to_string();
+        let key = key_e.text().to_string();
+        let fg = rgba_to_hex(fg_b.rgba());
+        let bg = rgba_to_hex(bg_b.rgba());
+        let font_size = font_d.selected_item().unwrap().downcast::<gtk::StringObject>().unwrap().string().parse::<i32>().unwrap_or(14);
+        let cur_style = cur_d.selected_item().unwrap().downcast::<gtk::StringObject>().unwrap().string().to_string();
+        let blink = blink_c.is_active();
+        let scroll = scroll_e.text().parse::<i32>().unwrap_or(1000);
+        let keepalive = ka_e.text().parse::<u32>().unwrap_or(0);
+        let agent = ag_c.is_active();
+        let theme_name = theme_d.selected_item().unwrap().downcast::<gtk::StringObject>().unwrap().string().to_string();
+
+        let mut pal = Vec::new();
+        for pw in &pal_weaks { if let Some(pb) = pw.upgrade() { pal.push(rgba_to_hex(pb.rgba())); } }
+
+        if host.is_empty() || user.is_empty() { return; }
+        
+        handle_connect(&app, &ConnectionSettings {
+            name: format!("{}@{}", user, host), host, port, username: user,
+            password: if pass.is_empty() { None } else { Some(pass.clone()) },
+            fg_color: fg, bg_color: bg, font_size,
+            palette: if pal.len() == 16 { pal } else { default_palette() },
+            cursor_style: cur_style, cursor_blink: blink, scrollback: scroll,
+            private_key: if key.is_empty() { None } else { Some(key) },
+            keepalive, agent_forwarding: agent, theme: theme_name,
+        }, if pass.is_empty() { None } else { Some(pass) });
+    });
+
+    window.connect_destroy(move |_| {
+        CONN_WIN.with(|cell| *cell.borrow_mut() = None);
+        TARGET_NB.with(|cell| *cell.borrow_mut() = glib::object::WeakRef::new());
+    });
+    
+    window.set_hide_on_close(true);
+    CONN_WIN.with(|cell| *cell.borrow_mut() = Some(window.clone()));
     window.present();
 }
 
-fn create_terminal_tab(notebook: &Notebook, host: &str, port: u16, user: &str, pass: &str) {
-    let terminal_box = GtkBox::new(Orientation::Vertical, 0);
+fn handle_connect(app: &Application, settings: &ConnectionSettings, override_pass: Option<String>) {
+    let target = TARGET_NB.with(|cell| cell.borrow().upgrade());
+    if let Some(nb) = target {
+        add_terminal_tab(&nb, settings, override_pass);
+        TARGET_NB.with(|cell| *cell.borrow_mut() = glib::object::WeakRef::new());
+        if let Some(win) = nb.root().and_then(|r| r.downcast::<gtk::Window>().ok()) {
+            win.present();
+        }
+        if let Some(win) = CONN_WIN.with(|cell| cell.borrow().clone()) {
+            win.close();
+        }
+    } else {
+        create_terminal_window(app, settings, override_pass);
+    }
+}
+
+fn create_terminal_window(app: &Application, settings: &ConnectionSettings, override_pass: Option<String>) {
+    let window = ApplicationWindow::builder().application(app).title(&format!("Terminal SSH: {}", settings.name)).default_width(1000).default_height(750).build();
+    let header = HeaderBar::new();
+    header.set_show_title_buttons(true);
+    
+    let menu = gio::Menu::new();
+    menu.append(Some("New Tab (Same Host)"), Some("win.new_tab_same"));
+    menu.append(Some("New Tab (Other Host)"), Some("win.new_tab_other"));
+    menu.append(Some("New Connection (New Window)"), Some("win.new_window"));
+    
+    let menu_btn = MenuButton::builder().icon_name("list-add-symbolic").menu_model(&menu).tooltip_text("New Connection Options").build();
+    header.pack_start(&menu_btn);
+    
+    let close_btn = Button::builder().icon_name("window-close-symbolic").tooltip_text("Close Window").build();
+    let win_weak = window.downgrade();
+    close_btn.connect_clicked(move |_| {
+        if let Some(win) = win_weak.upgrade() {
+            win.close();
+        }
+    });
+    header.pack_end(&close_btn);
+    window.set_titlebar(Some(&header));
+
+    let notebook = Notebook::new();
+    notebook.set_scrollable(true);
+    notebook.set_show_border(false);
+    window.set_child(Some(&notebook));
+    
+    let nb_weak = notebook.downgrade();
+    let app_weak = app.downgrade();
+    let s_clone = settings.clone();
+    let p_clone = override_pass.clone();
+    
+    let action_same = gio::SimpleAction::new("new_tab_same", None);
+    action_same.connect_activate(move |_, _| {
+        if let Some(nb) = nb_weak.upgrade() {
+            add_terminal_tab(&nb, &s_clone, p_clone.clone());
+        }
+    });
+    window.add_action(&action_same);
+
+    let app_weak2 = app_weak.clone();
+    let nb_weak2 = notebook.downgrade();
+    let action_other = gio::SimpleAction::new("new_tab_other", None);
+    action_other.connect_activate(move |_, _| {
+        if let (Some(app), Some(nb)) = (app_weak2.upgrade(), nb_weak2.upgrade()) {
+            ensure_connect_window(&app, Some(nb));
+        }
+    });
+    window.add_action(&action_other);
+
+    let app_weak3 = app_weak.clone();
+    let action_window = gio::SimpleAction::new("new_window", None);
+    action_window.connect_activate(move |_, _| {
+        if let Some(app) = app_weak3.upgrade() {
+            ensure_connect_window(&app, None);
+        }
+    });
+    window.add_action(&action_window);
+
+    add_terminal_tab(&notebook, settings, override_pass);
+    window.present();
+}
+
+fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, override_pass: Option<String>) {
     let text_view = TextView::builder().editable(false).monospace(true).cursor_visible(true).focusable(true).can_focus(true).build();
-    let term_scrolled = ScrolledWindow::builder().child(&text_view).vexpand(true).build();
-    terminal_box.append(&term_scrolled);
+    let provider = CssProvider::new();
+    provider.load_from_data(&format!(
+        "textview, textview text {{ background-color: {}; color: {}; font-size: {}pt; }}",
+        settings.bg_color, settings.fg_color, settings.font_size
+    ));
+    text_view.style_context().add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 200);
 
-    let label_box = GtkBox::new(Orientation::Horizontal, 6);
-    let label = Label::new(Some(&format!("{}@{}", user, host)));
-    label_box.append(&label);
-    let close_btn = Button::builder().icon_name("window-close-symbolic").css_classes(["destructive-action"]).build();
-    label_box.append(&close_btn);
-
-    let page_num = notebook.append_page(&terminal_box, Some(&label_box));
-    notebook.set_current_page(Some(page_num));
+    let scrolled = ScrolledWindow::builder().child(&text_view).vexpand(true).build();
+    let label = Label::new(Some(&settings.name));
+    let index = notebook.append_page(&scrolled, Some(&label));
+    notebook.set_current_page(Some(index));
     text_view.grab_focus();
 
     let (input_tx, input_rx) = flume::unbounded::<Vec<u8>>();
     let (output_tx, output_rx) = flume::unbounded::<Vec<u8>>();
-    let term_state = Arc::new(Mutex::new(TerminalState::new(text_view.buffer())));
+    
+    let term_state = Arc::new(Mutex::new(TerminalState::new(text_view.buffer(), settings.palette.clone())));
+    
+    // Register for active updates
+    let sid = settings.name.clone();
+    let tv_weak = text_view.downgrade();
+    let prov_clone = provider.clone();
+    let ts_clone = term_state.clone();
+    ACTIVE_TERMINALS.with(|at| {
+        at.borrow_mut().push(ActiveTerminal {
+            session_id: sid,
+            text_view: tv_weak,
+            css_provider: prov_clone,
+            term_state: ts_clone,
+        });
+    });
     let mut parser = Parser::new();
 
     let tv_weak = text_view.downgrade();
@@ -308,9 +951,30 @@ fn create_terminal_tab(notebook: &Notebook, host: &str, port: u16, user: &str, p
     });
 
     let itx = input_tx.clone();
+    let tv_for_key = text_view.clone();
     let key_controller = EventControllerKey::new();
     key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     key_controller.connect_key_pressed(move |_controller, keyval, _keycode, state| {
+        let is_ctrl = state.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+        if is_ctrl {
+            if keyval == gtk::gdk::Key::c || keyval == gtk::gdk::Key::C {
+                let clipboard = tv_for_key.clipboard();
+                if let Some((start, end)) = tv_for_key.buffer().selection_bounds() {
+                    let text = tv_for_key.buffer().text(&start, &end, false);
+                    clipboard.set_text(&text);
+                }
+                return glib::Propagation::Stop;
+            } else if keyval == gtk::gdk::Key::v || keyval == gtk::gdk::Key::V {
+                let clipboard = tv_for_key.clipboard();
+                let itx_clone = itx.clone();
+                clipboard.read_text_async(None::<&gio::Cancellable>, move |result| {
+                    if let Ok(Some(text)) = result {
+                        let _ = itx_clone.send(text.into_bytes());
+                    }
+                });
+                return glib::Propagation::Stop;
+            }
+        }
         if let Some(data) = keyval_to_bytes(keyval, state) {
             let _ = itx.send(data);
             return glib::Propagation::Stop;
@@ -319,25 +983,12 @@ fn create_terminal_tab(notebook: &Notebook, host: &str, port: u16, user: &str, p
     });
     text_view.add_controller(key_controller);
 
-    let nb_weak = notebook.downgrade();
-    let tb_weak = terminal_box.downgrade();
-    close_btn.connect_clicked(move |_| {
-        if let (Some(nb), Some(tb)) = (nb_weak.upgrade(), tb_weak.upgrade()) {
-            if let Some(pos) = nb.page_num(&tb) {
-                nb.remove_page(Some(pos));
-            }
-        }
-    });
-
-    let host_s = host.to_string();
-    let user_s = user.to_string();
-    let pass_s = pass.to_string();
-    
-    // Set initial text
-    text_view.buffer().set_text(&format!("Connecting to {}@{}...\n", user, host));
+    let s_clone = settings.clone();
+    let final_pass = override_pass.or(settings.password.clone());
+    text_view.buffer().set_text(&format!("Connecting to {}...\n", settings.name));
 
     std::thread::spawn(move || {
-        match connect_ssh(&host_s, port, &user_s, &pass_s) {
+        match connect_ssh(&s_clone.host, s_clone.port, &s_clone.username, final_pass.as_deref().unwrap_or(""), s_clone.private_key.as_deref(), s_clone.keepalive, s_clone.agent_forwarding) {
             Ok((session, mut channel)) => {
                 let _ = output_tx.send(b"Connection established.\r\n".to_vec());
                 let _ = session.set_blocking(false);
@@ -375,52 +1026,250 @@ fn create_terminal_tab(notebook: &Notebook, host: &str, port: u16, user: &str, p
     });
 }
 
-fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], host_e: &Entry, port_e: &Entry, user_e: &Entry, sessions_arc: Arc<Mutex<Vec<ConnectionSettings>>>) {
+fn populate_list(list: &ListBox, sessions: &[ConnectionSettings], host_e: &Entry, port_e: &Entry, user_e: &Entry, pass_e: &Entry, save_p: &CheckButton, fg_b: &ColorButton, bg_b: &ColorButton, font_d: &DropDown, cur_d: &DropDown, blink_c: &CheckButton, scroll_e: &Entry, palette_btns: &[ColorButton], sessions_arc: Arc<Mutex<Vec<ConnectionSettings>>>, key_e: &Entry, theme_d: &DropDown, ka_e: &Entry, ag_c: &CheckButton) {
     while let Some(child) = list.first_child() { list.remove(&child); }
     for (index, s) in sessions.iter().enumerate() {
         let row_box = GtkBox::new(Orientation::Horizontal, 10);
         row_box.add_css_class("session-row");
         let label = Label::builder().label(&s.name).halign(gtk::Align::Start).hexpand(true).build();
         row_box.append(&label);
-        let delete_btn = Button::builder().icon_name("user-trash-symbolic").css_classes(["destructive-action"]).build();
+        
+        let save_row_btn = Button::builder().icon_name("document-save-symbolic").css_classes(["secondary-action"]).tooltip_text("Save current settings to this session").build();
+        row_box.append(&save_row_btn);
+        
+        let delete_btn = Button::builder().icon_name("user-trash-symbolic").css_classes(["destructive-action"]).tooltip_text("Delete session").build();
         row_box.append(&delete_btn);
         let row = gtk::ListBoxRow::builder().child(&row_box).build();
         list.append(&row);
+        
         let s_arc_clone = sessions_arc.clone();
         let list_weak = list.downgrade();
         let h_e_weak = host_e.downgrade();
         let p_e_weak = port_e.downgrade();
         let u_e_weak = user_e.downgrade();
+        let ps_e_weak = pass_e.downgrade();
+        let save_p_weak = save_p.downgrade();
+        let fg_weak = fg_b.downgrade();
+        let bg_weak = bg_b.downgrade();
+        let font_weak = font_d.downgrade();
+        let cur_weak = cur_d.downgrade();
+        let blink_weak = blink_c.downgrade();
+        let scroll_weak = scroll_e.downgrade();
+        let key_e_weak = key_e.downgrade();
+        let theme_d_weak = theme_d.downgrade();
+        let ka_e_weak = ka_e.downgrade();
+        let ag_c_weak = ag_c.downgrade();
+        let p_buttons = palette_btns.to_vec();
+        let name_clone = s.name.clone();
+
+        let s_arc_for_save = sessions_arc.clone();
+        let h_e_w2 = h_e_weak.clone();
+        let p_e_w2 = p_e_weak.clone();
+        let u_e_w2 = u_e_weak.clone();
+        let ps_e_w2 = ps_e_weak.clone();
+        let sp_w2 = save_p_weak.clone();
+        let th_w2 = theme_d_weak.clone();
+        let fg_w2 = fg_weak.clone();
+        let bg_w2 = bg_weak.clone();
+        let f_d_w2 = font_weak.clone();
+        let c_d_w2 = cur_weak.clone();
+        let bc_w2 = blink_weak.clone();
+        let sc_w2 = scroll_weak.clone();
+        let ka_w2 = ka_e_weak.clone();
+        let ac_w2 = ag_c_weak.clone();
+        let ls_w2 = list.downgrade();
+        let ke_w2 = key_e_weak.clone();
+        let pb_w2 = p_buttons.clone();
+
+        save_row_btn.connect_clicked(move |_| {
+            let h_e = match h_e_w2.upgrade() { Some(v) => v, None => return };
+            let p_e = match p_e_w2.upgrade() { Some(v) => v, None => return };
+            let u_e = match u_e_w2.upgrade() { Some(v) => v, None => return };
+            let ps_e = match ps_e_w2.upgrade() { Some(v) => v, None => return };
+            let save_p_c = match sp_w2.upgrade() { Some(v) => v, None => return };
+            let theme_d = match th_w2.upgrade() { Some(v) => v, None => return };
+            let fg_b = match fg_w2.upgrade() { Some(v) => v, None => return };
+            let bg_b = match bg_w2.upgrade() { Some(v) => v, None => return };
+            let font_d = match f_d_w2.upgrade() { Some(v) => v, None => return };
+            let cur_d = match c_d_w2.upgrade() { Some(v) => v, None => return };
+            let blink_c = match bc_w2.upgrade() { Some(v) => v, None => return };
+            let scroll_e = match sc_w2.upgrade() { Some(v) => v, None => return };
+            let ka_e = match ka_w2.upgrade() { Some(v) => v, None => return };
+            let ag_c = match ac_w2.upgrade() { Some(v) => v, None => return };
+            let list = match ls_w2.upgrade() { Some(v) => v, None => return };
+            let key_e_up = match ke_w2.upgrade() { Some(v) => v, None => return };
+            
+            let mut pal = Vec::new();
+            for btn in &pb_w2 { pal.push(rgba_to_hex(btn.rgba())); }
+
+            let settings = ConnectionSettings {
+                name: name_clone.clone(),
+                host: h_e.text().to_string(),
+                port: p_e.text().parse().unwrap_or(22),
+                username: u_e.text().to_string(),
+                password: if save_p_c.is_active() { Some(ps_e.text().to_string()) } else { None },
+                fg_color: rgba_to_hex(fg_b.rgba()),
+                bg_color: rgba_to_hex(bg_b.rgba()),
+                font_size: font_d.selected_item().and_then(|i| i.downcast::<gtk::StringObject>().ok()).map(|s| s.string().parse().unwrap_or(14)).unwrap_or(14),
+                palette: pal,
+                cursor_style: cur_d.selected_item().and_then(|i| i.downcast::<gtk::StringObject>().ok()).map(|s| s.string().to_string()).unwrap_or_else(|| "Block".to_string()),
+                cursor_blink: blink_c.is_active(),
+                scrollback: scroll_e.text().parse().unwrap_or(1000),
+                private_key: if key_e_up.text().to_string().is_empty() { None } else { Some(key_e_up.text().to_string()) },
+                keepalive: ka_e.text().parse().unwrap_or(0),
+                agent_forwarding: ag_c.is_active(),
+                theme: theme_d.selected_item().and_then(|i| i.downcast::<gtk::StringObject>().ok()).map(|s| s.string().to_string()).unwrap_or_else(|| "Custom".to_string()),
+            };
+
+            let mut s_vec = s_arc_for_save.lock().unwrap();
+            if index < s_vec.len() {
+                s_vec[index] = settings.clone();
+                save_sessions(&s_vec);
+                populate_list(&list, &s_vec, &h_e, &p_e, &u_e, &ps_e, &save_p_c, &fg_b, &bg_b, &font_d, &cur_d, &blink_c, &scroll_e, &pb_w2, s_arc_for_save.clone(), &key_e_up, &theme_d, &ka_e, &ag_c);
+                update_active_terminals(&settings.name, &settings);
+            }
+        });
+
         delete_btn.connect_clicked(move |_| {
             let list_up = match list_weak.upgrade() { Some(v) => v, None => return };
             let h_e = match h_e_weak.upgrade() { Some(v) => v, None => return };
             let p_e = match p_e_weak.upgrade() { Some(v) => v, None => return };
             let u_e = match u_e_weak.upgrade() { Some(v) => v, None => return };
+            let ps_e = match ps_e_weak.upgrade() { Some(v) => v, None => return };
+            let save_p_up = match save_p_weak.upgrade() { Some(v) => v, None => return };
+            let fg = match fg_weak.upgrade() { Some(v) => v, None => return };
+            let bg = match bg_weak.upgrade() { Some(v) => v, None => return };
+            let font = match font_weak.upgrade() { Some(v) => v, None => return };
+            let cur = match cur_weak.upgrade() { Some(v) => v, None => return };
+            let blink = match blink_weak.upgrade() { Some(v) => v, None => return };
+            let scroll = match scroll_weak.upgrade() { Some(v) => v, None => return };
+            let key_up = match key_e_weak.upgrade() { Some(v) => v, None => return };
+            let theme_up = match theme_d_weak.upgrade() { Some(v) => v, None => return };
+            let ka_up = match ka_e_weak.upgrade() { Some(v) => v, None => return };
+            let ag_up = match ag_c_weak.upgrade() { Some(v) => v, None => return };
+            
             let mut s = s_arc_clone.lock().unwrap();
             if index < s.len() {
                 s.remove(index);
                 save_sessions(&s);
-                populate_list(&list_up, &s, &h_e, &p_e, &u_e, s_arc_clone.clone());
+                populate_list(&list_up, &s, &h_e, &p_e, &u_e, &ps_e, &save_p_up, &fg, &bg, &font, &cur, &blink, &scroll, &p_buttons, s_arc_clone.clone(), &key_up, &theme_up, &ka_up, &ag_up);
             }
         });
     }
+    
     let sessions_vec = sessions.to_vec();
     let h_e_weak = host_e.downgrade();
     let p_e_weak = port_e.downgrade();
-    let u_e_weak = user_e.downgrade();
+    let u_e_weak = user_entry_downgrade(user_e); 
+    let ps_e_weak = pass_entry_downgrade(pass_e);
+    let save_p_weak = save_p.downgrade();
+    let fg_weak = fg_button_downgrade(fg_b);
+    let bg_weak = bg_button_downgrade(bg_b);
+    let font_weak = font_dropdown_downgrade(font_d);
+    let cur_weak = cur_dropdown_downgrade(cur_d);
+    let blink_weak = blink_check_downgrade(blink_c);
+    let scroll_weak = scroll_entry_downgrade(scroll_e);
+    let key_e_weak = key_e.downgrade();
+    let theme_d_weak = theme_d.downgrade();
+    let ka_e_weak = ka_e.downgrade();
+    let ag_c_weak = ag_c.downgrade();
+    let pal_buttons = palette_btns.to_vec();
+    
     list.connect_row_activated(move |_, row| {
         let h_e = match h_e_weak.upgrade() { Some(v) => v, None => return };
         let p_e = match p_e_weak.upgrade() { Some(v) => v, None => return };
-        let u_e = match u_e_weak.upgrade() { Some(v) => v, None => return };
+        let u_e = match upgrade_user_e(&u_e_weak) { Some(v) => v, None => return };
+        let ps_e = match upgrade_pass_e(&ps_e_weak) { Some(v) => v, None => return };
+        let save_p = match save_p_weak.upgrade() { Some(v) => v, None => return };
+        let fg = match upgrade_fg_b(&fg_weak) { Some(v) => v, None => return };
+        let bg = match upgrade_bg_b(&bg_weak) { Some(v) => v, None => return };
+        let font = match upgrade_font_d(&font_weak) { Some(v) => v, None => return };
+        let cur = match upgrade_cur_d(&cur_weak) { Some(v) => v, None => return };
+        let blink = match upgrade_blink_c(&blink_weak) { Some(v) => v, None => return };
+        let scroll = match upgrade_scroll_e(&scroll_weak) { Some(v) => v, None => return };
+        let key_up = match key_e_weak.upgrade() { Some(v) => v, None => return };
+        let theme_up = match theme_d_weak.upgrade() { Some(v) => v, None => return };
+        let ka_up = match ka_e_weak.upgrade() { Some(v) => v, None => return };
+        let ag_up = match ag_c_weak.upgrade() { Some(v) => v, None => return };
+
         if let Some(s) = sessions_vec.get(row.index() as usize) {
             h_e.set_text(&s.host); p_e.set_text(&s.port.to_string()); u_e.set_text(&s.username);
+            ps_e.set_text(s.password.as_deref().unwrap_or(""));
+            key_up.set_text(s.private_key.as_deref().unwrap_or(""));
+            save_p.set_active(s.password.is_some());
+            fg.set_rgba(&hex_to_rgba(&s.fg_color));
+            bg.set_rgba(&hex_to_rgba(&s.bg_color));
+            
+            if let Some(model) = font.model().and_then(|m| m.downcast::<StringList>().ok()) {
+                for i in 0..model.n_items() {
+                    if let Some(str_obj) = model.string(i) {
+                        if str_obj == s.font_size.to_string() { font.set_selected(i); break; }
+                    }
+                }
+            }
+            if let Some(model) = cur.model().and_then(|m| m.downcast::<StringList>().ok()) {
+                for i in 0..model.n_items() {
+                    if let Some(str_obj) = model.string(i) {
+                        if str_obj == s.cursor_style { cur.set_selected(i); break; }
+                    }
+                }
+            }
+            if let Some(model) = theme_up.model().and_then(|m| m.downcast::<StringList>().ok()) {
+                for i in 0..model.n_items() {
+                    if let Some(str_obj) = model.string(i) {
+                        if str_obj == s.theme { theme_up.set_selected(i); break; }
+                    }
+                }
+            }
+            blink.set_active(s.cursor_blink);
+            scroll.set_text(&s.scrollback.to_string());
+            ka_up.set_text(&s.keepalive.to_string());
+            ag_up.set_active(s.agent_forwarding);
+            for i in 0..16 {
+                if i < s.palette.len() && i < pal_buttons.len() {
+                    pal_buttons[i].set_rgba(&hex_to_rgba(&s.palette[i]));
+                }
+            }
         }
     });
 }
 
-fn keyval_to_bytes(keyval: gdk::Key, state: gdk::ModifierType) -> Option<Vec<u8>> {
-    use gdk::Key;
-    let is_ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+fn user_entry_downgrade(e: &Entry) -> glib::object::WeakRef<Entry> { e.downgrade() }
+fn pass_entry_downgrade(e: &Entry) -> glib::object::WeakRef<Entry> { e.downgrade() }
+fn fg_button_downgrade(b: &ColorButton) -> glib::object::WeakRef<ColorButton> { b.downgrade() }
+fn bg_button_downgrade(b: &ColorButton) -> glib::object::WeakRef<ColorButton> { b.downgrade() }
+fn font_dropdown_downgrade(d: &DropDown) -> glib::object::WeakRef<DropDown> { d.downgrade() }
+fn cur_dropdown_downgrade(d: &DropDown) -> glib::object::WeakRef<DropDown> { d.downgrade() }
+fn blink_check_downgrade(c: &CheckButton) -> glib::object::WeakRef<CheckButton> { c.downgrade() }
+fn scroll_entry_downgrade(e: &Entry) -> glib::object::WeakRef<Entry> { e.downgrade() }
+
+fn upgrade_user_e(w: &glib::object::WeakRef<Entry>) -> Option<Entry> { w.upgrade() }
+fn upgrade_pass_e(w: &glib::object::WeakRef<Entry>) -> Option<Entry> { w.upgrade() }
+fn upgrade_fg_b(w: &glib::object::WeakRef<ColorButton>) -> Option<ColorButton> { w.upgrade() }
+fn upgrade_bg_b(w: &glib::object::WeakRef<ColorButton>) -> Option<ColorButton> { w.upgrade() }
+fn upgrade_font_d(w: &glib::object::WeakRef<DropDown>) -> Option<DropDown> { w.upgrade() }
+fn upgrade_cur_d(w: &glib::object::WeakRef<DropDown>) -> Option<DropDown> { w.upgrade() }
+fn upgrade_blink_c(w: &glib::object::WeakRef<CheckButton>) -> Option<CheckButton> { w.upgrade() }
+fn upgrade_scroll_e(w: &glib::object::WeakRef<Entry>) -> Option<Entry> { w.upgrade() }
+
+fn rgba_to_hex(rgba: gtk::gdk::RGBA) -> String {
+    format!("#{:02x}{:02x}{:02x}", 
+        (rgba.red() * 255.0) as u8, 
+        (rgba.green() * 255.0) as u8, 
+        (rgba.blue() * 255.0) as u8)
+}
+
+fn hex_to_rgba(hex: &str) -> gtk::gdk::RGBA {
+    let hex = hex.trim_start_matches('#');
+    let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0) as f32 / 255.0;
+    let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0) as f32 / 255.0;
+    let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0) as f32 / 255.0;
+    gtk::gdk::RGBA::builder().red(r).green(g).blue(b).alpha(1.0).build()
+}
+
+fn keyval_to_bytes(keyval: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> Option<Vec<u8>> {
+    use gtk::gdk::Key;
+    let is_ctrl = state.contains(gtk::gdk::ModifierType::CONTROL_MASK);
     match keyval {
         Key::Return | Key::KP_Enter => Some(b"\r".to_vec()),
         Key::BackSpace => Some(b"\x7f".to_vec()),
@@ -442,16 +1291,54 @@ fn keyval_to_bytes(keyval: gdk::Key, state: gdk::ModifierType) -> Option<Vec<u8>
     }
 }
 
-use gtk::gdk;
-
-fn connect_ssh(host: &str, port: u16, user: &str, pass: &str) -> Result<(ssh2::Session, ssh2::Channel), Box<dyn std::error::Error + Send + Sync>> {
+fn connect_ssh(host: &str, port: u16, user: &str, pass: &str, key_path: Option<&str>, keepalive: u32, agent_forwarding: bool) -> Result<(ssh2::Session, ssh2::Channel), Box<dyn std::error::Error + Send + Sync>> {
     let tcp = TcpStream::connect(format!("{}:{}", host, port))?;
     let mut sess = SshSession::new()?;
     sess.set_tcp_stream(tcp);
     sess.handshake()?;
-    sess.userauth_password(user, pass)?;
+    
+    if let Some(path) = key_path {
+        sess.userauth_pubkey_file(user, None, std::path::Path::new(path), None)?;
+    } else if !pass.is_empty() {
+        sess.userauth_password(user, pass)?;
+    } else {
+        return Err("Authentication failed: No password or key specified".into());
+    }
+
+    if keepalive > 0 {
+        sess.set_keepalive(true, keepalive);
+    }
+    
     let mut channel = sess.channel_session()?;
+    if agent_forwarding {
+        let _ = channel.request_auth_agent_forwarding();
+    }
     channel.request_pty("xterm-256color", None, Some((80, 24, 0, 0)))?;
     channel.shell()?;
     Ok((sess, channel))
+}
+
+fn update_active_terminals(session_id: &str, settings: &ConnectionSettings) {
+    ACTIVE_TERMINALS.with(|at| {
+        let mut list = at.borrow_mut();
+        // Clear dead ones while we are at it
+        list.retain(|t| t.text_view.upgrade().is_some());
+        
+        for t in list.iter() {
+            if t.session_id == session_id {
+                t.css_provider.load_from_data(&format!(
+                    "textview, textview text {{ background-color: {}; color: {}; font-size: {}pt; }}",
+                    settings.bg_color, settings.fg_color, settings.font_size
+                ));
+                if let Ok(mut state) = t.term_state.lock() {
+                    state.update_palette(&settings.palette);
+                    state.buffer.tag_table().foreach(|tag| {
+                        if tag.name().map(|n| n == "bold").unwrap_or(false) {
+                            tag.set_foreground(None); 
+                        }
+                    });
+                }
+            }
+        }
+    });
 }
