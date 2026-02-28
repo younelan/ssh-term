@@ -63,6 +63,13 @@ impl TerminalState {
         dim_tag.set_weight(300);
         tag_table.add(&dim_tag);
         
+        let italic_tag = TextTag::new(Some("italic"));
+        italic_tag.set_style(gtk::pango::Style::Italic);
+        tag_table.add(&italic_tag);
+        
+        let inv_tag = TextTag::new(Some("inverse"));
+        tag_table.add(&inv_tag);
+        
         let und_tag = TextTag::new(Some("underline"));
         und_tag.set_underline(gtk::pango::Underline::Single);
         tag_table.add(&und_tag);
@@ -129,6 +136,14 @@ impl TerminalState {
 
     pub fn update_palette(&mut self, palette: &[String]) {
         let tag_table = self.active_buffer().tag_table();
+        let bg = palette.first().cloned().unwrap_or_else(|| "#000000".to_string());
+        let fg = palette.get(7).cloned().unwrap_or_else(|| "#ffffff".to_string());
+        
+        if let Some(tag) = tag_table.lookup("inverse") {
+            tag.set_foreground(Some(&bg));
+            tag.set_background(Some(&fg));
+        }
+
         let codes = [
             "30", "31", "32", "33", "34", "35", "36", "37",
             "90", "91", "92", "93", "94", "95", "96", "97",
@@ -171,10 +186,14 @@ impl TerminalState {
                 0 => self.current_tags.clear(),
                 1 => if !self.current_tags.contains(&"bold".to_string()) { self.current_tags.push("bold".to_string()); },
                 2 => if !self.current_tags.contains(&"dim".to_string()) { self.current_tags.push("dim".to_string()); },
+                3 => if !self.current_tags.contains(&"italic".to_string()) { self.current_tags.push("italic".to_string()); },
                 4 => if !self.current_tags.contains(&"underline".to_string()) { self.current_tags.push("underline".to_string()); },
+                7 => if !self.current_tags.contains(&"inverse".to_string()) { self.current_tags.push("inverse".to_string()); },
                 9 => if !self.current_tags.contains(&"strikethrough".to_string()) { self.current_tags.push("strikethrough".to_string()); },
                 22 => self.current_tags.retain(|t| t != "bold" && t != "dim"),
+                23 => self.current_tags.retain(|t| t != "italic"),
                 24 => self.current_tags.retain(|t| t != "underline"),
+                27 => self.current_tags.retain(|t| t != "inverse"),
                 29 => self.current_tags.retain(|t| t != "strikethrough"),
                 30..=37 | 90..=97 => {
                     self.current_tags.retain(|t| !t.starts_with("fg-"));
@@ -383,15 +402,21 @@ impl Perform for TerminalState {
                 match arg0 {
                     0 => {
                         let mut end = iter.clone();
-                        end.forward_to_line_end();
+                        if !end.ends_line() { end.forward_to_line_end(); }
                         buffer.delete(&mut iter, &mut end);
+                    }
+                    1 => {
+                        if let Some(mut start) = buffer.iter_at_line(cy as i32) {
+                            buffer.delete(&mut start, &mut iter);
+                            let spaces = " ".repeat(cx);
+                            buffer.insert(&mut start, &spaces);
+                        }
                     }
                     2 => {
                         if let Some(mut start) = buffer.iter_at_line(cy as i32) {
                             let mut end = start.clone();
-                            end.forward_to_line_end();
+                            if !end.ends_line() { end.forward_to_line_end(); }
                             buffer.delete(&mut start, &mut end);
-                            cx = 0;
                         }
                     }
                     _ => {}
@@ -541,7 +566,7 @@ impl Perform for TerminalState {
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
         if params.len() >= 2 {
-            if params[0] == b"0" || params[0] == b"2" {
+            if params[0] == b"0" || params[0] == b"1" || params[0] == b"2" {
                 if let Ok(title) = std::str::from_utf8(params[1]) {
                     if let Some(lbl) = self.tab_label.upgrade() {
                         lbl.set_text(title);

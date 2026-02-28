@@ -317,6 +317,74 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
     });
     text_view.add_controller(key_controller);
 
+    let scroll_controller = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+    let s_arc_scroll = ts_weak.clone();
+    let itx_scroll = input_tx.clone();
+    scroll_controller.connect_scroll(move |_controller, _dx, dy| {
+        let ts = s_arc_scroll.lock().unwrap();
+        if ts.mouse_tracking_mode > 0 {
+            // SGR format: ESC [ < Pcb ; Px ; Py (M for press, m for release)
+            // Simplified scroll: we don't know precise X/Y here easily, so we just use 1;1
+            // Button 4 (scroll up) is usually code 64, Button 5 (scroll down) is 65.
+            let button = if dy < 0.0 { 64 } else { 65 };
+            let sgr = format!("\x1b[<{};1;1M", button);
+            let _ = itx_scroll.send(ConnectionControl::Input(sgr.into_bytes()));
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    text_view.add_controller(scroll_controller);
+
+    let click_controller = gtk::GestureClick::new();
+    click_controller.set_button(0); // All buttons
+    let s_arc_click = ts_weak.clone();
+    let itx_click = input_tx.clone();
+    let fs_click = font_size_u32;
+    
+    click_controller.connect_pressed(move |gesture, _n_press, x, y| {
+        let ts = s_arc_click.lock().unwrap();
+        if ts.mouse_tracking_mode > 0 {
+            let button = match gesture.current_button() {
+                1 => 0, // Left
+                2 => 1, // Middle
+                3 => 2, // Right
+                _ => 0,
+            };
+            let char_w = (fs_click as f32 * 0.6).max(1.0);
+            let char_h = (fs_click as f32 * 1.5).max(1.0);
+            let col = (x as f32 / char_w).max(0.0) as u32 + 1;
+            let row = (y as f32 / char_h).max(0.0) as u32 + 1;
+            
+            let sgr = format!("\x1b[<{};{};{}M", button, col, row);
+            let _ = itx_click.send(ConnectionControl::Input(sgr.into_bytes()));
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+        }
+    });
+    
+    let s_arc_release = ts_weak.clone();
+    let itx_release = input_tx.clone();
+    let fs_release = font_size_u32;
+    click_controller.connect_released(move |gesture, _n_press, x, y| {
+        let ts = s_arc_release.lock().unwrap();
+        if ts.mouse_tracking_mode > 0 {
+            let button = match gesture.current_button() {
+                1 => 0,
+                2 => 1,
+                3 => 2,
+                _ => 0,
+            };
+            let char_w = (fs_release as f32 * 0.6).max(1.0);
+            let char_h = (fs_release as f32 * 1.5).max(1.0);
+            let col = (x as f32 / char_w).max(0.0) as u32 + 1;
+            let row = (y as f32 / char_h).max(0.0) as u32 + 1;
+            
+            let sgr = format!("\x1b[<{};{};{}m", button, col, row); // 'm' for release in 1006
+            let _ = itx_release.send(ConnectionControl::Input(sgr.into_bytes()));
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+        }
+    });
+    text_view.add_controller(click_controller);
+
     let s_clone = settings.clone();
     let final_pass = override_pass.or(settings.password.clone());
     text_view.buffer().set_text(&format!("Connecting to {}...\n", settings.name));
@@ -325,13 +393,60 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
         match connect_ssh(&s_clone.host, s_clone.port, &s_clone.username, final_pass.as_deref().unwrap_or(""), s_clone.private_key.as_deref(), s_clone.keepalive, s_clone.agent_forwarding, &s_clone.term_type) {
             Ok((session, mut channel)) => {
                 let _ = output_tx.send(b"Connection established.\r\n".to_vec());
+
+                // PARSE LOCAL FORWARDS
+                let mut local_listeners = Vec::new();
+                for forward in s_clone.local_forwards.split(',') {
+                    let parts: Vec<&str> = forward.trim().split(':').collect();
+                    if parts.len() == 3 {
+                        if let (Ok(l_port), Ok(r_port)) = (parts[0].parse::<u16>(), parts[2].parse::<u16>()) {
+                            let r_host = parts[1].to_string();
+                            if let Ok(listener) = std::net::TcpListener::bind(format!("127.0.0.1:{}", l_port)) {
+                                let _ = listener.set_nonblocking(true);
+                                local_listeners.push((listener, r_host, r_port));
+                                let _ = output_tx.send(format!("-L {}:{}:{} forwarded.\r\n", l_port, parts[1], r_port).into_bytes());
+                            }
+                        }
+                    }
+                }
+
+                // PARSE REMOTE FORWARDS
+                let mut remote_listeners = Vec::new();
+                for forward in s_clone.remote_forwards.split(',') {
+                    let parts: Vec<&str> = forward.trim().split(':').collect();
+                    if parts.len() == 3 {
+                        if let (Ok(r_port), Ok(l_port)) = (parts[0].parse::<u16>(), parts[2].parse::<u16>()) {
+                            let l_host = parts[1].to_string();
+                            // Attempt to use None for host. The API usually expects `port, host_option, bound_port, backlog` or similar
+                            // We will use standard u16 defaults. The compiler will guide us if wrong:
+                            // remote_port_forward(port: u16, host: Option<&str>, bound_port: u16, max_connections: Option<u32>)
+                            match session.channel_forward_listen(r_port, Some("0.0.0.0"), None) {
+                                Ok((listener, _bound_port)) => {
+                                    remote_listeners.push((listener, l_host, l_port));
+                                    let _ = output_tx.send(format!("-R {}:{}:{} forwarded.\r\n", r_port, parts[1], l_port).into_bytes());
+                                }
+                                Err(e) => {
+                                    let _ = output_tx.send(format!("-R proxy failed to bind remote port {}: {}\r\n", r_port, e).into_bytes());
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let _ = session.set_blocking(false);
                 let mut buffer = [0; 8192];
+                
+                // Active TCP proxies
+                let mut active_local_tunnels: Vec<(std::net::TcpStream, ssh2::Channel)> = Vec::new();
+                let mut active_remote_tunnels: Vec<(std::net::TcpStream, ssh2::Channel)> = Vec::new();
+                
                 loop {
+                    // Check main terminal channel output
                     match channel.read(&mut buffer) {
                         Ok(0) => break,
                         Ok(size) => { let _ = output_tx.send(buffer[..size].to_vec()); }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            // Check Terminal Input
                             while let Ok(ctrl) = input_rx.try_recv() {
                                 match ctrl {
                                     ConnectionControl::Input(data) => {
@@ -339,10 +454,7 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
                                         while pos < data.len() {
                                             match channel.write(&data[pos..]) {
                                                 Ok(written) => pos += written,
-                                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                                    std::thread::sleep(Duration::from_millis(10));
-                                                    continue;
-                                                }
+                                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
                                                 Err(_) => break,
                                             }
                                         }
@@ -353,7 +465,70 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
                                 }
                                 let _ = channel.flush();
                             }
-                            std::thread::sleep(Duration::from_millis(10));
+                            
+                            // Check new local connections (-L)
+                            for (listener, r_host, r_port) in &local_listeners {
+                                if let Ok((tcp_stream, _addr)) = listener.accept() {
+                                    let _ = tcp_stream.set_nonblocking(true);
+                                    // Momentarily block to establish SSH channel reliably
+                                    let _ = session.set_blocking(true);
+                                    if let Ok(forward_channel) = session.channel_direct_tcpip(r_host, *r_port, None) {
+                                        active_local_tunnels.push((tcp_stream, forward_channel));
+                                    }
+                                    let _ = session.set_blocking(false);
+                                }
+                            }
+                            
+                            // Check new remote connections (-R)
+                            for (listener, l_host, l_port) in &mut remote_listeners {
+                                match listener.accept() {
+                                    Ok(forward_channel) => {
+                                        if let Ok(tcp_stream) = std::net::TcpStream::connect(format!("{}:{}", l_host, l_port)) {
+                                            let _ = tcp_stream.set_nonblocking(true);
+                                            active_remote_tunnels.push((tcp_stream, forward_channel));
+                                        }
+                                    }
+                                    Err(_) => {}
+                                }
+                            }
+                            
+                            // Pipe local tunnels (TCP -> SSH) and (SSH -> TCP)
+                            let mut drop_local_idx = Vec::new();
+                            for (idx, (tcp, ch)) in active_local_tunnels.iter_mut().enumerate() {
+                                // TCP -> SSH
+                                match tcp.read(&mut buffer) {
+                                    Ok(0) => drop_local_idx.push(idx),
+                                    Ok(size) => { let _ = ch.write_all(&buffer[..size]); }
+                                    Err(_) => ()
+                                }
+                                // SSH -> TCP
+                                match ch.read(&mut buffer) {
+                                    Ok(0) => if !drop_local_idx.contains(&idx) { drop_local_idx.push(idx) },
+                                    Ok(size) => { let _ = tcp.write_all(&buffer[..size]); }
+                                    Err(_) => ()
+                                }
+                            }
+                            for idx in drop_local_idx.into_iter().rev() { active_local_tunnels.remove(idx); }
+                            
+                            // Pipe remote tunnels (SSH -> TCP) and (TCP -> SSH)
+                            let mut drop_remote_idx = Vec::new();
+                            for (idx, (tcp, ch)) in active_remote_tunnels.iter_mut().enumerate() {
+                                // SSH -> TCP
+                                match ch.read(&mut buffer) {
+                                    Ok(0) => drop_remote_idx.push(idx),
+                                    Ok(size) => { let _ = tcp.write_all(&buffer[..size]); }
+                                    Err(_) => ()
+                                }
+                                // TCP -> SSH
+                                match tcp.read(&mut buffer) {
+                                    Ok(0) => if !drop_remote_idx.contains(&idx) { drop_remote_idx.push(idx) },
+                                    Ok(size) => { let _ = ch.write_all(&buffer[..size]); }
+                                    Err(_) => ()
+                                }
+                            }
+                            for idx in drop_remote_idx.into_iter().rev() { active_remote_tunnels.remove(idx); }
+
+                            std::thread::sleep(Duration::from_millis(5));
                         }
                         Err(_) => break,
                     }

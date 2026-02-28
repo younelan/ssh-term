@@ -445,6 +445,14 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
     let ag_c = CheckButton::builder().label("Enable SSH Agent Forwarding").build();
     scroll_grid.attach(&ag_c, 1, 2, 1, 1);
     
+    let lf_e = Entry::builder().placeholder_text("ex. 8080:localhost:80").build();
+    scroll_grid.attach(&Label::new(Some("-L Local Forwards:")), 0, 3, 1, 1);
+    scroll_grid.attach(&lf_e, 1, 3, 1, 1);
+
+    let rf_e = Entry::builder().placeholder_text("ex. 8080:localhost:80").build();
+    scroll_grid.attach(&Label::new(Some("-R Remote Forwards:")), 0, 4, 1, 1);
+    scroll_grid.attach(&rf_e, 1, 4, 1, 1);
+    
     extra_page.append(&scroll_grid);
 
     settings_nb.append_page(&conn_page, Some(&Label::new(Some("Connection"))));
@@ -469,8 +477,10 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
     let ka_e_pop = ka_e.clone();
     let ag_c_pop = ag_c.clone();
     let method_d_pop = method_dropdown.clone();
+    let lf_e_pop = lf_e.clone();
+    let rf_e_pop = rf_e.clone();
     
-    populate_list(&list, &sessions_data, &name_e, &host_e, &port_e, &user_e, &pass_e, &sp_clone, &fg_clone, &bg_clone, &fd_clone, &cd_clone, &bc_clone, &sc_clone, &pal_clone, arc_for_populate, &key_e_pop, &theme_d_pop, &ka_e_pop, &ag_c_pop, &method_d_pop);
+    populate_list(&list, &sessions_data, &name_e, &host_e, &port_e, &user_e, &pass_e, &sp_clone, &fg_clone, &bg_clone, &fd_clone, &cd_clone, &bc_clone, &sc_clone, &pal_clone, arc_for_populate, &key_e_pop, &theme_d_pop, &ka_e_pop, &ag_c_pop, &method_d_pop, &lf_e_pop, &rf_e_pop);
 
     let s_arc_save = sessions_arc.clone();
     let n_e_save = name_entry.clone();
@@ -492,6 +502,8 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
     let method_save = method_dropdown.clone();
     let term_save = term_dropdown.clone();
     let key_e_save = key_entry.clone();
+    let lf_save = lf_e.clone();
+    let rf_save = rf_e.clone();
 
     save_btn.connect_clicked(move |_| {
         let name = n_e_save.text().to_string();
@@ -522,6 +534,8 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
             theme: th_save.selected_item().and_then(|i| i.downcast::<gtk::StringObject>().ok()).map(|s| s.string().to_string()).unwrap_or_else(|| "Custom".to_string()),
             method: method_save.selected(),
             term_type: term_save.selected_item().and_then(|i| i.downcast::<gtk::StringObject>().ok()).map(|s| s.string().to_string()).unwrap_or_else(|| "xterm-256color".to_string()),
+            local_forwards: lf_save.text().to_string(),
+            remote_forwards: rf_save.text().to_string(),
         };
 
         let mut s_vec = s_arc_save.lock().unwrap();
@@ -531,11 +545,13 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
             s_vec.push(settings.clone());
         }
         crate::config::save_sessions(&s_vec);
-        populate_list(&list_clone, &s_vec, &n_e_save, &h_e_save, &p_e_save, &u_e_save, &ps_e_save, &sp_save, &fg_save, &bg_save, &fd_save, &cd_save, &bc_save, &sc_save, &pal_save, s_arc_save.clone(), &key_e_save, &th_save, &ka_save, &ac_save, &method_save);
+        populate_list(&list_clone, &s_vec, &n_e_save, &h_e_save, &p_e_save, &u_e_save, &ps_e_save, &sp_save, &fg_save, &bg_save, &fd_save, &cd_save, &bc_save, &sc_save, &pal_save, s_arc_save.clone(), &key_e_save, &th_save, &ka_save, &ac_save, &method_save, &lf_save, &rf_save);
     });
 
     let pal_weaks: Vec<_> = palette_btns.iter().map(|b| b.downgrade()).collect();
     let term_weak = term_dropdown.downgrade();
+    let lf_conn = lf_e.clone();
+    let rf_conn = rf_e.clone();
     connect_btn.connect_clicked(move |_| {
         let name_str = name_e.text().to_string();
         let host = host_e.text().to_string();
@@ -544,6 +560,8 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
         let user = user_e.text().to_string();
         let pass = pass_e.text().to_string();
         let key = key_e_pop.text().to_string();
+        let lf_str = lf_conn.text().to_string();
+        let rf_str = rf_conn.text().to_string();
         let fg = rgba_to_hex(fg_b.rgba());
         let bg = rgba_to_hex(bg_b.rgba());
         let font_size = font_d.selected_item().unwrap().downcast::<gtk::StringObject>().unwrap().string().parse::<i32>().unwrap_or(14);
@@ -571,6 +589,8 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
             keepalive, agent_forwarding: agent, theme: theme_name,
             method: method_dropdown.selected(),
             term_type: term_item,
+            local_forwards: lf_str,
+            remote_forwards: rf_str,
         }, if pass.is_empty() { None } else { Some(pass) });
     });
 

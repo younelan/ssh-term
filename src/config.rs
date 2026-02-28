@@ -34,6 +34,10 @@ pub struct ConnectionSettings {
     pub method: u32, // 0: Password, 1: Key
     #[serde(default = "default_term_type")]
     pub term_type: String,
+    #[serde(default)]
+    pub local_forwards: String,
+    #[serde(default)]
+    pub remote_forwards: String,
 }
 
 fn default_keepalive() -> u32 { 0 }

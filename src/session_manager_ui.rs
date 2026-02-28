@@ -26,7 +26,9 @@ pub fn populate_list(
     theme_d: &DropDown, 
     ka_e: &Entry, 
     ag_c: &CheckButton, 
-    method_d: &DropDown
+    method_d: &DropDown,
+    lf_e: &Entry,
+    rf_e: &Entry
 ) {
     while let Some(child) = list.first_child() { list.remove(&child); }
     for (index, s) in sessions.iter().enumerate() {
@@ -74,6 +76,8 @@ pub fn populate_list(
         let ka_e_weak = ka_e.downgrade();
         let ag_c_weak = ag_c.downgrade();
         let method_d_weak = method_d.downgrade();
+        let lf_e_weak = lf_e.downgrade();
+        let rf_e_weak = rf_e.downgrade();
         let p_buttons = palette_btns.to_vec();
         let name_clone = s.name.clone();
 
@@ -97,6 +101,8 @@ pub fn populate_list(
         let ke_w2 = key_e_weak.clone();
         let pb_w2 = p_buttons.clone();
         let method_d_w2 = method_d_weak.clone();
+        let lf_w2 = lf_e_weak.clone();
+        let rf_w2 = rf_e_weak.clone();
 
         let action_save = gtk::gio::SimpleAction::new("save", None);
         action_save.connect_activate(move |_, _| {
@@ -118,6 +124,8 @@ pub fn populate_list(
             let key_e_up = match ke_w2.upgrade() { Some(v) => v, None => return };
             let method_d_up = match method_d_w2.upgrade() { Some(v) => v, None => return };
             let name_e_up = match n_e_w2.upgrade() { Some(v) => v, None => return };
+            let lf_e = match lf_w2.upgrade() { Some(v) => v, None => return };
+            let rf_e = match rf_w2.upgrade() { Some(v) => v, None => return };
             
             let mut pal = Vec::new();
             for btn in &pb_w2 { pal.push(rgba_to_hex(btn.rgba())); }
@@ -141,13 +149,15 @@ pub fn populate_list(
                 theme: theme_d.selected_item().and_then(|i| i.downcast::<gtk::StringObject>().ok()).map(|s| s.string().to_string()).unwrap_or_else(|| "Custom".to_string()),
                 method: method_d_up.selected(),
                 term_type: s_arc_for_save.lock().unwrap().get(index).map(|s| s.term_type.clone()).unwrap_or_else(|| "xterm-256color".to_string()),
+                local_forwards: lf_e.text().to_string(),
+                remote_forwards: rf_e.text().to_string(),
             };
 
             let mut s_vec = s_arc_for_save.lock().unwrap();
             if index < s_vec.len() {
                 s_vec[index] = settings.clone();
                 crate::config::save_sessions(&s_vec);
-                populate_list(&list, &s_vec, &name_e_up, &h_e, &p_e, &u_e, &ps_e, &save_p_c, &fg_b, &bg_b, &font_d, &cur_d, &blink_c, &scroll_e, &pb_w2, s_arc_for_save.clone(), &key_e_up, &theme_d, &ka_e, &ag_c, &method_d_up);
+                populate_list(&list, &s_vec, &name_e_up, &h_e, &p_e, &u_e, &ps_e, &save_p_c, &fg_b, &bg_b, &font_d, &cur_d, &blink_c, &scroll_e, &pb_w2, s_arc_for_save.clone(), &key_e_up, &theme_d, &ka_e, &ag_c, &method_d_up, &lf_e, &rf_e);
                 update_active_terminals(&settings.name, &settings);
             }
         });
@@ -174,6 +184,8 @@ pub fn populate_list(
         let md_w_del = method_d_weak.clone();
         let s_arc_for_del = sessions_arc.clone();
         let pb_w_del = p_buttons.clone();
+        let lf_w_del = lf_e_weak.clone();
+        let rf_w_del = rf_e_weak.clone();
         action_delete.connect_activate(move |_, _| {
             let list_up = match list_w3.upgrade() { Some(v) => v, None => return };
             let name_up = match n_e_w_del.upgrade() { Some(v) => v, None => return };
@@ -193,12 +205,14 @@ pub fn populate_list(
             let ka_up = match ka_w_del.upgrade() { Some(v) => v, None => return };
             let ag_up = match ac_w_del.upgrade() { Some(v) => v, None => return };
             let method_up = match md_w_del.upgrade() { Some(v) => v, None => return };
+            let lf_e = match lf_w_del.upgrade() { Some(v) => v, None => return };
+            let rf_e = match rf_w_del.upgrade() { Some(v) => v, None => return };
             
             let mut s = s_arc_for_del.lock().unwrap();
             if index < s.len() {
                 s.remove(index);
                 crate::config::save_sessions(&s);
-                populate_list(&list_up, &s, &name_up, &h_e, &p_e, &u_e, &ps_e, &save_p_up, &fg, &bg, &font, &cur, &blink, &scroll, &pb_w_del, s_arc_for_del.clone(), &key_up, &theme_up, &ka_up, &ag_up, &method_up);
+                populate_list(&list_up, &s, &name_up, &h_e, &p_e, &u_e, &ps_e, &save_p_up, &fg, &bg, &font, &cur, &blink, &scroll, &pb_w_del, s_arc_for_del.clone(), &key_up, &theme_up, &ka_up, &ag_up, &method_up, &lf_e, &rf_e);
             }
         });
         action_group.add_action(&action_delete);
@@ -229,6 +243,8 @@ pub fn populate_list(
         let ka_ren = ka_e_weak.clone();
         let ac_ren = ag_c_weak.clone();
         let md_ren = method_d_weak.clone();
+        let lf_ren = lf_e_weak.clone();
+        let rf_ren = rf_e_weak.clone();
 
         action_rename.connect_activate(move |_, _| {
             let win = match win_weak_ren.upgrade() { Some(w) => w, None => return };
@@ -266,6 +282,8 @@ pub fn populate_list(
             let ka_ren_i = ka_ren.clone();
             let ac_ren_i = ac_ren.clone();
             let md_ren_i = md_ren.clone();
+            let lf_ren_i = lf_ren.clone();
+            let rf_ren_i = rf_ren.clone();
 
             dialog.connect_response(move |d, res| {
                 if res == gtk::ResponseType::Ok {
@@ -276,10 +294,10 @@ pub fn populate_list(
                             s[index].name = new_name;
                             crate::config::save_sessions(&s);
                             
-                            if let (Some(ls_up), Some(ne_up), Some(he_up), Some(pe_up), Some(ue_up), Some(pse_up), Some(sp_up), Some(fg_up), Some(bg_up), Some(fd_up), Some(cd_up), Some(bc_up), Some(sc_up), Some(ke_up), Some(th_up), Some(ka_up), Some(ac_up), Some(md_up)) = (
-                                l_w_ren_inner.upgrade(), n_e_weak_ren_inner.upgrade(), h_e_ren_i.upgrade(), p_e_ren_i.upgrade(), u_e_ren_i.upgrade(), ps_e_ren_i.upgrade(), sp_ren_i.upgrade(), fg_ren_i.upgrade(), bg_ren_i.upgrade(), f_d_ren_i.upgrade(), c_d_ren_i.upgrade(), bc_ren_i.upgrade(), sc_ren_i.upgrade(), ke_ren_i.upgrade(), th_ren_i.upgrade(), ka_ren_i.upgrade(), ac_ren_i.upgrade(), md_ren_i.upgrade()
+                            if let (Some(ls_up), Some(ne_up), Some(he_up), Some(pe_up), Some(ue_up), Some(pse_up), Some(sp_up), Some(fg_up), Some(bg_up), Some(fd_up), Some(cd_up), Some(bc_up), Some(sc_up), Some(ke_up), Some(th_up), Some(ka_up), Some(ac_up), Some(md_up), Some(lf_up), Some(rf_up)) = (
+                                l_w_ren_inner.upgrade(), n_e_weak_ren_inner.upgrade(), h_e_ren_i.upgrade(), p_e_ren_i.upgrade(), u_e_ren_i.upgrade(), ps_e_ren_i.upgrade(), sp_ren_i.upgrade(), fg_ren_i.upgrade(), bg_ren_i.upgrade(), f_d_ren_i.upgrade(), c_d_ren_i.upgrade(), bc_ren_i.upgrade(), sc_ren_i.upgrade(), ke_ren_i.upgrade(), th_ren_i.upgrade(), ka_ren_i.upgrade(), ac_ren_i.upgrade(), md_ren_i.upgrade(), lf_ren_i.upgrade(), rf_ren_i.upgrade()
                             ) {
-                                populate_list(&ls_up, &s, &ne_up, &he_up, &pe_up, &ue_up, &pse_up, &sp_up, &fg_up, &bg_up, &fd_up, &cd_up, &bc_up, &sc_up, &pb_ren_i, s_arc_ren_inner.clone(), &ke_up, &th_up, &ka_up, &ac_up, &md_up);
+                                populate_list(&ls_up, &s, &ne_up, &he_up, &pe_up, &ue_up, &pse_up, &sp_up, &fg_up, &bg_up, &fd_up, &cd_up, &bc_up, &sc_up, &pb_ren_i, s_arc_ren_inner.clone(), &ke_up, &th_up, &ka_up, &ac_up, &md_up, &lf_up, &rf_up);
                             }
                         }
                     }
@@ -315,6 +333,8 @@ pub fn populate_list(
         let ka_cl = ka_e_weak.clone();
         let ac_cl = ag_c_weak.clone();
         let md_cl = method_d_weak.clone();
+        let lf_cl = lf_e_weak.clone();
+        let rf_cl = rf_e_weak.clone();
 
         action_clone.connect_activate(move |_, _| {
             let win = match win_weak_cl.upgrade() { Some(w) => w, None => return };
@@ -354,6 +374,8 @@ pub fn populate_list(
             let ka_cl_i = ka_cl.clone();
             let ac_cl_i = ac_cl.clone();
             let md_cl_i = md_cl.clone();
+            let lf_cl_i = lf_cl.clone();
+            let rf_cl_i = rf_cl.clone();
 
             dialog.connect_response(move |d, res| {
                 if res == gtk::ResponseType::Ok {
@@ -366,10 +388,10 @@ pub fn populate_list(
                         s.push(cloned_settings);
                         crate::config::save_sessions(&s);
                         
-                        if let (Some(ls_up), Some(ne_up), Some(he_up), Some(pe_up), Some(ue_up), Some(pse_up), Some(sp_up), Some(fg_up), Some(bg_up), Some(fd_up), Some(cd_up), Some(bc_up), Some(sc_up), Some(ke_up), Some(th_up), Some(ka_up), Some(ac_up), Some(md_up)) = (
-                            l_w_cl_inner.upgrade(), n_e_w_cl_inner.upgrade(), h_e_cl_i.upgrade(), p_e_cl_i.upgrade(), u_e_cl_i.upgrade(), ps_e_cl_i.upgrade(), sp_cl_i.upgrade(), fg_cl_i.upgrade(), bg_cl_i.upgrade(), f_d_cl_i.upgrade(), c_d_cl_i.upgrade(), bc_cl_i.upgrade(), sc_cl_i.upgrade(), ke_cl_i.upgrade(), th_cl_i.upgrade(), ka_cl_i.upgrade(), ac_cl_i.upgrade(), md_cl_i.upgrade()
+                        if let (Some(ls_up), Some(ne_up), Some(he_up), Some(pe_up), Some(ue_up), Some(pse_up), Some(sp_up), Some(fg_up), Some(bg_up), Some(fd_up), Some(cd_up), Some(bc_up), Some(sc_up), Some(ke_up), Some(th_up), Some(ka_up), Some(ac_up), Some(md_up), Some(lf_up), Some(rf_up)) = (
+                            l_w_cl_inner.upgrade(), n_e_w_cl_inner.upgrade(), h_e_cl_i.upgrade(), p_e_cl_i.upgrade(), u_e_cl_i.upgrade(), ps_e_cl_i.upgrade(), sp_cl_i.upgrade(), fg_cl_i.upgrade(), bg_cl_i.upgrade(), f_d_cl_i.upgrade(), c_d_cl_i.upgrade(), bc_cl_i.upgrade(), sc_cl_i.upgrade(), ke_cl_i.upgrade(), th_cl_i.upgrade(), ka_cl_i.upgrade(), ac_cl_i.upgrade(), md_cl_i.upgrade(), lf_cl_i.upgrade(), rf_cl_i.upgrade()
                         ) {
-                            populate_list(&ls_up, &s, &ne_up, &he_up, &pe_up, &ue_up, &pse_up, &sp_up, &fg_up, &bg_up, &fd_up, &cd_up, &bc_up, &sc_up, &pb_cl_i, s_arc_cl_inner.clone(), &ke_up, &th_up, &ka_up, &ac_up, &md_up);
+                            populate_list(&ls_up, &s, &ne_up, &he_up, &pe_up, &ue_up, &pse_up, &sp_up, &fg_up, &bg_up, &fd_up, &cd_up, &bc_up, &sc_up, &pb_cl_i, s_arc_cl_inner.clone(), &ke_up, &th_up, &ka_up, &ac_up, &md_up, &lf_up, &rf_up);
                         }
                     }
                 }
@@ -414,6 +436,8 @@ pub fn populate_list(
             let ka_w_th = ka_e_weak.clone();
             let ac_w_th = ag_c_weak.clone();
             let md_w_th = method_d_weak.clone();
+            let lf_w_th = lf_e_weak.clone();
+            let rf_w_th = rf_e_weak.clone();
 
             action_theme.connect_activate(move |_, _| {
                 let mut s = s_arc_th.lock().unwrap();
@@ -424,10 +448,10 @@ pub fn populate_list(
                     s[index].palette = theme_pal.clone();
                     crate::config::save_sessions(&s);
                     
-                    if let (Some(ls_up), Some(ne_up), Some(he_up), Some(pe_up), Some(ue_up), Some(pse_up), Some(sp_up), Some(fg_up), Some(bg_up), Some(fd_up), Some(cd_up), Some(bc_up), Some(sc_up), Some(ke_up), Some(th_up), Some(ka_up), Some(ac_up), Some(md_up)) = (
-                        l_w_th.upgrade(), n_e_w_th.upgrade(), h_e_w_th.upgrade(), p_e_w_th.upgrade(), u_e_w_th.upgrade(), ps_e_w_th.upgrade(), sp_w_th.upgrade(), fg_w_th.upgrade(), bg_w_th.upgrade(), f_d_w_th.upgrade(), c_d_w_th.upgrade(), bc_w_th.upgrade(), sc_w_th.upgrade(), ke_w_th.upgrade(), th_w_th.upgrade(), ka_w_th.upgrade(), ac_w_th.upgrade(), md_w_th.upgrade()
+                    if let (Some(ls_up), Some(ne_up), Some(he_up), Some(pe_up), Some(ue_up), Some(pse_up), Some(sp_up), Some(fg_up), Some(bg_up), Some(fd_up), Some(cd_up), Some(bc_up), Some(sc_up), Some(ke_up), Some(th_up), Some(ka_up), Some(ac_up), Some(md_up), Some(lf_up), Some(rf_up)) = (
+                        l_w_th.upgrade(), n_e_w_th.upgrade(), h_e_w_th.upgrade(), p_e_w_th.upgrade(), u_e_w_th.upgrade(), ps_e_w_th.upgrade(), sp_w_th.upgrade(), fg_w_th.upgrade(), bg_w_th.upgrade(), f_d_w_th.upgrade(), c_d_w_th.upgrade(), bc_w_th.upgrade(), sc_w_th.upgrade(), ke_w_th.upgrade(), th_w_th.upgrade(), ka_w_th.upgrade(), ac_w_th.upgrade(), md_w_th.upgrade(), lf_w_th.upgrade(), rf_w_th.upgrade()
                     ) {
-                        populate_list(&ls_up, &s, &ne_up, &he_up, &pe_up, &ue_up, &pse_up, &sp_up, &fg_up, &bg_up, &fd_up, &cd_up, &bc_up, &sc_up, &pb_w_th, s_arc_th.clone(), &ke_up, &th_up, &ka_up, &ac_up, &md_up);
+                        populate_list(&ls_up, &s, &ne_up, &he_up, &pe_up, &ue_up, &pse_up, &sp_up, &fg_up, &bg_up, &fd_up, &cd_up, &bc_up, &sc_up, &pb_w_th, s_arc_th.clone(), &ke_up, &th_up, &ka_up, &ac_up, &md_up, &lf_up, &rf_up);
                     }
                 }
             });
@@ -468,6 +492,8 @@ pub fn populate_list(
     let ka_e_weak = ka_e.downgrade();
     let ag_c_weak = ag_c.downgrade();
     let method_d_weak = method_d.downgrade();
+    let lf_e_weak = lf_e.downgrade();
+    let rf_e_weak = rf_e.downgrade();
     let pal_buttons = palette_btns.to_vec();
     
     list.connect_row_activated(move |_, row| {
@@ -487,6 +513,8 @@ pub fn populate_list(
         let ka_up = match ka_e_weak.upgrade() { Some(v) => v, None => return };
         let ag_up = match ag_c_weak.upgrade() { Some(v) => v, None => return };
         let method_up = match method_d_weak.upgrade() { Some(v) => v, None => return };
+        let lf_up = match lf_e_weak.upgrade() { Some(v) => v, None => return };
+        let rf_up = match rf_e_weak.upgrade() { Some(v) => v, None => return };
 
         if let Some(s) = sessions_vec.get(row.index() as usize) {
             let n_e = match name_e_weak.upgrade() { Some(v) => v, None => return };
@@ -524,6 +552,8 @@ pub fn populate_list(
             scroll.set_text(&s.scrollback.to_string());
             ka_up.set_text(&s.keepalive.to_string());
             ag_up.set_active(s.agent_forwarding);
+            lf_up.set_text(&s.local_forwards);
+            rf_up.set_text(&s.remote_forwards);
             for i in 0..16 {
                 if i < s.palette.len() && i < pal_buttons.len() {
                     pal_buttons[i].set_rgba(&hex_to_rgba(&s.palette[i]));
