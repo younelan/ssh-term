@@ -217,7 +217,23 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
             updated = true;
         }
         if updated {
-            if let Some(adj) = tv.vadjustment() { adj.set_value(adj.upper() - adj.page_size()); }
+            if let Some(adj) = tv.vadjustment() {
+                let current = adj.value();
+                let upper = adj.upper();
+                let page_size = adj.page_size();
+                
+                // Sticky scroll: Only follow if we're within 100px of the bottom
+                if current >= (upper - page_size - 100.0) {
+                    let tv_scroll = tv.clone();
+                    glib::idle_add_local(move || {
+                        let buffer = tv_scroll.buffer();
+                        if let Some(mark) = buffer.mark("insert") {
+                            tv_scroll.scroll_to_mark(&mark, 0.0, true, 0.0, 1.0);
+                        }
+                        glib::ControlFlow::Break
+                    });
+                }
+            }
         }
         glib::ControlFlow::Continue
     });
