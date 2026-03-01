@@ -23,21 +23,50 @@ use gtk::{
 };
 use std::sync::{Arc, Mutex};
 
+thread_local! {
+    /// Effective starting directory for local shells: set once in main() from
+    /// current_dir() (and optionally overridden by a CLI directory argument).
+    static LAUNCH_CWD: std::cell::RefCell<Option<std::path::PathBuf>> =
+        std::cell::RefCell::new(None);
+}
+
 fn main() {
+    // Capture cwd BEFORE GTK can change it (GTK on macOS may reset to bundle dir).
+    let launch_cwd = std::env::current_dir().ok();
+
     let app = Application::builder().application_id("com.github.example.terminal-ssh").build();
     app.connect_startup(|app| setup_app(app));
+
+    // Check for an optional directory argument.
+    let raw_args: Vec<String> = std::env::args().collect();
+    let dir_arg: Option<std::path::PathBuf> = raw_args.get(1)
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_dir());
+
+    // Store effective launch dir in thread-local so other fns can read it.
+    let start_dir: Option<std::path::PathBuf> = dir_arg.clone().or(launch_cwd);
+    LAUNCH_CWD.with(|cell| *cell.borrow_mut() = start_dir);
+
+    let dir_arg_act = dir_arg.clone();
     app.connect_activate(move |app| {
         if app.active_window().is_none() {
-            ensure_connect_window(app, None);
+            if let Some(ref dir) = dir_arg_act {
+                // Directory passed on command-line → open local terminal directly.
+                let mut s = crate::config::ConnectionSettings::default();
+                s.name = dir.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "Shell".to_string());
+                s.initial_dir = Some(dir.clone());
+                handle_connect(app, &s, None, true);
+            } else {
+                ensure_connect_window(app, None);
+            }
         }
     });
 
-    let args: Vec<String> = std::env::args().collect();
-    if args.is_empty() {
-        app.run();
-    } else {
-        app.run_with_args(&args);
-    }
+    // Pass only the program name to GTK so our custom arg doesn't cause warnings.
+    let gtk_args: Vec<String> = raw_args.iter().take(1).cloned().collect();
+    app.run_with_args(&gtk_args);
 }
 
 fn setup_app(app: &Application) {
@@ -835,6 +864,7 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
             term_type: term_save.selected_item().and_then(|i| i.downcast::<gtk::StringObject>().ok()).map(|s| s.string().to_string()).unwrap_or_else(|| "xterm-256color".to_string()),
             local_forwards: lf_save.text().to_string(),
             remote_forwards: rf_save.text().to_string(),
+            initial_dir: None,
         };
 
         let mut s_vec = s_arc_save.lock().unwrap();
@@ -890,6 +920,7 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
             term_type: term_item,
             local_forwards: lf_str,
             remote_forwards: rf_str,
+            initial_dir: None,
         }, if pass.is_empty() { None } else { Some(pass) }, false);
     });
 
@@ -897,6 +928,7 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
     local_btn.connect_clicked(move |_| {
         let mut local_set = ConnectionSettings::default();
         local_set.name = "Local Shell".to_string();
+        local_set.initial_dir = LAUNCH_CWD.with(|c| c.borrow().clone());
         handle_connect(&app_clone_local, &local_set, None, true);
     });
 
@@ -993,6 +1025,7 @@ fn create_terminal_window(app: &Application, settings: &ConnectionSettings, over
         if let Some(nb) = nb_weak3.upgrade() {
             let mut local_set = s_local.clone();
             local_set.name = "Local Shell".to_string();
+            local_set.initial_dir = LAUNCH_CWD.with(|c| c.borrow().clone());
             add_terminal_tab(nb.upcast_ref::<gtk::Widget>(), local_set, None, true);
         }
     });

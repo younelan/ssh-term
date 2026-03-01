@@ -40,6 +40,9 @@ pub struct ConnectionSettings {
     pub local_forwards: String,
     #[serde(default)]
     pub remote_forwards: String,
+    /// Runtime-only: starting directory for local shells (not persisted).
+    #[serde(skip)]
+    pub initial_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for ConnectionSettings {
@@ -64,8 +67,7 @@ impl Default for ConnectionSettings {
             method: 0,
             term_type: "xterm-256color".to_string(),
             local_forwards: String::new(),
-            remote_forwards: String::new(),
-        }
+            remote_forwards: String::new(),            initial_dir: None,        }
     }
 }
 

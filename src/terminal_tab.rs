@@ -23,7 +23,7 @@ pub struct LocalPty {
     pub writer: Box<dyn std::io::Write + Send>,
 }
 
-fn spawn_local_shell(cols: u16, rows: u16) -> Result<(LocalPty, Box<dyn std::io::Read + Send>), Box<dyn std::error::Error + Send + Sync>> {
+fn spawn_local_shell(cols: u16, rows: u16, cwd: Option<&std::path::Path>) -> Result<(LocalPty, Box<dyn std::io::Read + Send>), Box<dyn std::error::Error + Send + Sync>> {
     // On macOS, TMPDIR can be very long (>100 chars) which causes ENAMETOOLONG (error 40)
     // when portable-pty creates unix sockets. Use a shorter temp dir.
     #[cfg(target_os = "macos")]
@@ -44,7 +44,13 @@ fn spawn_local_shell(cols: u16, rows: u16) -> Result<(LocalPty, Box<dyn std::io:
     })?;
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
-    let cmd = CommandBuilder::new(shell);
+    let mut cmd = CommandBuilder::new(shell);
+    // Use explicitly specified dir, then fall back to the process cwd.
+    if let Some(dir) = cwd {
+        cmd.cwd(dir);
+    } else if let Ok(d) = std::env::current_dir() {
+        cmd.cwd(d);
+    }
     let _child = pair.slave.spawn_command(cmd)?;
 
     let reader = pair.master.try_clone_reader()?;
@@ -347,8 +353,9 @@ pub fn add_terminal_tab(
     if is_local {
         let itx_l = input_tx.clone();
         let otx_l = output_tx.clone();
+        let initial_dir = settings.initial_dir.clone();
         std::thread::spawn(move || {
-            match spawn_local_shell(80, 24) {
+            match spawn_local_shell(80, 24, initial_dir.as_deref()) {
                 Ok((local, mut reader)) => {
                     let _ = otx_l.send(b"Local shell spawned.\r\n".to_vec());
                     let _ = itx_l.send(ConnectionControl::SetBackend(TerminalBackend::Local(local)));

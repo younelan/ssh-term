@@ -151,6 +151,7 @@ pub fn populate_list(
                 term_type: s_arc_for_save.lock().unwrap().get(index).map(|s| s.term_type.clone()).unwrap_or_else(|| "xterm-256color".to_string()),
                 local_forwards: lf_e.text().to_string(),
                 remote_forwards: rf_e.text().to_string(),
+                initial_dir: None,
             };
 
             let mut s_vec = s_arc_for_save.lock().unwrap();
