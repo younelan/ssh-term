@@ -570,20 +570,22 @@ impl TerminalState {
             "dropdown" | "combo" | "select" => {
                 let items_str = props.get("items").cloned().unwrap_or_default();
                 let items: Vec<&str> = items_str.split(',').collect();
-                let dd = gtk::DropDown::from_strings(&items.iter().map(|s| *s).collect::<Vec<&str>>());
-                dd.set_selected(0);
+                let selected: u32 = props.get("selected").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let combo = gtk::ComboBoxText::new();
+                for item in &items {
+                    combo.append_text(item);
+                }
+                combo.set_active(Some(selected));
                 let wid = id.clone();
                 let tx = pty_tx.clone();
-                let items_owned: Vec<String> = items.iter().map(|s| s.to_string()).collect();
-                dd.connect_selected_notify(move |d| {
+                combo.connect_changed(move |c| {
                     if let Some(ref tx) = tx {
-                        let idx = d.selected() as usize;
-                        let val = items_owned.get(idx).cloned().unwrap_or_default();
+                        let val = c.active_text().map(|s| s.to_string()).unwrap_or_default();
                         let msg = format!("\x1b]1337;WidgetEvent=id:{};action:selected;value:{}\x07", wid, val);
                         let _ = tx.send(msg.into_bytes());
                     }
                 });
-                Some(dd.upcast())
+                Some(combo.upcast())
             }
             "slider" | "scale" => {
                 let min: f64 = props.get("min").and_then(|v| v.parse().ok()).unwrap_or(0.0);
@@ -789,6 +791,74 @@ impl TerminalState {
                 // Store the inner TextView as the widget so we can update its buffer
                 self.widgets.insert(id.clone(), tv.clone().upcast());
                 Some(sw.upcast())
+            }
+            "notebook" | "tabs" => {
+                let width: i32 = props.get("width").and_then(|w| w.parse().ok()).unwrap_or(-1);
+                let height: i32 = props.get("height").and_then(|h| h.parse().ok()).unwrap_or(-1);
+                let pos = match props.get("tabpos").map(|s| s.as_str()) {
+                    Some("bottom") => gtk::PositionType::Bottom,
+                    Some("left") => gtk::PositionType::Left,
+                    Some("right") => gtk::PositionType::Right,
+                    _ => gtk::PositionType::Top,
+                };
+                let nb = gtk::Notebook::new();
+                nb.set_tab_pos(pos);
+                nb.set_scrollable(true);
+                if width > 0 || height > 0 { nb.set_size_request(width, height); }
+                // Store notebook so tabs can be added later
+                self.widgets.insert(id.clone(), nb.clone().upcast());
+                Some(nb.upcast())
+            }
+            "tab" => {
+                // Add a page to an existing notebook widget.
+                // Props: notebook:<id>, label:<tab title>
+                // The tab content is a vertical box registered as a panel.
+                let nb_id = props.get("notebook").cloned().unwrap_or_default();
+                let label = props.get("label").cloned().unwrap_or_else(|| "Tab".into());
+                let nb_widget = self.widgets.get(&nb_id).cloned();
+                if let Some(ref nbw) = nb_widget {
+                    if let Some(nb) = nbw.downcast_ref::<gtk::Notebook>() {
+                        let inner = gtk::Box::new(gtk::Orientation::Vertical, 4);
+                        inner.set_margin_start(4);
+                        inner.set_margin_end(4);
+                        inner.set_margin_top(4);
+                        inner.set_margin_bottom(4);
+                        let tab_label = gtk::Label::new(Some(&label));
+                        nb.append_page(&inner, Some(&tab_label));
+                        inner.set_visible(true);
+                        // Register the inner box as a panel
+                        self.panels.insert(id.clone(), inner);
+                        let wid = id.clone();
+                        let tx = pty_tx.clone();
+                        nb.connect_switch_page(move |_, _, page_num| {
+                            if let Some(ref tx) = tx {
+                                let msg = format!("\x1b]1337;WidgetEvent=id:{};action:switched;value:{}\x07", wid, page_num);
+                                let _ = tx.send(msg.into_bytes());
+                            }
+                        });
+                        return None; // Already placed inside notebook
+                    }
+                }
+                eprintln!("[WIDGET] notebook '{}' not found for tab", nb_id);
+                None
+            }
+            "close" | "closebutton" => {
+                // A button that sends Ctrl+C (ETX) + exit command to the PTY
+                let label = props.get("label").cloned().unwrap_or_else(|| "✕ Close".into());
+                let btn = gtk::Button::with_label(&label);
+                btn.add_css_class("destructive-action");
+                let wid = id.clone();
+                let tx = pty_tx.clone();
+                btn.connect_clicked(move |_| {
+                    if let Some(ref tx) = tx {
+                        // Send event first so demo can handle it
+                        let msg = format!("\x1b]1337;WidgetEvent=id:{};action:close;value:true\x07", wid);
+                        let _ = tx.send(msg.into_bytes());
+                        // Then send Ctrl+C (ETX byte 0x03) to kill the running script
+                        let _ = tx.send(vec![0x03]);
+                    }
+                });
+                Some(btn.upcast())
             }
             _ => {
                 eprintln!("[WIDGET] unknown type: {}", widget_type);

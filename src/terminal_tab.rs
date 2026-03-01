@@ -158,32 +158,55 @@ pub fn add_terminal_tab(
         gtk::glib::ControlFlow::Continue
     });
 
-    let itx_key = input_tx.clone();
-    let key_controller = gtk::EventControllerKey::new();
-    let tv_key = text_view.clone();
-    key_controller.connect_key_pressed(move |_, keyval, _, state| {
-        // On macOS Command key is META_MASK; on Linux/Windows it is SUPER_MASK
+    // Capture-phase controller on the ScrolledWindow: intercepts Ctrl+key and
+    // Cmd+key BEFORE any child widget (entry, button, etc.) can eat them.
+    // This ensures Ctrl+C always sends SIGINT to the PTY.
+    let itx_capture = input_tx.clone();
+    let tv_capture = text_view.clone();
+    let capture_controller = gtk::EventControllerKey::new();
+    capture_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    capture_controller.connect_key_pressed(move |_, keyval, _, state| {
+        let is_ctrl = state.contains(gtk::gdk::ModifierType::CONTROL_MASK);
         let is_super = state.contains(gtk::gdk::ModifierType::SUPER_MASK)
             || state.contains(gtk::gdk::ModifierType::META_MASK);
+
         if is_super {
             match keyval {
                 gtk::gdk::Key::c | gtk::gdk::Key::C => {
-                    tv_key.emit_by_name::<()>("copy-clipboard", &[]);
+                    tv_capture.emit_by_name::<()>("copy-clipboard", &[]);
+                    return gtk::glib::Propagation::Stop;
                 }
                 gtk::gdk::Key::v | gtk::gdk::Key::V => {
-                    let clipboard = tv_key.clipboard();
-                    let itx_v = itx_key.clone();
+                    let clipboard = tv_capture.clipboard();
+                    let itx_v = itx_capture.clone();
                     clipboard.read_text_async(gtk::gio::Cancellable::NONE, move |res| {
                         if let Ok(Some(text)) = res {
                             let _ = itx_v.send(ConnectionControl::Input(text.into_bytes()));
                         }
                     });
+                    return gtk::glib::Propagation::Stop;
                 }
-                _ => return gtk::glib::Propagation::Proceed,
+                _ => {}
             }
-            return gtk::glib::Propagation::Stop;
         }
 
+        // Ctrl+key: always send to PTY (Ctrl+C, Ctrl+Z, etc.) even if a child has focus
+        if is_ctrl {
+            let bytes = crate::terminal_state::keyval_to_bytes(keyval, state);
+            if let Some(data) = bytes {
+                let _ = itx_capture.send(ConnectionControl::Input(data));
+                return gtk::glib::Propagation::Stop;
+            }
+        }
+
+        gtk::glib::Propagation::Proceed
+    });
+    scrolled.add_controller(capture_controller);
+
+    // Bubble-phase controller on the TextView: handles normal typing
+    let itx_key = input_tx.clone();
+    let key_controller = gtk::EventControllerKey::new();
+    key_controller.connect_key_pressed(move |_, keyval, _, state| {
         let bytes = crate::terminal_state::keyval_to_bytes(keyval, state);
         if let Some(data) = bytes {
             let _ = itx_key.send(ConnectionControl::Input(data));
