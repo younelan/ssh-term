@@ -158,6 +158,70 @@ impl TerminalState {
         }
     }
 
+    /// Scroll the scroll region [scroll_top..scroll_bottom] up by `count` lines.
+    /// Deletes `count` lines from the top of the region, inserts `count` blank
+    /// lines at the bottom.  Cursor position is NOT changed.
+    fn scroll_region_up(&self, count: usize) {
+        let buffer = self.active_buffer();
+        for _ in 0..count {
+            // Delete the top line of the scroll region (including its trailing \n).
+            let line_start = match buffer.iter_at_line(self.scroll_top as i32) {
+                Some(i) => i,
+                None => return,
+            };
+            let mut line_end = line_start.clone();
+            // forward_line() moves to the START of the next line — that is exactly
+            // the range we need to delete (line text + the \n that terminated it).
+            if !line_end.forward_line() {
+                // scroll_top was the last line — just clear it instead.
+                let mut le = line_start.clone();
+                le.forward_to_line_end();
+                buffer.delete(&mut line_start.clone(), &mut le);
+                return;
+            }
+            buffer.delete(&mut line_start.clone(), &mut line_end);
+
+            // After the deletion, the old scroll_bottom is now at (scroll_bottom-1).
+            // Append a blank line after that position to keep the region height stable.
+            let new_bottom_idx = self.scroll_bottom as i32 - 1;
+            let mut ins = match buffer.iter_at_line(new_bottom_idx) {
+                Some(i) => i,
+                None => buffer.end_iter(),
+            };
+            ins.forward_to_line_end();
+            buffer.insert(&mut ins, "\n");
+        }
+    }
+
+    /// Scroll the scroll region [scroll_top..scroll_bottom] down by `count` lines.
+    /// Inserts `count` blank lines at the top of the region, deletes `count` lines
+    /// from the bottom.  Cursor position is NOT changed.
+    fn scroll_region_down(&self, count: usize) {
+        let buffer = self.active_buffer();
+        for _ in 0..count {
+            // Insert a blank line at the very start of the scroll region.
+            let mut ins = match buffer.iter_at_line(self.scroll_top as i32) {
+                Some(i) => i,
+                None => buffer.end_iter(),
+            };
+            buffer.insert(&mut ins, "\n");
+
+            // The old scroll_bottom line is now at (scroll_bottom+1).  Delete it.
+            let del_idx = self.scroll_bottom as i32 + 1;
+            if let Some(mut del_start) = buffer.iter_at_line(del_idx) {
+                let mut del_end = del_start.clone();
+                // Include the terminating \n so we don't leave an extra blank line.
+                if del_end.forward_line() {
+                    buffer.delete(&mut del_start, &mut del_end);
+                } else {
+                    // Last line — just clear its content.
+                    del_end.forward_to_line_end();
+                    buffer.delete(&mut del_start, &mut del_end);
+                }
+            }
+        }
+    }
+
     pub fn resize(&mut self, cols: usize, rows: usize) {
         self.cols = cols;
         self.rows = rows;
@@ -199,6 +263,9 @@ impl TerminalState {
             let (cx, cy) = if self.is_alternate { (self.alt_cursor_x, self.alt_cursor_y) } else { (self.cursor_x, self.cursor_y) };
             let mut iter = self.ensure_cursor_position(cx, cy);
             buffer.place_cursor(&iter);
+            // use_align=false: scroll the minimum amount to make the cursor visible.
+            // If the cursor is already on screen nothing happens; if it is below the
+            // viewport GTK scrolls it in at the bottom edge — correct terminal behaviour.
             tv.scroll_to_iter(&mut iter, 0.0, false, 0.0, 0.0);
         }
     }
@@ -271,6 +338,22 @@ impl TerminalState {
 
 impl Perform for TerminalState {
     fn print(&mut self, c: char) {
+        // Auto-wrap: if cursor is already at or past the right edge, advance to the next line first
+        {
+            let cx = if self.is_alternate { self.alt_cursor_x } else { self.cursor_x };
+            let cy = if self.is_alternate { self.alt_cursor_y } else { self.cursor_y };
+            if self.cols > 0 && cx >= self.cols {
+                let new_cy = cy + 1;
+                if self.is_alternate {
+                    self.alt_cursor_x = 0;
+                    self.alt_cursor_y = new_cy;
+                } else {
+                    self.cursor_x = 0;
+                    self.cursor_y = new_cy;
+                }
+            }
+        }
+
         let cx = if self.is_alternate { self.alt_cursor_x } else { self.cursor_x };
         let cy = if self.is_alternate { self.alt_cursor_y } else { self.cursor_y };
         let mut iter = self.ensure_cursor_position(cx, cy);
@@ -304,7 +387,18 @@ impl Perform for TerminalState {
 
     fn execute(&mut self, byte: u8) {
         match byte {
-            b'\n' => { if self.is_alternate { self.alt_cursor_y += 1; } else { self.cursor_y += 1; } }
+            b'\n' => {
+                let cy = if self.is_alternate { self.alt_cursor_y } else { self.cursor_y };
+                if cy == self.scroll_bottom {
+                    // Cursor is at the bottom margin — scroll the region up instead of
+                    // moving the cursor down.  This is what every terminal app (vi, less,
+                    // etc.) relies on: LF at scroll_bottom = scroll, not cursor advance.
+                    self.scroll_region_up(1);
+                    // cursor_y stays the same (still at scroll_bottom)
+                } else {
+                    if self.is_alternate { self.alt_cursor_y += 1; } else { self.cursor_y += 1; }
+                }
+            }
             b'\r' => { if self.is_alternate { self.alt_cursor_x = 0; } else { self.cursor_x = 0; } }
             b'\x08' | b'\x7f' => {
                 let cx = if self.is_alternate { &mut self.alt_cursor_x } else { &mut self.cursor_x };
@@ -452,22 +546,14 @@ impl Perform for TerminalState {
                 buffer.insert(&mut insert_iter, &spaces);
             }
             'S' => {
+                // Scroll region up: delete from scroll_top, blank lines appear at scroll_bottom
                 let count = arg0.max(1);
-                let buffer = self.active_buffer();
-                if let Some(mut start) = buffer.iter_at_line(0) {
-                    let mut end = start.clone();
-                    for _ in 0..count {
-                        if !end.is_end() { end.forward_visible_line(); }
-                    }
-                    buffer.delete(&mut start, &mut end);
-                }
+                self.scroll_region_up(count);
             }
             'T' => {
+                // Scroll region down: insert at scroll_top, delete from scroll_bottom
                 let count = arg0.max(1);
-                let buffer = self.active_buffer();
-                let mut start = buffer.start_iter();
-                let newlines = "\n".repeat(count);
-                buffer.insert(&mut start, &newlines);
+                self.scroll_region_down(count);
             }
             'r' => {
                 self.scroll_top = arg0.saturating_sub(1);
@@ -490,17 +576,11 @@ impl Perform for TerminalState {
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
         match byte {
             b'D' => {
+                // Index: same as LF — advance cursor, scroll if at scroll_bottom
                 let cy = if self.is_alternate { self.alt_cursor_y } else { self.cursor_y };
-                if cy == self.scroll_bottom && self.scroll_bottom != usize::MAX {
-                    let top = self.scroll_top;
-                    let buffer = self.active_buffer();
-                    if let Some(mut start) = buffer.iter_at_line(top as i32) {
-                        let mut end = start.clone();
-                        end.forward_visible_line();
-                        buffer.delete(&mut start, &mut end);
-                        let mut insert_iter = self.ensure_cursor_position(0, cy);
-                        buffer.insert(&mut insert_iter, "\n");
-                    }
+                if cy == self.scroll_bottom {
+                    self.scroll_region_up(1);
+                    // cursor stays at scroll_bottom
                 } else {
                     if self.is_alternate { self.alt_cursor_y += 1; } else { self.cursor_y += 1; }
                 }

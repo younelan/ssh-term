@@ -93,6 +93,10 @@ pub fn add_terminal_tab(
 
     let (input_tx, input_rx) = flume::unbounded::<ConnectionControl>();
     let (output_tx, output_rx) = flume::unbounded::<Vec<u8>>();
+    // Shared current terminal size — written by the resize timer (main thread),
+    // read by the backend thread when SetBackend fires so SSH/local both get
+    // the correct size immediately on connect regardless of timing.
+    let current_size = std::sync::Arc::new(std::sync::Mutex::new((80u32, 24u32)));
 
     let palette = settings.palette.clone();
     let state = TerminalState::new(text_view.downgrade(), dummy_label.downgrade(), palette);
@@ -108,7 +112,13 @@ pub fn add_terminal_tab(
             received = true;
         }
         if received {
-            state_for_output.borrow().update_visual_cursor();
+            // Defer the scroll until GTK has re-laid out the buffer changes.
+            // Calling scroll_to_iter immediately after buffer edits uses stale
+            // layout geometry and scrolls to the wrong position.
+            let state_scroll = state_for_output.clone();
+            gtk::glib::idle_add_local_once(move || {
+                state_scroll.borrow().update_visual_cursor();
+            });
         }
         gtk::glib::ControlFlow::Continue
     });
@@ -117,7 +127,9 @@ pub fn add_terminal_tab(
     let key_controller = gtk::EventControllerKey::new();
     let tv_key = text_view.clone();
     key_controller.connect_key_pressed(move |_, keyval, _, state| {
-        let is_super = state.contains(gtk::gdk::ModifierType::SUPER_MASK);
+        // On macOS Command key is META_MASK; on Linux/Windows it is SUPER_MASK
+        let is_super = state.contains(gtk::gdk::ModifierType::SUPER_MASK)
+            || state.contains(gtk::gdk::ModifierType::META_MASK);
         if is_super {
             match keyval {
                 gtk::gdk::Key::c | gtk::gdk::Key::C => {
@@ -147,31 +159,44 @@ pub fn add_terminal_tab(
     text_view.add_controller(key_controller);
 
     let tv_for_resize = text_view.clone();
+    let scrolled_for_resize = scrolled.clone();
     let itx_resize = input_tx.clone();
     let mut last_cols = 0;
     let mut last_rows = 0;
     let font_size_u32 = settings.font_size;
     
     let state_for_resize = state_rc.clone();
+    let current_size_thread = current_size.clone(); // cloned before the timer moves current_size
     gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
-        let width = tv_for_resize.width();
-        let height = tv_for_resize.height();
+        // scrolled_for_resize.width/height() is the allocation of the ScrolledWindow
+        // widget itself, which equals the visible viewport size.  This is always correct —
+        // never affected by content height or scrollbar presence.
+        let width  = scrolled_for_resize.width();
+        let height = scrolled_for_resize.height();
         if width > 0 && height > 0 {
             let font_desc = gtk::pango::FontDescription::from_string(&format!("monospace {}", font_size_u32));
-            let pango_ctx = tv_for_resize.pango_context();
-            let metrics = pango_ctx.metrics(Some(&font_desc), None);
-            
-            let char_w = (metrics.approximate_char_width() as f32 / gtk::pango::SCALE as f32).max(1.0);
-            let char_h = ((metrics.ascent() + metrics.descent()) as f32 / gtk::pango::SCALE as f32).max(1.0);
+            // Measure char size using a multi-char multi-line layout so that:
+            //   char_w  = advance width (not just ink width)
+            //   char_h  = line height INCLUDING line spacing (not just glyph height)
+            // Using 10 chars × 10 lines gives stable pixel-averaged values.
+            let sample = "MMMMMMMMMM\nMMMMMMMMMM\nMMMMMMMMMM\nMMMMMMMMMM\nMMMMMMMMMM\nMMMMMMMMMM\nMMMMMMMMMM\nMMMMMMMMMM\nMMMMMMMMMM\nMMMMMMMMMM";
+            let layout = tv_for_resize.create_pango_layout(Some(sample));
+            layout.set_font_description(Some(&font_desc));
+            let (w_px, h_px) = layout.pixel_size();
+            let char_w = (w_px as f32 / 10.0).max(1.0);
+            // pixel_size() is pure Pango — it does NOT include the per-line extra
+            // spacing that GTK TextView adds via pixels_above_lines / pixels_below_lines.
+            // We must add those back so char_h matches what the TextView actually renders.
+            let line_extra = (tv_for_resize.pixels_above_lines() + tv_for_resize.pixels_below_lines()) as f32;
+            let char_h = (h_px as f32 / 10.0 + line_extra).max(1.0);
 
-            // Account for TextView internal padding and potential borders
-            // 4px padding in CSS + GTK defaults
-            let cols = (((width - 10) as f32) / char_w).floor().max(1.0) as u32;
-            let rows = (((height - 10) as f32) / char_h).floor().max(1.0) as u32;
+            let cols = (width  as f32 / char_w).floor().max(1.0) as u32;
+            let rows = (height as f32 / char_h).floor().max(1.0) as u32;
 
             if cols != last_cols || rows != last_rows {
                 last_cols = cols;
                 last_rows = rows;
+                *current_size.lock().unwrap() = (cols, rows);
                 state_for_resize.borrow_mut().resize(cols as usize, rows as usize);
                 let _ = itx_resize.send(ConnectionControl::Resize(cols, rows, width as u32, height as u32));
             }
@@ -211,6 +236,28 @@ pub fn add_terminal_tab(
                 match ctrl {
                     ConnectionControl::SetBackend(b) => {
                         backend = Some(b);
+                        // Immediately resize to the current window size.
+                        // This is critical for SSH: the resize timer fires long before
+                        // auth completes, so the Resize message was dropped (no backend
+                        // yet). Now that we have a backend, apply the known size.
+                        let (cols, rows) = *current_size_thread.lock().unwrap();
+                        if cols > 0 && rows > 0 {
+                            if let Some(ref mut b) = backend {
+                                match b {
+                                    TerminalBackend::Local(local) => {
+                                        let _ = local.master.resize(portable_pty::PtySize {
+                                            rows: rows as u16,
+                                            cols: cols as u16,
+                                            pixel_width: 0,
+                                            pixel_height: 0,
+                                        });
+                                    }
+                                    TerminalBackend::Ssh(channel) => {
+                                        let _ = channel.request_pty_size(cols, rows, None, None);
+                                    }
+                                }
+                            }
+                        }
                     }
                     ConnectionControl::Input(data) => {
                         if let Some(ref mut b) = backend {
