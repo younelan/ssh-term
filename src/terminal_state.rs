@@ -109,6 +109,14 @@ pub struct TerminalState {
     pub list_stores: std::collections::HashMap<String, gtk::ListStore>,
     /// Named TreeIter rows: widget_id -> (row_id -> iter), for addrow with parent.
     pub tree_row_iters: std::collections::HashMap<String, std::collections::HashMap<String, gtk::TreeIter>>,
+    /// Tracks the last dynamically-applied CSS class per widget so we can remove it before adding a new one.
+    pub widget_css_classes: std::collections::HashMap<String, String>,
+    /// Per-widget CssProvider for dynamic background/foreground colours.
+    pub widget_css_providers: std::collections::HashMap<String, gtk::CssProvider>,
+    /// Last-set background colour per widget (for merge on partial update).
+    pub widget_bg_colors: std::collections::HashMap<String, String>,
+    /// Last-set foreground/text colour per widget (for merge on partial update).
+    pub widget_fg_colors: std::collections::HashMap<String, String>,
 }
 
 impl TerminalState {
@@ -188,6 +196,51 @@ impl TerminalState {
             tree_stores: std::collections::HashMap::new(),
             list_stores: std::collections::HashMap::new(),
             tree_row_iters: std::collections::HashMap::new(),
+            widget_css_classes: std::collections::HashMap::new(),
+            widget_css_providers: std::collections::HashMap::new(),
+            widget_bg_colors: std::collections::HashMap::new(),
+            widget_fg_colors: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Apply background/foreground colours to a widget via a per-widget CssProvider.
+    /// Merges new values with any already-stored value so a partial update (bg only,
+    /// fg only) doesn't erase the other channel.
+    fn apply_widget_colors(&mut self, id: &str, widget: &gtk::Widget, bg: Option<&str>, fg: Option<&str>) {
+        if let Some(b) = bg { self.widget_bg_colors.insert(id.to_string(), b.to_string()); }
+        if let Some(f) = fg { self.widget_fg_colors.insert(id.to_string(), f.to_string()); }
+        let eff_bg = self.widget_bg_colors.get(id).cloned();
+        let eff_fg = self.widget_fg_colors.get(id).cloned();
+        if eff_bg.is_none() && eff_fg.is_none() { return; }
+        widget.set_widget_name(&format!("wgt-{}", id));
+        // Build a CSS block that covers:
+        //   - the widget node itself  (background, and color for Label)
+        //   - the inner `label` node  (color for Button/CheckButton/etc.)
+        // `background-image:none` is required to strip GTK4's default gradient.
+        let mut widget_props = String::new();
+        let mut label_props  = String::new();
+        if let Some(ref b) = eff_bg {
+            widget_props.push_str(&format!("background-color:{};background-image:none;background:{};", b, b));
+        }
+        if let Some(ref f) = eff_fg {
+            widget_props.push_str(&format!("color:{};", f));
+            label_props.push_str(&format!("color:{};", f));
+        }
+        let mut css = format!("#wgt-{} {{ {} }}", id, widget_props);
+        if !label_props.is_empty() {
+            css.push_str(&format!(" #wgt-{} label {{ {} }}", id, label_props));
+        }
+        if let Some(provider) = self.widget_css_providers.get(id) {
+            provider.load_from_data(&css);
+        } else {
+            let provider = gtk::CssProvider::new();
+            provider.load_from_data(&css);
+            gtk::style_context_add_provider_for_display(
+                &widget.display(),
+                &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_USER,
+            );
+            self.widget_css_providers.insert(id.to_string(), provider);
         }
     }
 
@@ -442,6 +495,12 @@ impl TerminalState {
             (outer, Some(bx), None)
         };
         inner_widget.set_visible(true);
+        // Apply per-panel colours
+        let bg = props.get("bg_color").map(|s| s.as_str());
+        let fg = props.get("fg_color").or(props.get("color")).map(|s| s.as_str());
+        if bg.is_some() || fg.is_some() {
+            self.apply_widget_colors(&id, &inner_widget, bg, fg);
+        }
         if expand {
             inner_widget.set_hexpand(true);
             inner_widget.set_vexpand(true);
@@ -501,8 +560,42 @@ impl TerminalState {
 
         match widget_type {
             "button" => {
-                let label = props.get("label").cloned().unwrap_or_else(|| "Button".into());
+                let label_raw = props.get("label").cloned().unwrap_or_else(|| "Button".into());
+                let label = label_raw.replace("\\n", "\n");
                 let btn = gtk::Button::with_label(&label);
+                let bw: i32 = props.get("width").and_then(|v| v.parse().ok()).unwrap_or(-1);
+                let bh: i32 = props.get("height").and_then(|v| v.parse().ok()).unwrap_or(-1);
+                if bw > 0 || bh > 0 { btn.set_size_request(bw, bh); }
+                if let Some(cls) = props.get("css_class") {
+                    btn.add_css_class(cls);
+                    self.widget_css_classes.insert(id.clone(), cls.clone());
+                    // Pre-apply per-widget provider for ttt-* classes so the
+                    // GTK theme gradient cannot override the button background.
+                    let wname = format!("wgt-{}", id);
+                    btn.set_widget_name(&wname);
+                    let ttt_css: Option<String> = match cls.as_str() {
+                        "ttt-x"        => Some(format!("#{} {{ background-color:#3498db; background-image:none; }} #{} label {{ color:white; font-size:26px; font-weight:bold; }}", wname, wname)),
+                        "ttt-o"        => Some(format!("#{} {{ background-color:#e74c3c; background-image:none; }} #{} label {{ color:white; font-size:26px; font-weight:bold; }}", wname, wname)),
+                        "ttt-win"      => Some(format!("#{} {{ background-color:#2ecc71; background-image:none; }} #{} label {{ color:white; font-size:26px; font-weight:bold; }}", wname, wname)),
+                        "ttt-empty"    => Some(format!("#{} {{ background-color:#44475a; background-image:none; }} #{} label {{ color:#aaa;   font-size:26px; font-weight:bold; }}", wname, wname)),
+                        "card-hidden"  => Some(format!("#{} {{ background-color:#2c3e50; background-image:none; border-radius:8px; }} #{} label {{ color:#566573; font-size:20px; font-weight:bold; }}", wname, wname)),
+                        "card-red"     => Some(format!("#{} {{ background-color:#c0392b; background-image:none; border-radius:8px; }} #{} label {{ color:white;   font-size:20px; font-weight:bold; }}", wname, wname)),
+                        "card-black"   => Some(format!("#{} {{ background-color:#1a252f; background-image:none; border-radius:8px; }} #{} label {{ color:#3498db; font-size:20px; font-weight:bold; }}", wname, wname)),
+                        "card-matched" => Some(format!("#{} {{ background-color:#1e8449; background-image:none; border-radius:8px; }} #{} label {{ color:white;   font-size:20px; font-weight:bold; }}", wname, wname)),
+                        "card-wrong"   => Some(format!("#{} {{ background-color:#922b21; background-image:none; border-radius:8px; }} #{} label {{ color:white;   font-size:20px; font-weight:bold; }}", wname, wname)),
+                        _ => None,
+                    };
+                    if let Some(css) = ttt_css {
+                        let provider = gtk::CssProvider::new();
+                        provider.load_from_data(&css);
+                        gtk::style_context_add_provider_for_display(
+                            &btn.display(),
+                            &provider,
+                            gtk::STYLE_PROVIDER_PRIORITY_USER,
+                        );
+                        self.widget_css_providers.insert(id.clone(), provider);
+                    }
+                }
                 let wid = id.clone();
                 let tx = pty_tx.clone();
                 btn.connect_clicked(move |_| {
@@ -1521,6 +1614,12 @@ impl TerminalState {
             None => return,
         };
         widget.set_visible(true);
+        // Apply per-widget colours if provided
+        let bg = props.get("bg_color").map(|s| s.as_str());
+        let fg = props.get("fg_color").or(props.get("color")).map(|s| s.as_str());
+        if bg.is_some() || fg.is_some() {
+            self.apply_widget_colors(&id, &widget, bg, fg);
+        }
         // Block-level widgets always fill horizontal space when placed inline.
         let default_expand = matches!(widget_type.as_str(),
             "menubar" | "toolbar" | "splitview" | "paned" | "panel" | "titlebar" | "statusbar"
@@ -1613,6 +1712,7 @@ impl TerminalState {
 
         // Try each property update
         if let Some(text) = props.get("text") {
+            let text = &text.replace("\\n", "\n");
             if let Some(lbl) = widget.downcast_ref::<gtk::Label>() {
                 lbl.set_text(text);
             } else if let Some(btn) = widget.downcast_ref::<gtk::Button>() {
@@ -1657,6 +1757,7 @@ impl TerminalState {
             }
         }
         if let Some(label) = props.get("label") {
+            let label = &label.replace("\\n", "\n");
             if let Some(btn) = widget.downcast_ref::<gtk::Button>() {
                 btn.set_label(label);
             } else if let Some(cb) = widget.downcast_ref::<gtk::CheckButton>() {
@@ -1664,6 +1765,82 @@ impl TerminalState {
             } else if let Some(exp) = widget.downcast_ref::<gtk::Expander>() {
                 exp.set_label(Some(label));
             }
+        }
+        if let Some(new_class) = props.get("css_class") {
+            if let Some(old_class) = self.widget_css_classes.get(&id) {
+                widget.remove_css_class(old_class);
+            }
+            widget.add_css_class(new_class);
+            self.widget_css_classes.insert(id.clone(), new_class.clone());
+            // If the caller registered explicit bg/fg colours for this class,
+            // inject them via the high-priority per-widget provider so the
+            // GTK theme cannot override them.
+            let name = id.clone();
+            let w2   = widget.clone();
+            let nc   = new_class.clone();
+            // Build inline CSS based on the new class so the correct colours
+            // are applied immediately without needing a separate WU call.
+            w2.set_widget_name(&format!("wgt-{}", name));
+            let inline_css = match nc.as_str() {
+                "ttt-x"     => Some(format!(
+                    "#wgt-{} {{ background-color:#3498db; background-image:none; }}\
+                     #wgt-{} label {{ color:white; font-size:26px; font-weight:bold; }}",
+                    name, name)),
+                "ttt-o"     => Some(format!(
+                    "#wgt-{} {{ background-color:#e74c3c; background-image:none; }}\
+                     #wgt-{} label {{ color:white; font-size:26px; font-weight:bold; }}",
+                    name, name)),
+                "ttt-win"   => Some(format!(
+                    "#wgt-{} {{ background-color:#2ecc71; background-image:none; }}\
+                     #wgt-{} label {{ color:white; font-size:26px; font-weight:bold; }}",
+                    name, name)),
+                "ttt-empty" => Some(format!(
+                    "#wgt-{} {{ background-color:#44475a; background-image:none; }}\
+                     #wgt-{} label {{ color:#aaa; font-size:26px; font-weight:bold; }}",
+                    name, name)),
+                "card-hidden"  => Some(format!(
+                    "#wgt-{} {{ background-color:#2c3e50; background-image:none; border-radius:8px; }}\
+                     #wgt-{} label {{ color:#566573; font-size:20px; font-weight:bold; }}",
+                    name, name)),
+                "card-red"     => Some(format!(
+                    "#wgt-{} {{ background-color:#c0392b; background-image:none; border-radius:8px; }}\
+                     #wgt-{} label {{ color:white; font-size:20px; font-weight:bold; }}",
+                    name, name)),
+                "card-black"   => Some(format!(
+                    "#wgt-{} {{ background-color:#1a252f; background-image:none; border-radius:8px; }}\
+                     #wgt-{} label {{ color:#3498db; font-size:20px; font-weight:bold; }}",
+                    name, name)),
+                "card-matched" => Some(format!(
+                    "#wgt-{} {{ background-color:#1e8449; background-image:none; border-radius:8px; }}\
+                     #wgt-{} label {{ color:white; font-size:20px; font-weight:bold; }}",
+                    name, name)),
+                "card-wrong"   => Some(format!(
+                    "#wgt-{} {{ background-color:#922b21; background-image:none; border-radius:8px; }}\
+                     #wgt-{} label {{ color:white; font-size:20px; font-weight:bold; }}",
+                    name, name)),
+                _ => None,
+            };
+            if let Some(css) = inline_css {
+                if let Some(provider) = self.widget_css_providers.get(&id) {
+                    provider.load_from_data(&css);
+                } else {
+                    let provider = gtk::CssProvider::new();
+                    provider.load_from_data(&css);
+                    gtk::style_context_add_provider_for_display(
+                        &w2.display(),
+                        &provider,
+                        gtk::STYLE_PROVIDER_PRIORITY_USER,
+                    );
+                    self.widget_css_providers.insert(id.clone(), provider);
+                }
+            }
+        }
+        // Dynamic colour updates
+        let bg = props.get("bg_color").map(|s| s.as_str());
+        let fg = props.get("fg_color").or(props.get("color")).map(|s| s.as_str());
+        if bg.is_some() || fg.is_some() {
+            let w = widget.clone();
+            self.apply_widget_colors(&id, &w, bg, fg);
         }
         if let Some(sensitive) = props.get("sensitive") {
             widget.set_sensitive(sensitive == "true" || sensitive == "1");
@@ -1778,6 +1955,64 @@ impl TerminalState {
         } else {
             eprintln!("[IMG] view WeakRef was dead");
         }
+    }
+
+    /// Show a modal alert dialog.  spec = "title:Foo;body:Bar;ok:OK"
+    pub fn show_alert(&self, spec: &str) {
+        let props = Self::parse_widget_props(spec);
+        let title   = props.get("title").cloned().unwrap_or_else(|| "Alert".into());
+        let body    = props.get("body").cloned().unwrap_or_default();
+        let ok_lbl  = props.get("ok").cloned().unwrap_or_else(|| "OK".into());
+        let alert_id = props.get("id").cloned().unwrap_or_else(|| "alert".into());
+
+        let parent: Option<gtk::Window> = self.view.upgrade()
+            .and_then(|tv| tv.root())
+            .and_then(|r| r.downcast::<gtk::Window>().ok());
+
+        let dialog = gtk::Window::builder()
+            .title(&title)
+            .modal(true)
+            .default_width(320)
+            .resizable(false)
+            .build();
+        if let Some(ref p) = parent {
+            dialog.set_transient_for(Some(p));
+        }
+        dialog.add_css_class("main-app-window");
+
+        let vbox = gtk::Box::new(gtk::Orientation::Vertical, 16);
+        vbox.set_margin_top(24); vbox.set_margin_bottom(20);
+        vbox.set_margin_start(24); vbox.set_margin_end(24);
+
+        let title_lbl = gtk::Label::new(Some(&title));
+        title_lbl.add_css_class("title-4");
+        title_lbl.set_halign(gtk::Align::Center);
+        vbox.append(&title_lbl);
+
+        if !body.is_empty() {
+            let body_lbl = gtk::Label::new(Some(&body));
+            body_lbl.set_wrap(true);
+            body_lbl.set_halign(gtk::Align::Center);
+            vbox.append(&body_lbl);
+        }
+
+        let ok_btn = gtk::Button::with_label(&ok_lbl);
+        ok_btn.add_css_class("suggested-action");
+        ok_btn.set_halign(gtk::Align::Center);
+        ok_btn.set_margin_top(8);
+        let d2 = dialog.clone();
+        let pty_tx = self.pty_input_tx.clone();
+        ok_btn.connect_clicked(move |_| {
+            d2.close();
+            let msg = format!("\x1b]1337;WidgetEvent=id:{};action:clicked;value:\x07", alert_id);
+            if let Some(ref tx) = pty_tx {
+                let _ = tx.try_send(msg.into_bytes());
+            }
+        });
+        vbox.append(&ok_btn);
+
+        dialog.set_child(Some(&vbox));
+        dialog.present();
     }
 }
 
@@ -2098,6 +2333,9 @@ impl Perform for TerminalState {
                 if let Some(spec) = payload.strip_prefix("Panel=") {
                     eprintln!("[PANEL] OSC 1337 Panel spec: {}", spec);
                     self.insert_panel(spec);
+                } else if let Some(spec) = payload.strip_prefix("Alert=") {
+                    eprintln!("[ALERT] OSC 1337 Alert spec: {}", spec);
+                    self.show_alert(spec);
                 } else if let Some(spec) = payload.strip_prefix("Widget=") {
                     eprintln!("[WIDGET] OSC 1337 Widget spec: {}", spec);
                     self.insert_widget(spec);

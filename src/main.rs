@@ -131,6 +131,48 @@ fn setup_app(app: &Application) {
             font-size: 11px;
             opacity: 0.7;
         }
+
+        /* ── Tic-Tac-Toe cells ─────────────────────── */
+        button.ttt-empty {
+            background: #44475a;
+            background-image: none;
+            border-radius: 6px;
+            border: none;
+            box-shadow: none;
+        }
+        button.ttt-x {
+            background: #3498db;
+            background-image: none;
+            border-radius: 6px;
+            border: none;
+            box-shadow: none;
+        }
+        button.ttt-o {
+            background: #e74c3c;
+            background-image: none;
+            border-radius: 6px;
+            border: none;
+            box-shadow: none;
+        }
+        button.ttt-win {
+            background: #2ecc71;
+            background-image: none;
+            border-radius: 6px;
+            border: none;
+            box-shadow: none;
+        }
+        button.ttt-empty label,
+        button.ttt-x     label,
+        button.ttt-o     label,
+        button.ttt-win   label {
+            font-size: 26px;
+            font-weight: bold;
+            color: white;
+            min-width: 0;
+        }
+        button.ttt-empty:hover { background: #6272a4; background-image: none; }
+        button.ttt-x:hover     { background: #5dade2; background-image: none; }
+        button.ttt-o:hover     { background: #e84c3c; background-image: none; }
     "#;
     let provider = CssProvider::new();
     provider.load_from_data(css);
@@ -209,6 +251,7 @@ fn apply_app_theme(theme_name: &str) {
     };
 
     settings.set_gtk_application_prefer_dark_theme(is_dark);
+    settings.set_gtk_overlay_scrolling(true);
 
     let css = format!(
         r#"
@@ -304,6 +347,31 @@ fn apply_app_theme(theme_name: &str) {
         }}
         .bell-flash {{
             background-color: alpha({1}, 0.2);
+        }}
+
+        /* ── Scrollbar: hidden at rest, fade in on hover ── */
+        scrollbar {{
+            background-color: transparent;
+            border: none;
+            min-width: 0px;
+            min-height: 0px;
+            opacity: 0;
+            transition: opacity 200ms;
+        }}
+        scrollbar slider {{
+            background-color: alpha({1}, 0.35);
+            border-radius: 4px;
+            min-width: 5px;
+            min-height: 5px;
+            margin: 1px;
+        }}
+        scrolledwindow:hover scrollbar {{
+            opacity: 1;
+            min-width: 7px;
+            min-height: 7px;
+        }}
+        scrolledwindow:hover scrollbar slider:hover {{
+            background-color: alpha({1}, 0.6);
         }}
         "#,
         bg, fg, hb_bg

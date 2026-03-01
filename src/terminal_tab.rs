@@ -65,6 +65,7 @@ pub fn add_terminal_tab(
     let scrolled = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .overlay_scrolling(true)
         .build();
 
     let text_view = gtk::TextView::builder()
