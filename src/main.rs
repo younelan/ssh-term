@@ -373,6 +373,27 @@ fn apply_app_theme(theme_name: &str) {
         scrolledwindow:hover scrollbar slider:hover {{
             background-color: alpha({1}, 0.6);
         }}
+
+        /* ── Floating WM windows ── */
+        .wm-floating {{
+            border: 1px solid alpha({1}, 0.18);
+            box-shadow: 0 8px 32px alpha(black, 0.45);
+        }}
+
+        /* ── Toast popup ── */
+        .toast-popup {{
+            background-color: alpha(#e2e8f0, 0.93);
+            color: #1a202c;
+            border-radius: 20px;
+            padding: 0px;
+            box-shadow: 0 4px 16px alpha(black, 0.35);
+            background-image: none;
+        }}
+        .toast-popup label {{
+            color: #1a202c;
+            font-size: 0.95em;
+            background-color: transparent;
+        }}
         "#,
         bg, fg, hb_bg
     );

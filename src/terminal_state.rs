@@ -117,6 +117,8 @@ pub struct TerminalState {
     pub widget_bg_colors: std::collections::HashMap<String, String>,
     /// Last-set foreground/text colour per widget (for merge on partial update).
     pub widget_fg_colors: std::collections::HashMap<String, String>,
+    /// Floating GTK windows created by Window= OSC command (id -> window).
+    pub windows: std::collections::HashMap<String, gtk::Window>,
 }
 
 impl TerminalState {
@@ -200,6 +202,7 @@ impl TerminalState {
             widget_css_providers: std::collections::HashMap::new(),
             widget_bg_colors: std::collections::HashMap::new(),
             widget_fg_colors: std::collections::HashMap::new(),
+            windows: std::collections::HashMap::new(),
         }
     }
 
@@ -680,7 +683,7 @@ impl TerminalState {
             }
             "dropdown" | "combo" | "select" => {
                 let items_str = props.get("items").cloned().unwrap_or_default();
-                let items: Vec<&str> = items_str.split(',').collect();
+                let items: Vec<&str> = items_str.split('|').collect();
                 let selected: u32 = props.get("selected").and_then(|v| v.parse().ok()).unwrap_or(0);
                 let combo = gtk::ComboBoxText::new();
                 for item in &items {
@@ -748,14 +751,14 @@ impl TerminalState {
                 Some(pb.upcast())
             }
             "label" => {
-                let text = props.get("text").cloned().unwrap_or_else(|| "Label".into());
+                let text = props.get("label").or(props.get("text")).cloned().unwrap_or_default();
                 let lbl = gtk::Label::new(Some(&text));
                 if let Some(css_class) = props.get("class") {
                     lbl.add_css_class(css_class);
                 }
                 Some(lbl.upcast())
             }
-            "spinbutton" | "spin" => {
+            "spinbutton" | "spin" | "spinbox" => {
                 let min: f64 = props.get("min").and_then(|v| v.parse().ok()).unwrap_or(0.0);
                 let max: f64 = props.get("max").and_then(|v| v.parse().ok()).unwrap_or(100.0);
                 let value: f64 = props.get("value").and_then(|v| v.parse().ok()).unwrap_or(min);
@@ -915,6 +918,34 @@ impl TerminalState {
                         }
                     }
                 });
+                {
+                    let wid2 = id.clone();
+                    let tx2 = pty_tx.clone();
+                    tv.connect_row_expanded(move |tv_inner, iter, _path| {
+                        if let Some(model) = tv_inner.model() {
+                            if let Ok(val) = model.get_value(iter, 0).get::<String>() {
+                                if let Some(ref tx) = tx2 {
+                                    let msg = format!("\x1b]1337;WidgetEvent=id:{};action:expanded;value:{}\x07", wid2, val);
+                                    let _ = tx.send(msg.into_bytes());
+                                }
+                            }
+                        }
+                    });
+                }
+                {
+                    let wid3 = id.clone();
+                    let tx3 = pty_tx.clone();
+                    tv.connect_row_collapsed(move |tv_inner, iter, _path| {
+                        if let Some(model) = tv_inner.model() {
+                            if let Ok(val) = model.get_value(iter, 0).get::<String>() {
+                                if let Some(ref tx) = tx3 {
+                                    let msg = format!("\x1b]1337;WidgetEvent=id:{};action:collapsed;value:{}\x07", wid3, val);
+                                    let _ = tx.send(msg.into_bytes());
+                                }
+                            }
+                        }
+                    });
+                }
                 let sw = gtk::ScrolledWindow::new();
                 sw.set_child(Some(&tv));
                 sw.set_size_request(width, height);
@@ -925,7 +956,7 @@ impl TerminalState {
                 self.widgets.insert(id.clone(), tv.clone().upcast());
                 Some(sw.upcast())
             }
-            "listview" => {
+            "listview" | "listbox" | "table" => {
                 let width: i32 = props.get("width").and_then(|v| v.parse().ok()).unwrap_or(300);
                 let height: i32 = props.get("height").and_then(|v| v.parse().ok()).unwrap_or(300);
                 let col_names: Vec<String> = props.get("cols")
@@ -970,6 +1001,56 @@ impl TerminalState {
                         }
                     }
                 });
+                // Row action columns — inline click targets, not backed by the model store.
+                // Each renderer has a fixed label set directly; no add_attribute binding is
+                // made so GTK never overwrites the text from the model.
+                let action_names: Vec<String> = props.get("actions")
+                    .map(|s| s.split('|').map(|a| a.trim().to_string()).collect())
+                    .unwrap_or_default();
+                let n_data = n;
+                for act_name in &action_names {
+                    let renderer = gtk::CellRendererText::new();
+                    renderer.set_property("text", act_name.as_str());
+                    renderer.set_property("foreground", "#5599ff");
+                    let col = gtk::TreeViewColumn::new();
+                    gtk::prelude::CellLayoutExt::pack_start(&col, &renderer, false);
+                    col.set_expand(false);
+                    tv.append_column(&col);
+                }
+                if !action_names.is_empty() {
+                    let tv_click = tv.clone();
+                    let wid_click = id.clone();
+                    let tx_click = pty_tx.clone();
+                    let actions_click = action_names.clone();
+                    let gesture = gtk::GestureClick::new();
+                    gesture.connect_pressed(move |_, _, x, y| {
+                        if let Some((Some(path), Some(clicked_col), _, _)) =
+                            tv_click.path_at_pos(x as i32, y as i32)
+                        {
+                            let all_cols = tv_click.columns();
+                            if let Some(col_idx) = all_cols.iter().position(|c| c == &clicked_col) {
+                                if col_idx >= n_data {
+                                    let act = &actions_click[col_idx - n_data];
+                                    let row_idx = path.indices().first().cloned().unwrap_or(0);
+                                    if let Some(model) = tv_click.model() {
+                                        if let Some(iter) = model.iter(&path) {
+                                            let rowid = model.get_value(&iter, 0)
+                                                .get::<String>().unwrap_or_default();
+                                            if let Some(ref tx) = tx_click {
+                                                let msg = format!(
+                                                    "\x1b]1337;WidgetEvent=id:{};action:row_action;value:{};rowid:{};row:{}\x07",
+                                                    wid_click, act, rowid, row_idx
+                                                );
+                                                let _ = tx.send(msg.into_bytes());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    tv.add_controller(gesture);
+                }
                 let sw = gtk::ScrolledWindow::new();
                 sw.set_child(Some(&tv));
                 sw.set_size_request(width, height);
@@ -1037,6 +1118,22 @@ impl TerminalState {
                 exp.set_child(Some(&inner));
                 self.panels.insert(id.clone(), inner);
                 Some(exp.upcast())
+            }
+            "frame" => {
+                let label = props.get("label").cloned().unwrap_or_default();
+                let spacing: i32 = props.get("spacing").and_then(|s| s.parse().ok()).unwrap_or(6);
+                let margin: i32  = props.get("margin").and_then(|m| m.parse().ok()).unwrap_or(6);
+                let width: i32   = props.get("width").and_then(|v| v.parse().ok()).unwrap_or(-1);
+                let height: i32  = props.get("height").and_then(|v| v.parse().ok()).unwrap_or(-1);
+                let frame = if label.is_empty() { gtk::Frame::new(None) }
+                            else { gtk::Frame::new(Some(&label)) };
+                if width > 0 || height > 0 { frame.set_size_request(width, height); }
+                let inner = gtk::Box::new(gtk::Orientation::Vertical, spacing);
+                inner.set_margin_start(margin); inner.set_margin_end(margin);
+                inner.set_margin_top(margin);   inner.set_margin_bottom(margin);
+                frame.set_child(Some(&inner));
+                self.panels.insert(id.clone(), inner);
+                Some(frame.upcast())
             }
             "textview" | "textarea" => {
                 let text = props.get("text").cloned().unwrap_or_default();
@@ -1624,9 +1721,10 @@ impl TerminalState {
         let default_expand = matches!(widget_type.as_str(),
             "menubar" | "toolbar" | "splitview" | "paned" | "panel" | "titlebar" | "statusbar"
         );
-        if expand || default_expand {
-            widget.set_hexpand(true);
-        }
+        let h_expand = props.get("hexpand").map(|v| v == "true" || v == "1").unwrap_or(false);
+        let v_expand = props.get("vexpand").map(|v| v == "true" || v == "1").unwrap_or(false);
+        if expand || default_expand || h_expand { widget.set_hexpand(true); }
+        if v_expand { widget.set_vexpand(true); }
 
         // Store widget by ID for later updates (textview stores itself inside build_widget)
         if !self.widgets.contains_key(&id) {
@@ -1957,6 +2055,106 @@ impl TerminalState {
         }
     }
 
+    // ── Floating window management ─────────────────────────────────────────
+
+    /// Create (or replace) a named floating window.
+    /// spec = "id:w1;title:My Window;width:400;height:300;modal:false;x:100;y:100;resizable:true"
+    /// The window's root Box is registered as a panel under the window id so
+    /// Panel= and Widget= with panel:<id> route content into the window.
+    pub fn create_wm_window(&mut self, spec: &str) {
+        let props = Self::parse_widget_props(spec);
+        let id       = props.get("id").cloned().unwrap_or_else(|| "wnd".into());
+        let title    = props.get("title").cloned().unwrap_or_else(|| "Window".into());
+        let width: i32  = props.get("width").and_then(|v| v.parse().ok()).unwrap_or(400);
+        let height: i32 = props.get("height").and_then(|v| v.parse().ok()).unwrap_or(300);
+        let modal: bool = props.get("modal").map(|v| v == "true" || v == "1").unwrap_or(false);
+        let resizable: bool = props.get("resizable").map(|v| v != "false" && v != "0").unwrap_or(true);
+        let decorated: bool = props.get("decorated").map(|v| v != "false" && v != "0").unwrap_or(true);
+
+        // Close any previous window with the same id
+        if let Some(old) = self.windows.remove(&id) { old.close(); }
+
+        let parent: Option<gtk::Window> = self.view.upgrade()
+            .and_then(|tv| tv.root())
+            .and_then(|r| r.downcast::<gtk::Window>().ok());
+
+        let win = gtk::Window::builder()
+            .title(&title)
+            .default_width(width)
+            .default_height(height)
+            .modal(modal)
+            .resizable(resizable)
+            .decorated(decorated)
+            .build();
+        if let Some(ref p) = parent {
+            win.set_transient_for(Some(p));
+        }
+        win.add_css_class("main-app-window");
+        win.add_css_class("wm-floating");
+
+        // Root content box (vbox) — registered as a panel so children land here
+        let root_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        root_box.set_hexpand(true);
+        root_box.set_vexpand(true);
+        win.set_child(Some(&root_box));
+
+        // Close button fires WidgetEvent back to PTY
+        let wid = id.clone();
+        let pty_tx = self.pty_input_tx.clone();
+        win.connect_close_request(move |_| {
+            if let Some(ref tx) = pty_tx {
+                let msg = format!("\x1b]1337;WidgetEvent=id:{};action:close;value:\x07", wid);
+                let _ = tx.try_send(msg.into_bytes());
+            }
+            glib::Propagation::Proceed
+        });
+
+        self.panels.insert(id.clone(), root_box);
+        self.windows.insert(id.clone(), win.clone());
+        win.present();
+        eprintln!("[WINDOW] created '{}' {}x{} modal={}", id, width, height, modal);
+    }
+
+    /// Update a named floating window.
+    /// spec = "id:w1;visible:false"  |  "id:w1;title:New"  |  "id:w1;modal:true"  |  "id:w1;close:"
+    pub fn update_wm_window(&mut self, spec: &str) {
+        let props = Self::parse_widget_props(spec);
+        let id = props.get("id").cloned().unwrap_or_default();
+        if id.is_empty() { return; }
+
+        if props.contains_key("close") {
+            if let Some(win) = self.windows.remove(&id) {
+                win.close();
+                self.panels.remove(&id);
+            }
+            return;
+        }
+
+        let win = match self.windows.get(&id) {
+            Some(w) => w.clone(),
+            None => { eprintln!("[WINDOW] update: '{}' not found", id); return; }
+        };
+
+        if let Some(vis) = props.get("visible") {
+            if vis == "true" || vis == "1" {
+                win.present();
+            } else {
+                win.set_visible(false);
+            }
+        }
+        if let Some(t) = props.get("title") {
+            win.set_title(Some(t));
+        }
+        if let Some(m) = props.get("modal") {
+            win.set_modal(m == "true" || m == "1");
+        }
+        if let Some(w) = props.get("width").and_then(|v| v.parse::<i32>().ok()) {
+            let h = props.get("height").and_then(|v| v.parse::<i32>().ok()).unwrap_or(-1);
+            win.set_default_size(w, h);
+        }
+        eprintln!("[WINDOW] updated '{}'", id);
+    }
+
     /// Show a modal alert dialog.  spec = "title:Foo;body:Bar;ok:OK"
     pub fn show_alert(&self, spec: &str) {
         let props = Self::parse_widget_props(spec);
@@ -1996,6 +2194,18 @@ impl TerminalState {
             vbox.append(&body_lbl);
         }
 
+        // Optional input field — present when spec contains input: key
+        let input_placeholder = props.get("input").cloned().unwrap_or_default();
+        let entry_opt: Option<gtk::Entry> = if !input_placeholder.is_empty() {
+            let e = gtk::Entry::new();
+            e.set_placeholder_text(Some(&input_placeholder));
+            e.set_margin_top(4);
+            vbox.append(&e);
+            Some(e)
+        } else {
+            None
+        };
+
         let ok_btn = gtk::Button::with_label(&ok_lbl);
         ok_btn.add_css_class("suggested-action");
         ok_btn.set_halign(gtk::Align::Center);
@@ -2003,13 +2213,115 @@ impl TerminalState {
         let d2 = dialog.clone();
         let pty_tx = self.pty_input_tx.clone();
         ok_btn.connect_clicked(move |_| {
+            let value = entry_opt.as_ref().map(|e| e.text().to_string()).unwrap_or_default();
             d2.close();
-            let msg = format!("\x1b]1337;WidgetEvent=id:{};action:clicked;value:\x07", alert_id);
+            let msg = format!("\x1b]1337;WidgetEvent=id:{};action:clicked;value:{}\x07", alert_id, value);
             if let Some(ref tx) = pty_tx {
                 let _ = tx.try_send(msg.into_bytes());
             }
         });
         vbox.append(&ok_btn);
+
+        dialog.set_child(Some(&vbox));
+        dialog.present();
+    }
+
+    /// Non-blocking toast notification.  spec = "msg:Hello;duration:3000"
+    pub fn show_toast(&self, spec: &str) {
+        // spec may be plain text (no key=val) or "msg:X;duration:N"
+        let props = Self::parse_widget_props(spec);
+        let msg      = props.get("msg").cloned().unwrap_or_else(|| spec.to_string());
+        let duration: u32 = props.get("duration").and_then(|v| v.parse().ok()).unwrap_or(3000);
+
+        let parent: Option<gtk::Window> = self.view.upgrade()
+            .and_then(|tv| tv.root())
+            .and_then(|r| r.downcast::<gtk::Window>().ok());
+
+        let toast_win = gtk::Window::builder()
+            .decorated(false)
+            .resizable(false)
+            .modal(false)
+            .build();
+        if let Some(ref p) = parent { toast_win.set_transient_for(Some(p)); }
+        toast_win.add_css_class("toast-popup");
+
+        let lbl = gtk::Label::new(Some(&msg));
+        lbl.set_margin_top(10); lbl.set_margin_bottom(10);
+        lbl.set_margin_start(18); lbl.set_margin_end(18);
+        lbl.set_wrap(true);
+        toast_win.set_child(Some(&lbl));
+        toast_win.present();
+
+        let tw2 = toast_win.clone();
+        glib::timeout_add_local_once(
+            std::time::Duration::from_millis(duration as u64),
+            move || { tw2.close(); }
+        );
+    }
+
+    /// Yes/No confirm dialog.  spec = "id:X;title:T;body:B;confirm:Yes;cancel:No"
+    pub fn show_confirm(&self, spec: &str) {
+        let props = Self::parse_widget_props(spec);
+        let title       = props.get("title").cloned().unwrap_or_else(|| "Confirm".into());
+        let body        = props.get("body").cloned().unwrap_or_default();
+        let confirm_lbl = props.get("confirm").cloned().unwrap_or_else(|| "Yes".into());
+        let cancel_lbl  = props.get("cancel").cloned().unwrap_or_else(|| "No".into());
+        let confirm_id  = props.get("id").cloned().unwrap_or_else(|| "confirm".into());
+
+        let parent: Option<gtk::Window> = self.view.upgrade()
+            .and_then(|tv| tv.root())
+            .and_then(|r| r.downcast::<gtk::Window>().ok());
+
+        let dialog = gtk::Window::builder()
+            .title(&title).modal(true).default_width(320).resizable(false).build();
+        if let Some(ref p) = parent { dialog.set_transient_for(Some(p)); }
+        dialog.add_css_class("main-app-window");
+
+        let vbox = gtk::Box::new(gtk::Orientation::Vertical, 16);
+        vbox.set_margin_top(24); vbox.set_margin_bottom(20);
+        vbox.set_margin_start(24); vbox.set_margin_end(24);
+
+        let title_lbl = gtk::Label::new(Some(&title));
+        title_lbl.add_css_class("title-4");
+        title_lbl.set_halign(gtk::Align::Center);
+        vbox.append(&title_lbl);
+
+        if !body.is_empty() {
+            let body_lbl = gtk::Label::new(Some(&body));
+            body_lbl.set_wrap(true);
+            body_lbl.set_halign(gtk::Align::Center);
+            vbox.append(&body_lbl);
+        }
+
+        let btn_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        btn_row.set_halign(gtk::Align::Center);
+        btn_row.set_margin_top(8);
+
+        let cancel_btn = gtk::Button::with_label(&cancel_lbl);
+        cancel_btn.add_css_class("destructive-action");
+        let d_cancel = dialog.clone();
+        let pty_cancel = self.pty_input_tx.clone();
+        let cid_cancel = confirm_id.clone();
+        cancel_btn.connect_clicked(move |_| {
+            d_cancel.close();
+            let msg = format!("\x1b]1337;WidgetEvent=id:{};action:cancel;value:false\x07", cid_cancel);
+            if let Some(ref tx) = pty_cancel { let _ = tx.try_send(msg.into_bytes()); }
+        });
+
+        let confirm_btn = gtk::Button::with_label(&confirm_lbl);
+        confirm_btn.add_css_class("suggested-action");
+        let d_confirm = dialog.clone();
+        let pty_confirm = self.pty_input_tx.clone();
+        let cid_confirm = confirm_id.clone();
+        confirm_btn.connect_clicked(move |_| {
+            d_confirm.close();
+            let msg = format!("\x1b]1337;WidgetEvent=id:{};action:confirm;value:true\x07", cid_confirm);
+            if let Some(ref tx) = pty_confirm { let _ = tx.try_send(msg.into_bytes()); }
+        });
+
+        btn_row.append(&cancel_btn);
+        btn_row.append(&confirm_btn);
+        vbox.append(&btn_row);
 
         dialog.set_child(Some(&vbox));
         dialog.present();
@@ -2330,12 +2642,24 @@ impl Perform for TerminalState {
                     Err(_) => return,
                 };
 
-                if let Some(spec) = payload.strip_prefix("Panel=") {
+                if let Some(spec) = payload.strip_prefix("Window=") {
+                    eprintln!("[WINDOW] OSC 1337 Window spec: {}", spec);
+                    self.create_wm_window(spec);
+                } else if let Some(spec) = payload.strip_prefix("WindowUpdate=") {
+                    eprintln!("[WINDOW] OSC 1337 WindowUpdate spec: {}", spec);
+                    self.update_wm_window(spec);
+                } else if let Some(spec) = payload.strip_prefix("Panel=") {
                     eprintln!("[PANEL] OSC 1337 Panel spec: {}", spec);
                     self.insert_panel(spec);
                 } else if let Some(spec) = payload.strip_prefix("Alert=") {
                     eprintln!("[ALERT] OSC 1337 Alert spec: {}", spec);
                     self.show_alert(spec);
+                } else if let Some(spec) = payload.strip_prefix("Toast=") {
+                    eprintln!("[TOAST] OSC 1337 Toast spec: {}", spec);
+                    self.show_toast(spec);
+                } else if let Some(spec) = payload.strip_prefix("Confirm=") {
+                    eprintln!("[CONFIRM] OSC 1337 Confirm spec: {}", spec);
+                    self.show_confirm(spec);
                 } else if let Some(spec) = payload.strip_prefix("Widget=") {
                     eprintln!("[WIDGET] OSC 1337 Widget spec: {}", spec);
                     self.insert_widget(spec);
