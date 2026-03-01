@@ -108,7 +108,20 @@ pub fn add_terminal_tab(
     let current_size = std::sync::Arc::new(std::sync::Mutex::new((80u32, 24u32)));
 
     let palette = settings.palette.clone();
-    let state = TerminalState::new(text_view.downgrade(), dummy_label.downgrade(), palette);
+    let mut state = TerminalState::new(text_view.downgrade(), dummy_label.downgrade(), palette);
+    // Give TerminalState a sender so embedded widgets can push input back to the PTY.
+    state.pty_input_tx = Some(input_tx.clone()).map(|tx| {
+        let (wtx, wrx) = flume::unbounded::<Vec<u8>>();
+        // Bridge: forward widget event bytes as ConnectionControl::Input
+        let itx = tx.clone();
+        gtk::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            while let Ok(data) = wrx.try_recv() {
+                let _ = itx.send(ConnectionControl::Input(data));
+            }
+            gtk::glib::ControlFlow::Continue
+        });
+        wtx
+    });
     let state_rc = std::rc::Rc::new(std::cell::RefCell::new(state));
 
     let state_for_output = state_rc.clone();
