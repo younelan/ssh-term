@@ -112,7 +112,9 @@ pub fn add_terminal_tab(
     let state_rc = std::rc::Rc::new(std::cell::RefCell::new(state));
 
     let state_for_output = state_rc.clone();
-    let mut parser = vte::Parser::new();
+    // The default VTE OSC buffer is 1024 bytes — far too small for base64-encoded
+    // images.  Use a 4 MB buffer so the full image payload reaches osc_dispatch.
+    let mut parser: vte::Parser<{4 * 1024 * 1024}> = Default::default();
     gtk::glib::timeout_add_local(Duration::from_millis(10), move || {
         let mut received = false;
         while let Ok(data) = output_rx.try_recv() {

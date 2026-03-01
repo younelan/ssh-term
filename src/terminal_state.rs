@@ -158,36 +158,43 @@ impl TerminalState {
         }
     }
 
+    /// Ensure buffer has at least `n+1` lines (lines 0..=n exist).
+    fn ensure_lines(&self, n: usize) {
+        let buffer = self.active_buffer();
+        while (buffer.line_count() as usize) <= n {
+            let mut end = buffer.end_iter();
+            buffer.insert(&mut end, "\n");
+        }
+    }
+
     /// Scroll the scroll region [scroll_top..scroll_bottom] up by `count` lines.
     /// Deletes `count` lines from the top of the region, inserts `count` blank
     /// lines at the bottom.  Cursor position is NOT changed.
     fn scroll_region_up(&self, count: usize) {
+        // Guarantee every line through scroll_bottom exists before we start
+        // indexing.  If the buffer is short, iter_at_line() returns None and
+        // the fallback to end_iter inserts the blank line at the wrong row,
+        // shifting all subsequent row indices and pulling the status bar into
+        // the scroll region.
+        self.ensure_lines(self.scroll_bottom);
         let buffer = self.active_buffer();
         for _ in 0..count {
-            // Delete the top line of the scroll region (including its trailing \n).
-            let line_start = match buffer.iter_at_line(self.scroll_top as i32) {
-                Some(i) => i,
-                None => return,
-            };
+            // Delete line scroll_top (text + its trailing \n) so everything
+            // above scroll_top shifts up by one.
+            let mut line_start = buffer.iter_at_line(self.scroll_top as i32).unwrap();
             let mut line_end = line_start.clone();
-            // forward_line() moves to the START of the next line — that is exactly
-            // the range we need to delete (line text + the \n that terminated it).
-            if !line_end.forward_line() {
-                // scroll_top was the last line — just clear it instead.
-                let mut le = line_start.clone();
-                le.forward_to_line_end();
-                buffer.delete(&mut line_start.clone(), &mut le);
+            if line_end.forward_line() {
+                buffer.delete(&mut line_start, &mut line_end);
+            } else {
+                // scroll_top is the very last line — clear its content.
+                line_end.forward_to_line_end();
+                buffer.delete(&mut line_start, &mut line_end);
                 return;
             }
-            buffer.delete(&mut line_start.clone(), &mut line_end);
-
-            // After the deletion, the old scroll_bottom is now at (scroll_bottom-1).
-            // Append a blank line after that position to keep the region height stable.
-            let new_bottom_idx = self.scroll_bottom as i32 - 1;
-            let mut ins = match buffer.iter_at_line(new_bottom_idx) {
-                Some(i) => i,
-                None => buffer.end_iter(),
-            };
+            // After the deletion every line from scroll_top+1 shifted up one.
+            // The old scroll_bottom is now at (scroll_bottom-1).
+            // Insert a blank line AFTER it to restore scroll_bottom.
+            let mut ins = buffer.iter_at_line(self.scroll_bottom as i32 - 1).unwrap();
             ins.forward_to_line_end();
             buffer.insert(&mut ins, "\n");
         }
@@ -197,24 +204,19 @@ impl TerminalState {
     /// Inserts `count` blank lines at the top of the region, deletes `count` lines
     /// from the bottom.  Cursor position is NOT changed.
     fn scroll_region_down(&self, count: usize) {
+        self.ensure_lines(self.scroll_bottom);
         let buffer = self.active_buffer();
         for _ in 0..count {
-            // Insert a blank line at the very start of the scroll region.
-            let mut ins = match buffer.iter_at_line(self.scroll_top as i32) {
-                Some(i) => i,
-                None => buffer.end_iter(),
-            };
+            // Insert blank line at scroll_top — everything in the region shifts down.
+            let mut ins = buffer.iter_at_line(self.scroll_top as i32).unwrap();
             buffer.insert(&mut ins, "\n");
-
-            // The old scroll_bottom line is now at (scroll_bottom+1).  Delete it.
+            // The old scroll_bottom is now at (scroll_bottom+1).  Delete it.
             let del_idx = self.scroll_bottom as i32 + 1;
             if let Some(mut del_start) = buffer.iter_at_line(del_idx) {
                 let mut del_end = del_start.clone();
-                // Include the terminating \n so we don't leave an extra blank line.
                 if del_end.forward_line() {
                     buffer.delete(&mut del_start, &mut del_end);
                 } else {
-                    // Last line — just clear its content.
                     del_end.forward_to_line_end();
                     buffer.delete(&mut del_start, &mut del_end);
                 }
@@ -223,11 +225,20 @@ impl TerminalState {
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
+        let rows_changed = rows != self.rows;
         self.cols = cols;
         self.rows = rows;
-        // Reset scroll region to full screen on resize
-        self.scroll_top = 0;
-        self.scroll_bottom = rows.saturating_sub(1);
+        // Only reset the scroll region when the row count actually changes.
+        // If rows is the same, an app like vi may have already sent CSI r to
+        // define a restricted region (e.g. scroll_bottom = rows-2 so the status
+        // bar is excluded). Wiping that on every identical resize call would
+        // continuously stomp the custom region and drag the status line into the
+        // scroll area.  When rows DO change, the PTY receives SIGWINCH and the
+        // app will re-send CSI r, so resetting here is safe and necessary.
+        if rows_changed {
+            self.scroll_top = 0;
+            self.scroll_bottom = rows.saturating_sub(1);
+        }
     }
 
     pub fn active_buffer(&self) -> TextBuffer {
@@ -323,21 +334,43 @@ impl TerminalState {
     }
 
     pub fn insert_image(&mut self, data: Vec<u8>) {
+        eprintln!("[IMG] insert_image called with {} bytes", data.len());
+        if data.len() >= 4 {
+            eprintln!("[IMG] first 4 bytes: {:02x} {:02x} {:02x} {:02x}",
+                data[0], data[1], data[2], data[3]);
+        }
         if let Some(tv) = self.view.upgrade() {
-            let buffer = self.active_buffer();
-            let cx = if self.is_alternate { self.alt_cursor_x } else { self.cursor_x };
-            let cy = if self.is_alternate { self.alt_cursor_y } else { self.cursor_y };
-            let mut iter = self.ensure_cursor_position(cx, cy);
-            
-            let anchor = buffer.create_child_anchor(&mut iter);
             let pixbuf_loader = gtk::gdk_pixbuf::PixbufLoader::new();
-            if pixbuf_loader.write(&data).is_ok() && pixbuf_loader.close().is_ok() {
-                if let Some(pixbuf) = pixbuf_loader.pixbuf() {
-                    let picture = gtk::Picture::for_pixbuf(&pixbuf);
-                    picture.set_can_shrink(true);
-                    tv.add_child_at_anchor(&picture, &anchor);
+            if let Err(e) = pixbuf_loader.write(&data) {
+                eprintln!("[IMG] pixbuf_loader.write failed: {}", e);
+                return;
+            }
+            if let Err(e) = pixbuf_loader.close() {
+                eprintln!("[IMG] pixbuf_loader.close failed: {}", e);
+                return;
+            }
+            match pixbuf_loader.pixbuf() {
+                None => eprintln!("[IMG] pixbuf_loader.pixbuf() returned None"),
+                Some(pixbuf) => {
+                    let img_w = pixbuf.width();
+                    let img_h = pixbuf.height();
+                    eprintln!("[IMG] pixbuf loaded: {}x{}", img_w, img_h);
+                    let buffer = self.active_buffer();
+                    let cx = if self.is_alternate { self.alt_cursor_x } else { self.cursor_x };
+                    let cy = if self.is_alternate { self.alt_cursor_y } else { self.cursor_y };
+                    let mut iter = self.ensure_cursor_position(cx, cy);
+
+                    // GTK4's native way to embed images in a TextBuffer:
+                    let texture = gtk::gdk::Texture::for_pixbuf(&pixbuf);
+                    buffer.insert_paintable(&mut iter, &texture);
+
+                    // advance cursor past the paintable character
+                    if self.is_alternate { self.alt_cursor_x += 1; } else { self.cursor_x += 1; }
+                    eprintln!("[IMG] paintable inserted at cursor ({}, {}), texture {}x{}", cx, cy, img_w, img_h);
                 }
             }
+        } else {
+            eprintln!("[IMG] view WeakRef was dead");
         }
     }
 }
@@ -625,6 +658,9 @@ impl Perform for TerminalState {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        eprintln!("[OSC] osc_dispatch called, {} params, p[0]={:?}",
+            params.len(),
+            params.first().and_then(|p| std::str::from_utf8(p).ok()));
         if params.len() >= 2 {
             if params[0] == b"0" || params[0] == b"1" || params[0] == b"2" {
                 if let Ok(title) = std::str::from_utf8(params[1]) {
@@ -641,11 +677,19 @@ impl Perform for TerminalState {
                     self.current_tags.retain(|t| !t.starts_with("url:"));
                 }
             } else if params[0] == b"1337" && params[1].starts_with(b"File=") {
-                let data_parts: Vec<&[u8]> = params[1].split(|&b| b == b':').collect();
-                if data_parts.len() >= 2 {
-                    if let Ok(data) = BASE64.decode(data_parts[1]) {
-                        self.insert_image(data);
+                eprintln!("[IMG] OSC 1337 received, params[1] len={}", params[1].len());
+                if let Some(colon_pos) = params[1].iter().position(|&b| b == b':') {
+                    let b64 = &params[1][colon_pos + 1..];
+                    eprintln!("[IMG] base64 slice len={}", b64.len());
+                    match BASE64.decode(b64) {
+                        Ok(data) => {
+                            eprintln!("[IMG] decoded {} bytes, calling insert_image", data.len());
+                            self.insert_image(data);
+                        }
+                        Err(e) => eprintln!("[IMG] base64 decode error: {}", e),
                     }
+                } else {
+                    eprintln!("[IMG] no colon found in File= payload");
                 }
             } else if params[0] == b"108" {
                 if let Ok(data) = BASE64.decode(params[1]) {
