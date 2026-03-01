@@ -97,6 +97,18 @@ pub struct TerminalState {
     pub radio_groups: std::collections::HashMap<String, gtk::CheckButton>,
     /// All created widgets by ID, for later updates via WidgetUpdate.
     pub widgets: std::collections::HashMap<String, gtk::Widget>,
+    /// Menu popover inner boxes — items are appended here.
+    pub menu_boxes: std::collections::HashMap<String, gtk::Box>,
+    /// Menu popover widgets — for closing after item click.
+    pub menu_popovers: std::collections::HashMap<String, gtk::Popover>,
+    /// Map from menu ID to parent menu/menubar ID (for closing chain).
+    pub menu_parents: std::collections::HashMap<String, String>,
+    /// TreeStore models for treeview widgets (id -> store).
+    pub tree_stores: std::collections::HashMap<String, gtk::TreeStore>,
+    /// ListStore models for listview widgets (id -> store).
+    pub list_stores: std::collections::HashMap<String, gtk::ListStore>,
+    /// Named TreeIter rows: widget_id -> (row_id -> iter), for addrow with parent.
+    pub tree_row_iters: std::collections::HashMap<String, std::collections::HashMap<String, gtk::TreeIter>>,
 }
 
 impl TerminalState {
@@ -170,6 +182,12 @@ impl TerminalState {
             grids: std::collections::HashMap::new(),
             radio_groups: std::collections::HashMap::new(),
             widgets: std::collections::HashMap::new(),
+            menu_boxes: std::collections::HashMap::new(),
+            menu_popovers: std::collections::HashMap::new(),
+            menu_parents: std::collections::HashMap::new(),
+            tree_stores: std::collections::HashMap::new(),
+            list_stores: std::collections::HashMap::new(),
+            tree_row_iters: std::collections::HashMap::new(),
         }
     }
 
@@ -751,6 +769,171 @@ impl TerminalState {
                 if w > 0 || h > 0 { img.set_size_request(w, h); }
                 Some(img.upcast())
             }
+            "picturebox" | "img" => {
+                // Updatable picture widget — supports setting image via path or base64 data.
+                // Use WidgetUpdate with path: or data: (base64) to change the image.
+                let w: i32 = props.get("width").and_then(|v| v.parse().ok()).unwrap_or(200);
+                let h: i32 = props.get("height").and_then(|v| v.parse().ok()).unwrap_or(200);
+                let pic = gtk::Picture::new();
+                pic.set_can_shrink(true);
+                pic.set_size_request(w, h);
+                // If path provided at creation time, load it
+                if let Some(path) = props.get("path") {
+                    let file = gtk::gio::File::for_path(path);
+                    pic.set_file(Some(&file));
+                }
+                // If base64 data provided at creation time, decode and set
+                if let Some(b64) = props.get("data") {
+                    if let Ok(bytes) = BASE64.decode(b64.as_bytes()) {
+                        let pixbuf_loader = gtk::gdk_pixbuf::PixbufLoader::new();
+                        let _ = pixbuf_loader.write(&bytes);
+                        let _ = pixbuf_loader.close();
+                        if let Some(pixbuf) = pixbuf_loader.pixbuf() {
+                            let texture = gtk::gdk::Texture::for_pixbuf(&pixbuf);
+                            pic.set_paintable(Some(&texture));
+                        }
+                    }
+                }
+                // Store the Picture itself for updates
+                self.widgets.insert(id.clone(), pic.clone().upcast());
+                Some(pic.upcast())
+            }
+            "treeview" => {
+                let width: i32 = props.get("width").and_then(|v| v.parse().ok()).unwrap_or(200);
+                let height: i32 = props.get("height").and_then(|v| v.parse().ok()).unwrap_or(300);
+                let store = gtk::TreeStore::new(&[glib::Type::STRING]);
+                let tv = gtk::TreeView::with_model(&store);
+                tv.set_headers_visible(false);
+                tv.set_activate_on_single_click(true);
+                let renderer = gtk::CellRendererText::new();
+                let col = gtk::TreeViewColumn::new();
+                gtk::prelude::CellLayoutExt::pack_start(&col, &renderer, true);
+                gtk::prelude::CellLayoutExt::add_attribute(&col, &renderer, "text", 0);
+                tv.append_column(&col);
+                let wid = id.clone();
+                let tx = pty_tx.clone();
+                tv.selection().connect_changed(move |sel| {
+                    if let Some((model, iter)) = sel.selected() {
+                        if let Ok(val) = model.get_value(&iter, 0).get::<String>() {
+                            if let Some(ref tx) = tx {
+                                let msg = format!("\x1b]1337;WidgetEvent=id:{};action:selected;value:{}\x07", wid, val);
+                                let _ = tx.send(msg.into_bytes());
+                            }
+                        }
+                    }
+                });
+                let sw = gtk::ScrolledWindow::new();
+                sw.set_child(Some(&tv));
+                sw.set_size_request(width, height);
+                sw.set_vexpand(true);
+                sw.set_hexpand(true);
+                sw.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Automatic);
+                self.tree_stores.insert(id.clone(), store);
+                self.widgets.insert(id.clone(), tv.clone().upcast());
+                Some(sw.upcast())
+            }
+            "listview" => {
+                let width: i32 = props.get("width").and_then(|v| v.parse().ok()).unwrap_or(300);
+                let height: i32 = props.get("height").and_then(|v| v.parse().ok()).unwrap_or(300);
+                let col_names: Vec<String> = props.get("cols")
+                    .map(|s| s.split('|').map(|c| c.to_string()).collect())
+                    .unwrap_or_else(|| vec!["Column".to_string()]);
+                let col_widths: Vec<i32> = props.get("widths")
+                    .map(|s| s.split('|').filter_map(|w| w.parse().ok()).collect())
+                    .unwrap_or_default();
+                let n = col_names.len();
+                let types: Vec<glib::Type> = vec![glib::Type::STRING; n];
+                let store = gtk::ListStore::new(&types);
+                let tv = gtk::TreeView::with_model(&store);
+                tv.set_headers_visible(true);
+                tv.set_activate_on_single_click(true);
+                for (i, name) in col_names.iter().enumerate() {
+                    let renderer = gtk::CellRendererText::new();
+                    let col = gtk::TreeViewColumn::new();
+                    col.set_title(name);
+                    gtk::prelude::CellLayoutExt::pack_start(&col, &renderer, true);
+                    gtk::prelude::CellLayoutExt::add_attribute(&col, &renderer, "text", i as i32);
+                    col.set_resizable(true);
+                    col.set_expand(i == 0); // first col expands
+                    if let Some(&cw) = col_widths.get(i) {
+                        if cw > 0 {
+                            col.set_sizing(gtk::TreeViewColumnSizing::Fixed);
+                            col.set_fixed_width(cw);
+                        }
+                    }
+                    tv.append_column(&col);
+                }
+                let wid = id.clone();
+                let tx = pty_tx.clone();
+                let ncols = n;
+                tv.selection().connect_changed(move |sel| {
+                    if let Some((model, iter)) = sel.selected() {
+                        let vals: Vec<String> = (0..ncols)
+                            .filter_map(|i| model.get_value(&iter, i as i32).get::<String>().ok())
+                            .collect();
+                        if let Some(ref tx) = tx {
+                            let msg = format!("\x1b]1337;WidgetEvent=id:{};action:selected;value:{}\x07", wid, vals.join("|"));
+                            let _ = tx.send(msg.into_bytes());
+                        }
+                    }
+                });
+                let sw = gtk::ScrolledWindow::new();
+                sw.set_child(Some(&tv));
+                sw.set_size_request(width, height);
+                sw.set_vexpand(true);
+                sw.set_hexpand(true);
+                sw.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Automatic);
+                self.list_stores.insert(id.clone(), store);
+                self.widgets.insert(id.clone(), tv.clone().upcast());
+                Some(sw.upcast())
+            }
+            "splitview" | "paned" => {
+                let orientation = match props.get("layout").map(|s| s.as_str()) {
+                    Some("vertical") => gtk::Orientation::Vertical,
+                    _ => gtk::Orientation::Horizontal,
+                };
+                let pos: i32 = props.get("pos").and_then(|p| p.parse().ok()).unwrap_or(250);
+                let width: i32 = props.get("width").and_then(|v| v.parse().ok()).unwrap_or(-1);
+                let height: i32 = props.get("height").and_then(|v| v.parse().ok()).unwrap_or(-1);
+                let paned = gtk::Paned::new(orientation);
+                paned.set_hexpand(true);
+                paned.set_vexpand(true);
+                // Default height so handle is actually visible and draggable
+                let h = if height > 0 { height } else { 400 };
+                if width > 0 { paned.set_size_request(width, h); } else { paned.set_size_request(-1, h); }
+                paned.set_position(pos);
+                // resize_start/end_child=true means dragging the handle actually
+                // redistributes space between both sides instead of just moving
+                // the divider position.
+                paned.set_resize_start_child(true);
+                paned.set_resize_end_child(true);
+                // Minimum sizes prevent the pane from shrinking below a usable
+                // width; without these GTK shifts the divider off-screen instead
+                // of stopping the resize at the window edge.
+                let min_start: i32 = props.get("min_start").and_then(|v| v.parse().ok()).unwrap_or(80);
+                let min_end:   i32 = props.get("min_end").and_then(|v| v.parse().ok()).unwrap_or(120);
+                let (ms_w, ms_h, me_w, me_h) = if orientation == gtk::Orientation::Horizontal {
+                    (min_start, -1, min_end, -1)
+                } else {
+                    (-1, min_start, -1, min_end)
+                };
+                let start = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                let end = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                start.set_size_request(ms_w, ms_h);
+                end.set_size_request(me_w, me_h);
+                start.set_hexpand(true); start.set_vexpand(true);
+                end.set_hexpand(true);   end.set_vexpand(true);
+                paned.set_start_child(Some(&start));
+                paned.set_end_child(Some(&end));
+                // set_shrink=false enforces the size_request minimums during
+                // drag; without this GTK ignores the child minimum and lets the
+                // handle travel all the way to both edges.
+                paned.set_shrink_start_child(false);
+                paned.set_shrink_end_child(false);
+                self.panels.insert(format!("{}-start", id), start);
+                self.panels.insert(format!("{}-end", id), end);
+                Some(paned.upcast())
+            }
             "expander" => {
                 let label = props.get("label").cloned().unwrap_or_else(|| "Details".into());
                 let expanded: bool = props.get("expanded").map(|v| v == "true" || v == "1").unwrap_or(false);
@@ -860,6 +1043,456 @@ impl TerminalState {
                 });
                 Some(btn.upcast())
             }
+            "titlebar" => {
+                let title = props.get("title").cloned().unwrap_or_else(|| "App".into());
+                let icon  = props.get("icon").cloned();
+                let show_close: bool = props.get("close").map(|v| v != "false" && v != "0").unwrap_or(true);
+
+                let bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+                bar.add_css_class("app-titlebar");
+                bar.set_hexpand(true);
+
+                // Left: icon + title
+                let left = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+                left.set_hexpand(true);
+                left.set_valign(gtk::Align::Center);
+                left.set_margin_start(10);
+                left.set_margin_top(6);
+                left.set_margin_bottom(6);
+                if let Some(icon_name) = icon {
+                    let img = gtk::Image::from_icon_name(&icon_name);
+                    img.set_pixel_size(16);
+                    left.append(&img);
+                }
+                let lbl = gtk::Label::new(Some(&title));
+                lbl.add_css_class("app-titlebar-title");
+                left.append(&lbl);
+                bar.append(&left);
+
+                // Right: window controls + custom panel
+                let right = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+                right.set_valign(gtk::Align::Center);
+                right.set_margin_end(8);
+                right.set_margin_top(4);
+                right.set_margin_bottom(4);
+                bar.append(&right);
+
+                if show_close {
+                    // Minimize
+                    let min_btn = gtk::Button::new();
+                    min_btn.set_child(Some(&gtk::Image::from_icon_name("window-minimize-symbolic")));
+                    min_btn.add_css_class("app-wm-btn");
+                    min_btn.set_has_frame(false);
+                    right.append(&min_btn);
+                    // Maximize
+                    let max_btn = gtk::Button::new();
+                    max_btn.set_child(Some(&gtk::Image::from_icon_name("window-maximize-symbolic")));
+                    max_btn.add_css_class("app-wm-btn");
+                    max_btn.set_has_frame(false);
+                    right.append(&max_btn);
+                    // Close
+                    let close_btn = gtk::Button::new();
+                    close_btn.set_child(Some(&gtk::Image::from_icon_name("window-close-symbolic")));
+                    close_btn.add_css_class("app-wm-btn");
+                    close_btn.add_css_class("app-wm-close");
+                    close_btn.set_has_frame(false);
+                    let wid = id.clone();
+                    let tx = pty_tx.clone();
+                    close_btn.connect_clicked(move |_| {
+                        if let Some(ref tx) = tx {
+                            let msg = format!("\x1b]1337;WidgetEvent=id:{};action:close;value:\x07", wid);
+                            let _ = tx.send(msg.into_bytes());
+                            let _ = tx.send(vec![0x03]);
+                        }
+                    });
+                    right.append(&close_btn);
+                }
+
+                self.panels.insert(format!("{}-right", id), right);
+                self.panels.insert(id.clone(), left.clone()); // panel:<id> → left area
+                self.widgets.insert(id.clone(), lbl.upcast());
+                Some(bar.upcast())
+            }
+            "statusbar" => {
+                let text = props.get("text").cloned().unwrap_or_else(|| "Ready".into());
+
+                let bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+                bar.add_css_class("app-statusbar");
+                bar.set_hexpand(true);
+
+                let lbl = gtk::Label::new(Some(&text));
+                lbl.add_css_class("app-statusbar-text");
+                lbl.set_halign(gtk::Align::Start);
+                lbl.set_hexpand(true);
+                lbl.set_margin_start(8);
+                lbl.set_margin_top(3);
+                lbl.set_margin_bottom(3);
+                bar.append(&lbl);
+
+                // Right panel for extra status items
+                let right = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                right.set_margin_end(8);
+                right.set_valign(gtk::Align::Center);
+                bar.append(&right);
+
+                self.panels.insert(format!("{}-right", id), right);
+                self.panels.insert(id.clone(), bar.clone());
+                self.widgets.insert(id.clone(), lbl.upcast());
+                Some(bar.upcast())
+            }
+            "menubar" => {
+                // Horizontal box holding MenuButtons — no gio models, purely manual.
+                let bx = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+                bx.set_hexpand(true);
+                bx.add_css_class("menubar-box");
+                self.panels.insert(id.clone(), bx.clone());
+                eprintln!("[MENU] created menubar id={}", id);
+                Some(bx.upcast())
+            }
+            "menu" | "submenu" => {
+                let label = props.get("label").cloned().unwrap_or_else(|| "Menu".into());
+                let menubar_id = props.get("menubar").cloned();
+                let parent_menu_id = props.get("menu").cloned();
+
+                // Build popover content box
+                let inner = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                inner.set_margin_top(4);
+                inner.set_margin_bottom(4);
+
+                let popover = gtk::Popover::new();
+                popover.set_child(Some(&inner));
+                popover.set_has_arrow(false);
+                popover.set_autohide(true);
+                popover.add_css_class("menu-popover");
+
+                // CRITICAL: Parent the popover on the TextView — NOT on any
+                // widget embedded inside a TextBuffer child anchor.  Child
+                // anchors break GTK's parent chain for active-state
+                // propagation, causing "Broken accounting of active state"
+                // warnings and preventing the popover from opening.
+                if let Some(tv) = self.view.upgrade() {
+                    popover.set_parent(&tv);
+                }
+
+                // Top-level: attach a label to the menubar box
+                if let Some(ref mbar_id) = menubar_id {
+                    let lbl = gtk::Label::new(Some(&label));
+                    lbl.add_css_class("menubar-item");
+                    // Hover tracking via contains-pointer (works across children)
+                    let motion = gtk::EventControllerMotion::new();
+                    let lbl_ref = lbl.clone();
+                    motion.connect_notify_local(Some("contains-pointer"), move |ctrl, _| {
+                        if ctrl.contains_pointer() {
+                            lbl_ref.add_css_class("hovered");
+                        } else {
+                            lbl_ref.remove_css_class("hovered");
+                        }
+                    });
+                    lbl.add_controller(motion);
+                    let click = gtk::GestureClick::new();
+                    let pop = popover.clone();
+                    click.connect_pressed(move |gesture, _, _, _| {
+                        gesture.set_state(gtk::EventSequenceState::Claimed);
+                    });
+                    let pop2 = pop.clone();
+                    click.connect_released(move |gesture, _, _, _| {
+                        gesture.set_state(gtk::EventSequenceState::Claimed);
+                        if let Some(widget) = gesture.widget() {
+                            if let Some(parent) = pop2.parent() {
+                                if let Some(bounds) = widget.compute_bounds(&parent) {
+                                    pop2.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
+                                        bounds.x() as i32,
+                                        (bounds.y() + bounds.height()) as i32,
+                                        bounds.width() as i32,
+                                        1,
+                                    )));
+                                }
+                            }
+                        }
+                        if pop2.is_visible() { pop2.popdown(); } else { pop2.popup(); }
+                    });
+                    lbl.add_controller(click);
+                    if let Some(mbar_box) = self.panels.get(mbar_id) {
+                        mbar_box.append(&lbl);
+                    }
+                } else if let Some(ref pid) = parent_menu_id {
+                    // Nested submenu: add a box with GestureClick for explicit hover/background control
+                    if let Some(parent_box) = self.menu_boxes.get(pid) {
+                        let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+                        row.add_css_class("menu-row");
+                        row.set_halign(gtk::Align::Fill);
+                        row.set_hexpand(true);
+                        
+                        // Hover tracking via EVENT CONTROLLER using motion
+                        let motion = gtk::EventControllerMotion::new();
+                        let r1 = row.clone();
+                        motion.connect_enter(move |_, _, _| { r1.add_css_class("hovered"); });
+                        let r2 = row.clone();
+                        motion.connect_leave(move |_| { r2.remove_css_class("hovered"); });
+                        row.add_controller(motion);
+
+                        let lbl = gtk::Label::new(Some(&label));
+                        lbl.set_hexpand(true);
+                        lbl.set_halign(gtk::Align::Start);
+                        let arrow = gtk::Image::from_icon_name("go-next-symbolic");
+                        arrow.set_halign(gtk::Align::End);
+                        arrow.set_margin_start(12);
+                        row.append(&lbl);
+                        row.append(&arrow);
+                        popover.set_position(gtk::PositionType::Right);
+                        let pop = popover.clone();
+                        
+                        let click = gtk::GestureClick::new();
+                        click.connect_released(move |gesture, _, _, _| {
+                            gesture.set_state(gtk::EventSequenceState::Claimed);
+                            if let Some(widget) = gesture.widget() {
+                                if let Some(parent) = pop.parent() {
+                                    if let Some(bounds) = widget.compute_bounds(&parent) {
+                                        pop.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
+                                            (bounds.x() + bounds.width()) as i32,
+                                            bounds.y() as i32,
+                                            1,
+                                            bounds.height() as i32,
+                                        )));
+                                    }
+                                }
+                            }
+                            pop.popup();
+                        });
+                        row.add_controller(click);
+                        parent_box.append(&row);
+                    }
+                }
+
+                // Track parent relationship for close chain
+                if let Some(ref mbar_id) = menubar_id {
+                    self.menu_parents.insert(id.clone(), mbar_id.clone());
+                } else if let Some(ref pid) = parent_menu_id {
+                    self.menu_parents.insert(id.clone(), pid.clone());
+                }
+
+                self.menu_boxes.insert(id.clone(), inner);
+                self.menu_popovers.insert(id.clone(), popover);
+                eprintln!("[MENU] created menu id={} label={}", id, label);
+                None
+            }
+            "menuitem" => {
+                let label = props.get("label").cloned().unwrap_or_else(|| "Item".into());
+                let menu_id = props.get("menu").cloned().unwrap_or_default();
+                
+                // Regular menu item using Box + GestureClick to avoid all button styling
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+                row.add_css_class("menu-row");
+                row.set_halign(gtk::Align::Fill);
+                row.set_hexpand(true);
+                
+                let motion = gtk::EventControllerMotion::new();
+                let r1 = row.clone();
+                motion.connect_enter(move |_, _, _| { r1.add_css_class("hovered"); });
+                let r2 = row.clone();
+                motion.connect_leave(move |_| { r2.remove_css_class("hovered"); });
+                row.add_controller(motion);
+
+                let lbl = gtk::Label::new(Some(&label));
+                lbl.set_halign(gtk::Align::Start);
+                lbl.set_hexpand(true);
+                row.append(&lbl);
+
+                let wid = id.clone();
+                let tx = pty_tx.clone();
+                // Collect all ancestor popovers so clicking closes the entire chain
+                let mut close_pops: Vec<gtk::Popover> = Vec::new();
+                let mut cur = menu_id.clone();
+                loop {
+                    if let Some(p) = self.menu_popovers.get(&cur) {
+                        close_pops.push(p.clone());
+                    }
+                    if let Some(parent) = self.menu_parents.get(&cur) {
+                        cur = parent.clone();
+                    } else {
+                        break;
+                    }
+                }
+                
+                let click = gtk::GestureClick::new();
+                click.connect_released(move |gesture, _, _, _| {
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                    for p in &close_pops { p.popdown(); }
+                    if let Some(ref tx) = tx {
+                        let msg = format!("\x1b]1337;WidgetEvent=id:{};action:activated;value:\x07", wid);
+                        let _ = tx.send(msg.into_bytes());
+                    }
+                });
+                row.add_controller(click);
+                
+                if let Some(menu_box) = self.menu_boxes.get(&menu_id) {
+                    menu_box.append(&row);
+                }
+                self.widgets.insert(id.clone(), row.clone().upcast());
+                eprintln!("[MENU] menuitem id={} in menu={}", id, menu_id);
+                None
+            }
+            "menusep" | "menuseparator" => {
+                let menu_id = props.get("menu").cloned().unwrap_or_default();
+                if let Some(menu_box) = self.menu_boxes.get(&menu_id) {
+                    let sep = gtk::Separator::new(gtk::Orientation::Horizontal);
+                    sep.add_css_class("menu-sep");
+                    menu_box.append(&sep);
+                }
+                eprintln!("[MENU] separator in menu={}", menu_id);
+                None
+            }
+            "menucheck" | "menutoggle" => {
+                let label = props.get("label").cloned().unwrap_or_else(|| "Check".into());
+                let menu_id = props.get("menu").cloned().unwrap_or_default();
+                let checked = props.get("checked").map(|v| v == "true" || v == "1").unwrap_or(false);
+                
+                // Create a row container to have uniform hover over the full width
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+                row.add_css_class("menu-row");
+                row.set_halign(gtk::Align::Fill);
+                row.set_hexpand(true);
+                
+                let motion = gtk::EventControllerMotion::new();
+                let r1 = row.clone();
+                motion.connect_enter(move |_, _, _| { r1.add_css_class("hovered"); });
+                let r2 = row.clone();
+                motion.connect_leave(move |_| { r2.remove_css_class("hovered"); });
+                row.add_controller(motion);
+
+                let cb = gtk::CheckButton::new();
+                cb.set_active(checked);
+                cb.set_can_focus(false); // remove focus ring from clicking it
+                
+                let lbl = gtk::Label::new(Some(&label));
+                lbl.set_halign(gtk::Align::Start);
+                lbl.set_margin_start(6);
+                lbl.set_hexpand(true);
+                
+                row.append(&cb);
+                row.append(&lbl);
+
+                let wid = id.clone();
+                let tx = pty_tx.clone();
+                
+                let click = gtk::GestureClick::new();
+                let cb_clone = cb.clone();
+                click.connect_released(move |gesture, _, _, _| {
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                    cb_clone.set_active(!cb_clone.is_active());
+                });
+                row.add_controller(click);
+
+                cb.connect_toggled(move |c| {
+                    if let Some(ref tx) = tx {
+                        let val = if c.is_active() { "true" } else { "false" };
+                        let msg = format!("\x1b]1337;WidgetEvent=id:{};action:toggled;value:{}\x07", wid, val);
+                        let _ = tx.send(msg.into_bytes());
+                    }
+                });
+
+                if let Some(menu_box) = self.menu_boxes.get(&menu_id) {
+                    menu_box.append(&row);
+                }
+                self.widgets.insert(id.clone(), row.clone().upcast());
+                eprintln!("[MENU] menucheck id={} in menu={}", id, menu_id);
+                None
+            }
+            "toolbar" => {
+                let spacing: i32 = props.get("spacing").and_then(|s| s.parse().ok()).unwrap_or(2);
+                let width: i32 = props.get("width").and_then(|w| w.parse().ok()).unwrap_or(-1);
+                let bx = gtk::Box::new(gtk::Orientation::Horizontal, spacing);
+                bx.add_css_class("toolbar");
+                bx.set_hexpand(true);
+                bx.set_margin_start(2);
+                bx.set_margin_end(2);
+                bx.set_margin_top(2);
+                bx.set_margin_bottom(2);
+                if width > 0 { bx.set_size_request(width, -1); }
+                self.panels.insert(id.clone(), bx.clone());
+                eprintln!("[TOOLBAR] created toolbar id={}", id);
+                Some(bx.upcast())
+            }
+            "toolbutton" => {
+                let label = props.get("label").cloned().unwrap_or_default();
+                let icon = props.get("icon").cloned();
+                let tooltip = props.get("tooltip").cloned();
+                let btn = gtk::Button::new();
+                match (icon.as_deref(), label.is_empty()) {
+                    (Some(icon_name), false) => {
+                        let content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+                        let img = gtk::Image::from_icon_name(icon_name);
+                        let lbl = gtk::Label::new(Some(&label));
+                        content.append(&img);
+                        content.append(&lbl);
+                        btn.set_child(Some(&content));
+                    }
+                    (Some(icon_name), true) => {
+                        btn.set_icon_name(icon_name);
+                    }
+                    (None, false) => {
+                        btn.set_label(&label);
+                    }
+                    _ => {
+                        btn.set_label("•");
+                    }
+                }
+                btn.add_css_class("flat");
+                if let Some(ref tip) = tooltip {
+                    btn.set_tooltip_text(Some(tip));
+                }
+                let wid = id.clone();
+                let tx = pty_tx.clone();
+                btn.connect_clicked(move |_| {
+                    if let Some(ref tx) = tx {
+                        let msg = format!("\x1b]1337;WidgetEvent=id:{};action:clicked;value:\x07", wid);
+                        let _ = tx.send(msg.into_bytes());
+                    }
+                });
+                Some(btn.upcast())
+            }
+            "tooltoggle" => {
+                let label = props.get("label").cloned().unwrap_or_default();
+                let icon = props.get("icon").cloned();
+                let active = props.get("active").map(|v| v == "true" || v == "1").unwrap_or(false);
+                let tooltip = props.get("tooltip").cloned();
+                let btn = gtk::ToggleButton::new();
+                match (icon.as_deref(), label.is_empty()) {
+                    (Some(icon_name), false) => {
+                        let content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+                        let img = gtk::Image::from_icon_name(icon_name);
+                        let lbl = gtk::Label::new(Some(&label));
+                        content.append(&img);
+                        content.append(&lbl);
+                        btn.set_child(Some(&content));
+                    }
+                    (Some(icon_name), true) => {
+                        let img = gtk::Image::from_icon_name(icon_name);
+                        btn.set_child(Some(&img));
+                    }
+                    (None, false) => {
+                        btn.set_label(&label);
+                    }
+                    _ => {
+                        btn.set_label("•");
+                    }
+                }
+                btn.set_active(active);
+                btn.add_css_class("flat");
+                if let Some(ref tip) = tooltip {
+                    btn.set_tooltip_text(Some(tip));
+                }
+                let wid = id.clone();
+                let tx = pty_tx.clone();
+                btn.connect_toggled(move |b| {
+                    if let Some(ref tx) = tx {
+                        let val = if b.is_active() { "true" } else { "false" };
+                        let msg = format!("\x1b]1337;WidgetEvent=id:{};action:toggled;value:{}\x07", wid, val);
+                        let _ = tx.send(msg.into_bytes());
+                    }
+                });
+                Some(btn.upcast())
+            }
             _ => {
                 eprintln!("[WIDGET] unknown type: {}", widget_type);
                 None
@@ -876,7 +1509,7 @@ impl TerminalState {
             None => { eprintln!("[WIDGET] no type specified"); return; }
         };
         let id = props.get("id").cloned().unwrap_or_else(|| "unnamed".to_string());
-        let panel_id = props.get("panel").cloned();
+        let panel_id = props.get("panel").or(props.get("toolbar")).cloned();
         let row: i32 = props.get("row").and_then(|r| r.parse().ok()).unwrap_or(0);
         let col: i32 = props.get("col").and_then(|c| c.parse().ok()).unwrap_or(0);
         let colspan: i32 = props.get("colspan").and_then(|c| c.parse().ok()).unwrap_or(1);
@@ -888,7 +1521,11 @@ impl TerminalState {
             None => return,
         };
         widget.set_visible(true);
-        if expand {
+        // Block-level widgets always fill horizontal space when placed inline.
+        let default_expand = matches!(widget_type.as_str(),
+            "menubar" | "toolbar" | "splitview" | "paned" | "panel" | "titlebar" | "statusbar"
+        );
+        if expand || default_expand {
             widget.set_hexpand(true);
         }
 
@@ -923,7 +1560,38 @@ impl TerminalState {
         let mut iter = self.ensure_cursor_position(cx, cy);
         let anchor = buffer.create_child_anchor(&mut iter);
         tv.add_child_at_anchor(&widget, &anchor);
-        if self.is_alternate { self.alt_cursor_x += 1; } else { self.cursor_x += 1; }
+
+        // If block:true is set (or implied by widget type), inject a newline
+        // into the buffer after the anchor so the next widget/text starts on
+        // a fresh line.  Widgets placed inside a parent panel are never block
+        // (the parent controls layout).  Explicit block:false overrides type default.
+        let default_block = matches!(widget_type.as_str(),
+            "menubar" | "toolbar" | "splitview" | "paned" | "panel" | "titlebar" | "statusbar"
+        );
+        let block = props
+            .get("block")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(default_block);
+
+        if block {
+            let end_of_anchor = buffer.iter_at_child_anchor(&anchor);
+            let mut after = end_of_anchor;
+            after.forward_char();
+            if after.line_offset() != 0 || after.char() != '\n' {
+                buffer.insert(&mut after, "\n");
+            }
+            if self.is_alternate {
+                self.alt_cursor_x = 0;
+                self.alt_cursor_y = cy + 1;
+            } else {
+                self.cursor_x = 0;
+                self.cursor_y = cy + 1;
+            }
+        } else if self.is_alternate {
+            self.alt_cursor_x += 1;
+        } else {
+            self.cursor_x += 1;
+        }
         eprintln!("[WIDGET] inserted {}(id={}) inline at ({}, {})", widget_type, id, cx, cy);
     }
 
@@ -935,6 +1603,9 @@ impl TerminalState {
             Some(id) => id.clone(),
             None => { eprintln!("[UPDATE] no id specified"); return; }
         };
+        // Handle menu action updates (enable/disable, toggle state)
+        // (Removed — menu items are now stored as regular widgets below)
+
         let widget = match self.widgets.get(&id) {
             Some(w) => w.clone(),
             None => { eprintln!("[UPDATE] widget '{}' not found", id); return; }
@@ -999,6 +1670,71 @@ impl TerminalState {
         }
         if let Some(visible) = props.get("visible") {
             widget.set_visible(visible == "true" || visible == "1");
+        }
+        // Update picturebox: path or data (base64)
+        if let Some(path) = props.get("path") {
+            if let Some(pic) = widget.downcast_ref::<gtk::Picture>() {
+                let file = gtk::gio::File::for_path(path);
+                pic.set_file(Some(&file));
+                eprintln!("[UPDATE] picturebox '{}' set path={}", id, path);
+            }
+        }
+        if let Some(b64) = props.get("data") {
+            if let Some(pic) = widget.downcast_ref::<gtk::Picture>() {
+                if let Ok(bytes) = BASE64.decode(b64.as_bytes()) {
+                    let pixbuf_loader = gtk::gdk_pixbuf::PixbufLoader::new();
+                    let _ = pixbuf_loader.write(&bytes);
+                    let _ = pixbuf_loader.close();
+                    if let Some(pixbuf) = pixbuf_loader.pixbuf() {
+                        let texture = gtk::gdk::Texture::for_pixbuf(&pixbuf);
+                        pic.set_paintable(Some(&texture));
+                    }
+                    eprintln!("[UPDATE] picturebox '{}' set from base64 ({} bytes)", id, bytes.len());
+                }
+            }
+        }
+        // TreeView / ListView row operations
+        if let Some(action) = props.get("action").map(|s| s.as_str()) {
+            match action {
+                "clear" => {
+                    if let Some(ts) = self.tree_stores.get(&id).cloned() {
+                        ts.clear();
+                        self.tree_row_iters.remove(&id);
+                    } else if let Some(ls) = self.list_stores.get(&id).cloned() {
+                        ls.clear();
+                    }
+                }
+                "addrow" => {
+                    if let Some(ts) = self.tree_stores.get(&id).cloned() {
+                        let label = props.get("label").cloned().unwrap_or_default();
+                        let row_id = props.get("rowid").cloned().unwrap_or_else(|| label.clone());
+                        let parent_row_id = props.get("parent").cloned();
+                        let parent_iter = parent_row_id.as_ref().and_then(|pid| {
+                            self.tree_row_iters.get(&id).and_then(|m| m.get(pid)).cloned()
+                        });
+                        let iter = ts.append(parent_iter.as_ref());
+                        ts.set_value(&iter, 0, &label.to_value());
+                        self.tree_row_iters
+                            .entry(id.clone())
+                            .or_insert_with(std::collections::HashMap::new)
+                            .insert(row_id, iter);
+                    } else if let Some(ls) = self.list_stores.get(&id).cloned() {
+                        if let Some(cols_str) = props.get("cols") {
+                            let vals: Vec<&str> = cols_str.split('|').collect();
+                            let iter = ls.append();
+                            for (i, val) in vals.iter().enumerate() {
+                                ls.set_value(&iter, i as u32, &val.to_value());
+                            }
+                        }
+                    }
+                }
+                "expand_all" => {
+                    if let Some(tv) = widget.downcast_ref::<gtk::TreeView>() {
+                        tv.expand_all();
+                    }
+                }
+                _ => {}
+            }
         }
         eprintln!("[UPDATE] widget '{}' updated", id);
     }

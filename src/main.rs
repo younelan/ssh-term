@@ -49,18 +49,97 @@ fn setup_app(app: &Application) {
         notebook > header tab { padding: 4px 12px; border-radius: 6px 6px 0 0; min-width: 120px; border: none; background: transparent; }
         notebook > header tab:checked { background-color: @theme_bg_color; box-shadow: inset 0 3px alpha(currentColor, 0.2); }
         textview { padding: 4px; }
-        popover { background-color: @theme_bg_color; border: 1px solid alpha(currentColor, 0.1); border-radius: 8px; box-shadow: 0 4px 12px alpha(black, 0.15); padding: 8px; }
-        popover button.flat { border-radius: 6px; padding: 6px 12px; }
-        popover button.flat:hover { background-color: alpha(currentColor, 0.05); }
+
+        popover.menu-popover { background: none; border: none; box-shadow: none; padding: 0; margin: 0; }
+        popover.menu-popover > contents {
+            background-color: @popover_bg_color;
+            border: 1px solid alpha(currentColor, 0.18);
+            border-radius: 8px;
+            padding: 6px 0;
+            box-shadow: 0 3px 12px alpha(black, 0.2), 0 1px 3px alpha(black, 0.1);
+        }
+
+        .menubar-box { padding: 0 4px; }
+        .menubar-item {
+            padding: 5px 10px;
+            border-radius: 6px;
+        }
+        .menubar-item.hovered {
+            background-color: @theme_selected_bg_color;
+            color: @theme_selected_fg_color;
+        }
+
+        .menu-row {
+            padding: 6px 12px;
+            min-height: 22px;
+            border-radius: 6px;
+            margin: 1px 6px;
+        }
+        .menu-row.hovered {
+            background-color: @theme_selected_bg_color;
+            color: @theme_selected_fg_color;
+        }
+
+        .menu-sep {
+            margin: 4px 10px;
+            min-height: 0;
+            background-color: alpha(currentColor, 0.12);
+        }
+        .menu-check {
+            padding: 6px 12px;
+            min-height: 22px;
+            border-radius: 6px;
+            margin: 1px 6px;
+        }
+        .menu-check.hovered {
+            background-color: @theme_selected_bg_color;
+            color: @theme_selected_fg_color;
+        }
+
+        .app-titlebar {
+            background-color: @theme_bg_color;
+            border-bottom: 1px solid alpha(currentColor, 0.15);
+            min-height: 36px;
+        }
+        .app-titlebar-title {
+            font-weight: bold;
+            font-size: 13px;
+        }
+        .app-wm-btn {
+            min-width: 26px;
+            min-height: 26px;
+            border-radius: 50%;
+            padding: 3px;
+            background: none;
+            border: none;
+            box-shadow: none;
+        }
+        .app-wm-btn:hover {
+            background-color: alpha(currentColor, 0.12);
+        }
+        .app-wm-close:hover {
+            background-color: #e74c3c;
+            color: white;
+        }
+
+        .app-statusbar {
+            background-color: @theme_bg_color;
+            border-top: 1px solid alpha(currentColor, 0.12);
+            min-height: 24px;
+        }
+        .app-statusbar-text {
+            font-size: 11px;
+            opacity: 0.7;
+        }
     "#;
     let provider = CssProvider::new();
     provider.load_from_data(css);
+    let display = &gdk::Display::default().expect("Could not connect to a display.");
     gtk::style_context_add_provider_for_display(
-        &gdk::Display::default().expect("Could not connect to a display."),
+        display,
         &provider,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
-    
     let app_config = load_app_config();
     apply_app_theme(&app_config.theme);
 
