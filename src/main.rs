@@ -423,6 +423,17 @@ fn apply_app_theme(theme_name: &str) {
             font-size: 0.95em;
             background-color: transparent;
         }}
+
+        /* ── Badge pill labels ── */
+        .badge {{
+            background-color: #e74c3c;
+            color: #ffffff;
+            border-radius: 9999px;
+            padding: 2px 8px;
+            font-size: 0.78em;
+            font-weight: bold;
+            min-width: 18px;
+        }}
         "#,
         bg, fg, hb_bg
     );

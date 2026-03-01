@@ -1,7 +1,7 @@
 use base64::Engine as _;
 const BASE64: base64::engine::general_purpose::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 use gtk4 as gtk;
-use gtk::{glib, Label, TextBuffer, TextTag, TextView};
+use gtk::{glib, gio, Label, TextBuffer, TextTag, TextView};
 use gtk::prelude::*;
 use vte::Perform;
 pub fn keyval_to_bytes(keyval: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> Option<Vec<u8>> {
@@ -119,6 +119,8 @@ pub struct TerminalState {
     pub widget_fg_colors: std::collections::HashMap<String, String>,
     /// Floating GTK windows created by Window= OSC command (id -> window).
     pub windows: std::collections::HashMap<String, gtk::Window>,
+    /// Number of data columns per table/listview (excludes the 2 hidden fg/bg colour columns).
+    pub table_data_cols: std::collections::HashMap<String, usize>,
 }
 
 impl TerminalState {
@@ -203,6 +205,7 @@ impl TerminalState {
             widget_bg_colors: std::collections::HashMap::new(),
             widget_fg_colors: std::collections::HashMap::new(),
             windows: std::collections::HashMap::new(),
+            table_data_cols: std::collections::HashMap::new(),
         }
     }
 
@@ -750,6 +753,18 @@ impl TerminalState {
                 }
                 Some(pb.upcast())
             }
+            "badge" => {
+                let text = props.get("text").or(props.get("label")).cloned().unwrap_or_default();
+                let lbl = gtk::Label::new(Some(&text));
+                lbl.add_css_class("badge");
+                // Support inline colour override via color: and fg: props
+                if props.contains_key("color") || props.contains_key("fg") {
+                    let bg = props.get("color").or(props.get("bg")).cloned();
+                    let fg = props.get("fg").cloned();
+                    self.apply_widget_colors(&id, &lbl.clone().upcast(), bg.as_deref(), fg.as_deref());
+                }
+                Some(lbl.upcast())
+            }
             "label" => {
                 let text = props.get("label").or(props.get("text")).cloned().unwrap_or_default();
                 let lbl = gtk::Label::new(Some(&text));
@@ -966,27 +981,63 @@ impl TerminalState {
                     .map(|s| s.split('|').filter_map(|w| w.parse().ok()).collect())
                     .unwrap_or_default();
                 let n = col_names.len();
-                let types: Vec<glib::Type> = vec![glib::Type::STRING; n];
+                // n+2 cols: n data + 1 fg colour + 1 bg colour (hidden, bound to renderers)
+                let types: Vec<glib::Type> = vec![glib::Type::STRING; n + 2];
                 let store = gtk::ListStore::new(&types);
                 let tv = gtk::TreeView::with_model(&store);
                 tv.set_headers_visible(true);
                 tv.set_activate_on_single_click(true);
+                let sortable = props.get("sortable").map(|v| v != "false" && v != "0").unwrap_or(true);
+                // Per-column ascending/descending toggle state
+                let sort_dirs = std::rc::Rc::new(std::cell::RefCell::new(vec![true; n]));
                 for (i, name) in col_names.iter().enumerate() {
                     let renderer = gtk::CellRendererText::new();
                     let col = gtk::TreeViewColumn::new();
                     col.set_title(name);
                     gtk::prelude::CellLayoutExt::pack_start(&col, &renderer, true);
                     gtk::prelude::CellLayoutExt::add_attribute(&col, &renderer, "text", i as i32);
+                    // Bind hidden fg/bg colour columns to every renderer
+                    gtk::prelude::CellLayoutExt::add_attribute(&col, &renderer, "foreground", n as i32);
+                    gtk::prelude::CellLayoutExt::add_attribute(&col, &renderer, "background", (n + 1) as i32);
                     col.set_resizable(true);
-                    col.set_expand(i == 0); // first col expands
+                    col.set_expand(i == 0);
                     if let Some(&cw) = col_widths.get(i) {
                         if cw > 0 {
                             col.set_sizing(gtk::TreeViewColumnSizing::Fixed);
                             col.set_fixed_width(cw);
                         }
                     }
+                    // Column-header click → sort event
+                    if sortable {
+                        let col_name = name.clone();
+                        let wid_sort = id.clone();
+                        let tx_sort  = pty_tx.clone();
+                        let dirs     = sort_dirs.clone();
+                        let col_idx  = i;
+                        col.set_clickable(true);
+                        col.connect_clicked(move |c| {
+                            let mut d = dirs.borrow_mut();
+                            let asc = d[col_idx];
+                            d[col_idx] = !asc;
+                            let dir_str = if asc { "asc" } else { "desc" };
+                            c.set_sort_indicator(true);
+                            c.set_sort_order(if asc {
+                                gtk::SortType::Ascending
+                            } else {
+                                gtk::SortType::Descending
+                            });
+                            if let Some(ref tx) = tx_sort {
+                                let msg = format!(
+                                    "\x1b]1337;WidgetEvent=id:{};action:sort;col:{};dir:{}\x07",
+                                    wid_sort, col_name, dir_str
+                                );
+                                let _ = tx.send(msg.into_bytes());
+                            }
+                        });
+                    }
                     tv.append_column(&col);
                 }
+                self.table_data_cols.insert(id.clone(), n);
                 let wid = id.clone();
                 let tx = pty_tx.clone();
                 let ncols = n;
@@ -2000,6 +2051,32 @@ impl TerminalState {
                             for (i, val) in vals.iter().enumerate() {
                                 ls.set_value(&iter, i as u32, &val.to_value());
                             }
+                            // Optional per-row foreground/background colours
+                            let n_data = self.table_data_cols.get(&id).copied().unwrap_or(vals.len());
+                            if let Some(fg) = props.get("fg") {
+                                ls.set_value(&iter, n_data as u32, &fg.to_value());
+                            }
+                            if let Some(bg) = props.get("bg") {
+                                ls.set_value(&iter, (n_data + 1) as u32, &bg.to_value());
+                            }
+                        }
+                    }
+                }
+                // Change the colour of an existing row by index
+                "rowcolor" => {
+                    if let Some(ls) = self.list_stores.get(&id).cloned() {
+                        if let Some(row_str) = props.get("row") {
+                            if let Ok(row_idx) = row_str.parse::<i32>() {
+                                if let Some(iter) = ls.iter_nth_child(None, row_idx) {
+                                    let n_data = self.table_data_cols.get(&id).copied().unwrap_or(0);
+                                    if let Some(fg) = props.get("fg") {
+                                        ls.set_value(&iter, n_data as u32, &fg.to_value());
+                                    }
+                                    if let Some(bg) = props.get("bg") {
+                                        ls.set_value(&iter, (n_data + 1) as u32, &bg.to_value());
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -2648,6 +2725,32 @@ impl Perform for TerminalState {
                 } else if let Some(spec) = payload.strip_prefix("WindowUpdate=") {
                     eprintln!("[WINDOW] OSC 1337 WindowUpdate spec: {}", spec);
                     self.update_wm_window(spec);
+                } else if let Some(url) = payload.strip_prefix("OpenURL=") {
+                    let url = url.trim().to_string();
+                    eprintln!("[URL] Opening: {}", url);
+                    if let Err(e) = gio::AppInfo::launch_default_for_uri(&url, None::<&gio::AppLaunchContext>) {
+                        eprintln!("[URL] launch_default_for_uri error: {}", e);
+                    }
+                } else if let Some(spec) = payload.strip_prefix("Notify=") {
+                    let props = Self::parse_widget_props(spec);
+                    let title = props.get("title").cloned().unwrap_or_else(|| "Notification".into());
+                    let body  = props.get("body").cloned().unwrap_or_default();
+                    let nid   = props.get("id").cloned().unwrap_or_else(|| "notif".into());
+                    eprintln!("[NOTIFY] title={} body={}", title, body);
+                    if let Some(app) = gio::Application::default() {
+                        let notif = gio::Notification::new(&title);
+                        if !body.is_empty() { notif.set_body(Some(&body)); }
+                        app.send_notification(Some(&nid), &notif);
+                    } else {
+                        // Fallback: system command
+                        #[cfg(target_os = "macos")]
+                        { let _ = std::process::Command::new("osascript")
+                            .arg("-e").arg(format!("display notification {:?} with title {:?}", body, title))
+                            .spawn(); }
+                        #[cfg(not(target_os = "macos"))]
+                        { let _ = std::process::Command::new("notify-send")
+                            .arg(&title).arg(&body).spawn(); }
+                    }
                 } else if let Some(spec) = payload.strip_prefix("Panel=") {
                     eprintln!("[PANEL] OSC 1337 Panel spec: {}", spec);
                     self.insert_panel(spec);
