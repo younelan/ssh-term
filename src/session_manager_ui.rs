@@ -2,7 +2,7 @@ use crate::config::{ConnectionSettings, THEMES};
 use crate::app_state::update_active_terminals;
 use gtk4 as gtk;
 use gtk::prelude::*;
-use gtk::{glib, Box as GtkBox, CheckButton, ColorButton, DropDown, Entry, Label, ListBox, MenuButton, Orientation, StringList};
+use gtk::{glib, Box as GtkBox, Button, CheckButton, ColorButton, DropDown, Entry, Label, ListBox, MenuButton, Orientation, StringList};
 use std::sync::{Arc, Mutex};
 
 pub fn populate_list(
@@ -606,3 +606,39 @@ pub fn hex_to_rgba(hex: &str) -> gtk::gdk::RGBA {
     let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0) as f32 / 255.0;
     gtk::gdk::RGBA::builder().red(r).green(g).blue(b).alpha(1.0).build()
 }
+
+pub fn populate_known_hosts_list(list: &ListBox) {
+    while let Some(child) = list.first_child() { list.remove(&child); }
+    let hosts = crate::config::load_known_hosts();
+    for (index, h) in hosts.iter().enumerate() {
+        let row_box = GtkBox::new(Orientation::Horizontal, 10);
+        row_box.set_margin_start(10); row_box.set_margin_end(10);
+        row_box.set_margin_top(5); row_box.set_margin_bottom(5);
+        
+        let text_box = GtkBox::new(Orientation::Vertical, 2);
+        text_box.set_hexpand(true);
+        let host_label = Label::builder().label(&format!("{}:{}", h.host, h.port)).halign(gtk::Align::Start).css_classes(["title-4"]).build();
+        let fp_label = Label::builder().label(&h.fingerprint).halign(gtk::Align::Start).css_classes(["caption", "dim-label"]).selectable(true).build();
+        text_box.append(&host_label);
+        text_box.append(&fp_label);
+        row_box.append(&text_box);
+        
+        let del_btn = Button::builder().icon_name("user-trash-symbolic").css_classes(["flat", "error"]).build();
+        let list_weak = list.downgrade();
+        del_btn.connect_clicked(move |_| {
+            let mut current = crate::config::load_known_hosts();
+            if index < current.len() {
+                current.remove(index);
+                crate::config::save_known_hosts(&current);
+                if let Some(l) = list_weak.upgrade() {
+                    populate_known_hosts_list(&l);
+                }
+            }
+        });
+        row_box.append(&del_btn);
+        
+        let row = gtk::ListBoxRow::builder().child(&row_box).build();
+        list.append(&row);
+    }
+}
+

@@ -1,19 +1,24 @@
 use crate::config::{ConnectionSettings, THEMES, get_config_path};
 use crate::app_state::{ACTIVE_TERMINALS, ActiveTerminal, update_active_terminals};
-use crate::ssh::connect_ssh;
+use crate::ssh::{connect_ssh, SshEvent};
 use crate::terminal_state::TerminalState;
 use flume;
 use gtk4 as gtk;
 use gtk::prelude::*;
-use gtk::{glib, Label, Notebook, ScrolledWindow, TextView, CssProvider, EventControllerKey};
+use gtk::{
+    glib, Label, Notebook, ScrolledWindow, TextView, CssProvider, 
+    EventControllerKey, Orientation, Box as GtkBox
+};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use vte::Parser;
+use ssh2;
 
 pub enum ConnectionControl {
     Input(Vec<u8>),
     Resize(u32, u32, u32, u32),
+    SetSsh(ssh2::Session, ssh2::Channel),
 }
 
 fn load_sessions() -> Vec<ConnectionSettings> {
@@ -96,7 +101,14 @@ fn keyval_to_bytes(keyval: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> Opti
 }
 
 pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, override_pass: Option<String>) {
-    let text_view = TextView::builder().editable(false).monospace(true).cursor_visible(true).focusable(true).can_focus(true).build();
+    let text_view = TextView::builder()
+        .editable(false)
+        .monospace(true)
+        .cursor_visible(true)
+        .focusable(true)
+        .can_focus(true)
+        .build();
+    text_view.set_direction(gtk::TextDirection::Ltr);
     let provider = CssProvider::new();
     let css = format!(
         "textview, textview text {{ background-color: {0}; background: {0}; color: {1}; font-size: {2}pt; }}" ,
@@ -111,7 +123,7 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
         .hscrollbar_policy(gtk::PolicyType::Never)
         .build();
     let label = Label::new(Some(&settings.name));
-    let label_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    let label_box = GtkBox::new(Orientation::Horizontal, 0);
     label_box.append(&label);
     
     let index = notebook.append_page(&scrolled, Some(&label_box));
@@ -210,6 +222,12 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
             let char_w = (metrics.approximate_char_width() as f32 / gtk::pango::SCALE as f32).max(1.0);
             let char_h = ((metrics.ascent() + metrics.descent()) as f32 / gtk::pango::SCALE as f32).max(1.0);
 
+            {
+                let mut state = ts_weak_loop.lock().unwrap();
+                state.char_width = char_w;
+                state.char_height = char_h;
+            }
+
             let cols = (width as f32 / char_w).floor().max(1.0) as u32;
             let rows = (height as f32 / char_h).floor().max(1.0) as u32;
 
@@ -232,7 +250,6 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
                 let upper = adj.upper();
                 let page_size = adj.page_size();
                 
-                // Sticky scroll: Only follow if we're within 100px of the bottom
                 if current >= (upper - page_size - 100.0) {
                     let tv_scroll = tv.clone();
                     glib::idle_add_local(move || {
@@ -248,6 +265,7 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
         glib::ControlFlow::Continue
     });
 
+    // CONTROLLERS
     let itx = input_tx.clone();
     let tv_for_key = text_view.clone();
     let key_controller = EventControllerKey::new();
@@ -264,7 +282,6 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
                       (is_cmd && (keyval == gtk::gdk::Key::c || keyval == gtk::gdk::Key::C));
         let is_paste = (is_ctrl && is_shift && (keyval == gtk::gdk::Key::v || keyval == gtk::gdk::Key::V)) ||
                        (is_cmd && (keyval == gtk::gdk::Key::v || keyval == gtk::gdk::Key::V));
-
         let is_zoom_in = (is_ctrl || is_cmd) && (keyval == gtk::gdk::Key::equal || keyval == gtk::gdk::Key::plus || keyval == gtk::gdk::Key::KP_Add);
         let is_zoom_out = (is_ctrl || is_cmd) && (keyval == gtk::gdk::Key::minus || keyval == gtk::gdk::Key::KP_Subtract);
         let is_zoom_reset = (is_ctrl || is_cmd) && (keyval == gtk::gdk::Key::_0 || keyval == gtk::gdk::Key::KP_0);
@@ -288,7 +305,6 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
                     if is_bracketed { data.extend_from_slice(b"\x1b[200~"); }
                     data.extend_from_slice(text.as_bytes());
                     if is_bracketed { data.extend_from_slice(b"\x1b[201~"); }
-                    
                     let _ = itx_clone.send(ConnectionControl::Input(data));
                 }
             });
@@ -298,45 +314,31 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
             let mut p_end = state.primary_buffer.end_iter();
             let mut p_start = state.primary_buffer.start_iter();
             state.primary_buffer.delete(&mut p_start, &mut p_end);
-            
             let mut a_end = state.alternate_buffer.end_iter();
             let mut a_start = state.alternate_buffer.start_iter();
             state.alternate_buffer.delete(&mut a_start, &mut a_end);
-            
             state.cursor_x = 0; state.cursor_y = 0;
             state.alt_cursor_x = 0; state.alt_cursor_y = 0;
             return glib::Propagation::Stop;
         } else if is_zoom_in || is_zoom_out || is_zoom_reset {
             let sid_to_update = sid_for_key.clone();
-            
             ACTIVE_TERMINALS.with(|at| {
                 let mut list = at.borrow_mut();
                 if let Some(term) = list.iter_mut().find(|t| t.session_id == sid_to_update) {
                     let mut sessions = load_sessions();
                     if let Some(s) = sessions.iter_mut().find(|s| s.name == sid_to_update) {
-                        let new_size = if is_zoom_reset {
-                            original_font_size as i32
-                        } else if is_zoom_in {
-                            s.font_size + 1
-                        } else {
-                            (s.font_size - 1).clone().max(6)
-                        };
-                        
+                        let new_size = if is_zoom_reset { original_font_size as i32 } 
+                                     else if is_zoom_in { s.font_size + 1 } 
+                                     else { (s.font_size - 1).clone().max(6) };
                         s.font_size = new_size;
-                        
-                        let css = format!(
-                            "textview, textview text {{ background-color: {0}; background: {0}; color: {1}; font-size: {2}pt; }}",
-                            s.bg_color, s.fg_color, new_size
-                        );
+                        let css = format!("textview, textview text {{ background-color: {0}; background: {0}; color: {1}; font-size: {2}pt; }}", s.bg_color, s.fg_color, new_size);
                         term.css_provider.load_from_data(&css);
-                        
                         save_sessions(&sessions);
                     }
                 }
             });
             return glib::Propagation::Stop;
         }
-
         if let Some(data) = keyval_to_bytes(keyval, state) {
             let _ = itx.send(ConnectionControl::Input(data));
             return glib::Propagation::Stop;
@@ -351,9 +353,6 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
     scroll_controller.connect_scroll(move |_controller, _dx, dy| {
         let ts = s_arc_scroll.lock().unwrap();
         if ts.mouse_tracking_mode > 0 {
-            // SGR format: ESC [ < Pcb ; Px ; Py (M for press, m for release)
-            // Simplified scroll: we don't know precise X/Y here easily, so we just use 1;1
-            // Button 4 (scroll up) is usually code 64, Button 5 (scroll down) is 65.
             let button = if dy < 0.0 { 64 } else { 65 };
             let sgr = format!("\x1b[<{};1;1M", button);
             let _ = itx_scroll.send(ConnectionControl::Input(sgr.into_bytes()));
@@ -364,61 +363,44 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
     text_view.add_controller(scroll_controller);
 
     let click_controller = gtk::GestureClick::new();
-    click_controller.set_button(0); // All buttons
+    click_controller.set_button(0); 
     let s_arc_click = ts_weak.clone();
     let itx_click = input_tx.clone();
-    let fs_click = font_size_u32;
-    
     click_controller.connect_pressed(move |gesture, _n_press, x, y| {
         let ts = s_arc_click.lock().unwrap();
         if ts.mouse_tracking_mode > 0 {
-            let button = match gesture.current_button() {
-                1 => 0, // Left
-                2 => 1, // Middle
-                3 => 2, // Right
-                _ => 0,
-            };
-            let char_w = (fs_click as f32 * 0.6).max(1.0);
-            let char_h = (fs_click as f32 * 1.5).max(1.0);
-            let col = (x as f32 / char_w).max(0.0) as u32 + 1;
-            let row = (y as f32 / char_h).max(0.0) as u32 + 1;
-            
+            let button = match gesture.current_button() { 1 => 0, 2 => 1, 3 => 2, _ => 0 };
+            let col = (x as f32 / ts.char_width).max(0.0) as u32 + 1;
+            let row = (y as f32 / ts.char_height).max(0.0) as u32 + 1;
             let sgr = format!("\x1b[<{};{};{}M", button, col, row);
             let _ = itx_click.send(ConnectionControl::Input(sgr.into_bytes()));
             gesture.set_state(gtk::EventSequenceState::Claimed);
         }
     });
-    
+
     let s_arc_release = ts_weak.clone();
     let itx_release = input_tx.clone();
-    let fs_release = font_size_u32;
     click_controller.connect_released(move |gesture, _n_press, x, y| {
         let ts = s_arc_release.lock().unwrap();
         if ts.mouse_tracking_mode > 0 {
-            let button = match gesture.current_button() {
-                1 => 0,
-                2 => 1,
-                3 => 2,
-                _ => 0,
-            };
-            let char_w = (fs_release as f32 * 0.6).max(1.0);
-            let char_h = (fs_release as f32 * 1.5).max(1.0);
-            let col = (x as f32 / char_w).max(0.0) as u32 + 1;
-            let row = (y as f32 / char_h).max(0.0) as u32 + 1;
-            
-            let sgr = format!("\x1b[<{};{};{}m", button, col, row); // 'm' for release in 1006
+            let button = match gesture.current_button() { 1 => 0, 2 => 1, 3 => 2, _ => 0 };
+            let col = (x as f32 / ts.char_width).max(0.0) as u32 + 1;
+            let row = (y as f32 / ts.char_height).max(0.0) as u32 + 1;
+            let sgr = format!("\x1b[<{};{};{}m", button, col, row);
             let _ = itx_release.send(ConnectionControl::Input(sgr.into_bytes()));
             gesture.set_state(gtk::EventSequenceState::Claimed);
         }
     });
     text_view.add_controller(click_controller);
 
+    // CONNECTION LOGIC
+    let _sid_for_thread = settings.name.clone();
     let s_clone = settings.clone();
-    let final_pass = override_pass.or(settings.password.clone());
-    text_view.buffer().set_text(&format!("Connecting to {}...\n", settings.name));
+    let final_pass = override_pass.clone();
+    let (event_tx, event_rx) = flume::unbounded::<SshEvent>();
 
     std::thread::spawn(move || {
-        match connect_ssh(&s_clone.host, s_clone.port, &s_clone.username, final_pass.as_deref().unwrap_or(""), s_clone.private_key.as_deref(), s_clone.keepalive, s_clone.agent_forwarding, &s_clone.term_type) {
+        match connect_ssh(&s_clone.host, s_clone.port, &s_clone.username, final_pass.as_deref().unwrap_or(""), s_clone.private_key.as_deref(), s_clone.keepalive, s_clone.agent_forwarding, &s_clone.term_type, Some(event_tx)) {
             Ok((session, mut channel)) => {
                 let _ = output_tx.send(b"Connection established.\r\n".to_vec());
 
@@ -445,9 +427,6 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
                     if parts.len() == 3 {
                         if let (Ok(r_port), Ok(l_port)) = (parts[0].parse::<u16>(), parts[2].parse::<u16>()) {
                             let l_host = parts[1].to_string();
-                            // Attempt to use None for host. The API usually expects `port, host_option, bound_port, backlog` or similar
-                            // We will use standard u16 defaults. The compiler will guide us if wrong:
-                            // remote_port_forward(port: u16, host: Option<&str>, bound_port: u16, max_connections: Option<u32>)
                             match session.channel_forward_listen(r_port, Some("0.0.0.0"), None) {
                                 Ok((listener, _bound_port)) => {
                                     remote_listeners.push((listener, l_host, l_port));
@@ -463,18 +442,14 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
 
                 let _ = session.set_blocking(false);
                 let mut buffer = [0; 8192];
-                
-                // Active TCP proxies
                 let mut active_local_tunnels: Vec<(std::net::TcpStream, ssh2::Channel)> = Vec::new();
                 let mut active_remote_tunnels: Vec<(std::net::TcpStream, ssh2::Channel)> = Vec::new();
                 
                 loop {
-                    // Check main terminal channel output
                     match channel.read(&mut buffer) {
                         Ok(0) => break,
                         Ok(size) => { let _ = output_tx.send(buffer[..size].to_vec()); }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            // Check Terminal Input
                             while let Ok(ctrl) = input_rx.try_recv() {
                                 match ctrl {
                                     ConnectionControl::Input(data) => {
@@ -489,16 +464,15 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
                                     },
                                     ConnectionControl::Resize(cols, rows, width_px, height_px) => {
                                         let _ = channel.request_pty_size(cols, rows, Some(width_px), Some(height_px));
-                                    }
+                                    },
+                                    ConnectionControl::SetSsh(_, _) => (),
                                 }
                                 let _ = channel.flush();
                             }
                             
-                            // Check new local connections (-L)
                             for (listener, r_host, r_port) in &local_listeners {
                                 if let Ok((tcp_stream, _addr)) = listener.accept() {
                                     let _ = tcp_stream.set_nonblocking(true);
-                                    // Momentarily block to establish SSH channel reliably
                                     let _ = session.set_blocking(true);
                                     if let Ok(forward_channel) = session.channel_direct_tcpip(r_host, *r_port, None) {
                                         active_local_tunnels.push((tcp_stream, forward_channel));
@@ -507,7 +481,6 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
                                 }
                             }
                             
-                            // Check new remote connections (-R)
                             for (listener, l_host, l_port) in &mut remote_listeners {
                                 match listener.accept() {
                                     Ok(forward_channel) => {
@@ -520,34 +493,28 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
                                 }
                             }
                             
-                            // Pipe local tunnels (TCP -> SSH) and (SSH -> TCP)
                             let mut drop_local_idx = Vec::new();
                             for (idx, (tcp, ch)) in active_local_tunnels.iter_mut().enumerate() {
-                                // TCP -> SSH
                                 match tcp.read(&mut buffer) {
                                     Ok(0) => drop_local_idx.push(idx),
                                     Ok(size) => { let _ = ch.write_all(&buffer[..size]); }
                                     Err(_) => ()
                                 }
-                                // SSH -> TCP
                                 match ch.read(&mut buffer) {
-                                    Ok(0) => if !drop_local_idx.contains(&idx) { drop_local_idx.push(idx) },
                                     Ok(size) => { let _ = tcp.write_all(&buffer[..size]); }
+                                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => if !drop_local_idx.contains(&idx) { drop_local_idx.push(idx) },
                                     Err(_) => ()
                                 }
                             }
                             for idx in drop_local_idx.into_iter().rev() { active_local_tunnels.remove(idx); }
                             
-                            // Pipe remote tunnels (SSH -> TCP) and (TCP -> SSH)
                             let mut drop_remote_idx = Vec::new();
                             for (idx, (tcp, ch)) in active_remote_tunnels.iter_mut().enumerate() {
-                                // SSH -> TCP
                                 match ch.read(&mut buffer) {
-                                    Ok(0) => drop_remote_idx.push(idx),
                                     Ok(size) => { let _ = tcp.write_all(&buffer[..size]); }
+                                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => drop_remote_idx.push(idx),
                                     Err(_) => ()
                                 }
-                                // TCP -> SSH
                                 match tcp.read(&mut buffer) {
                                     Ok(0) => if !drop_remote_idx.contains(&idx) { drop_remote_idx.push(idx) },
                                     Ok(size) => { let _ = ch.write_all(&buffer[..size]); }
@@ -556,7 +523,7 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
                             }
                             for idx in drop_remote_idx.into_iter().rev() { active_remote_tunnels.remove(idx); }
 
-                            std::thread::sleep(Duration::from_millis(5));
+                            std::thread::sleep(Duration::from_millis(10));
                         }
                         Err(_) => break,
                     }
@@ -567,5 +534,57 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
                 let _ = output_tx.send(format!("Connection failed: {}\r\n", e).as_bytes().to_vec());
             }
         }
+    });
+
+    // EVENT LISTENER
+    let tv_for_event = text_view.clone();
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                SshEvent::HostKeyVerify { host, port, fingerprint, response } => {
+                    let win = match tv_for_event.root().and_then(|r| r.downcast::<gtk::Window>().ok()) {
+                        Some(w) => w,
+                        None => continue,
+                    };
+                    let dialog = gtk::MessageDialog::builder()
+                        .transient_for(&win)
+                        .modal(true)
+                        .message_type(gtk::MessageType::Warning)
+                        .buttons(gtk::ButtonsType::YesNo)
+                        .text("SSH Host Key Verification")
+                        .secondary_text(&format!(
+                            "The authenticity of host '{}:{}' can't be established.\n\nSHA256 Fingerprint: {}\n\nAre you sure you want to continue connecting?",
+                            host, port, fingerprint
+                        ))
+                        .build();
+                    let resp_tx = response.clone();
+                    let h_clone = host.clone();
+                    let fp_clone = fingerprint.clone();
+                    dialog.connect_response(move |d, res| {
+                        let approved = res == gtk::ResponseType::Yes;
+                        if approved {
+                            let mut current = crate::config::load_known_hosts();
+                            current.retain(|kh| !(kh.host == h_clone && kh.port == port));
+                            current.push(crate::config::KnownHost {
+                                host: h_clone.clone(),
+                                port,
+                                fingerprint: fp_clone.clone(),
+                            });
+                            crate::config::save_known_hosts(&current);
+
+                            crate::app_state::KNOWN_HOSTS_LIST.with(|cell| {
+                                if let Some(list) = cell.borrow().upgrade() {
+                                    crate::session_manager_ui::populate_known_hosts_list(&list);
+                                }
+                            });
+                        }
+                        let _ = resp_tx.send(approved);
+                        d.destroy();
+                    });
+                    dialog.show();
+                }
+            }
+        }
+        glib::ControlFlow::Continue
     });
 }

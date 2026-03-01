@@ -21,6 +21,8 @@ pub struct TerminalState {
     pub saved_cursor_y: usize,
     pub saved_tags: Vec<String>,
     pub bracketed_paste_mode: bool,
+    pub char_width: f32,
+    pub char_height: f32,
 }
 
 impl TerminalState {
@@ -96,6 +98,8 @@ impl TerminalState {
             saved_cursor_y: 0,
             saved_tags: Vec::new(),
             bracketed_paste_mode: false,
+            char_width: 1.0,
+            char_height: 1.0,
         }
     }
 
@@ -233,8 +237,21 @@ impl TerminalState {
     }
 }
 
+use unicode_width::UnicodeWidthChar;
+
 impl Perform for TerminalState {
     fn print(&mut self, c: char) {
+        let width = c.width().unwrap_or(0);
+        if width == 0 {
+            // Combining character or zero-width: just insert it at current position without advancing
+            let cx = if self.is_alternate { self.alt_cursor_x } else { self.cursor_x };
+            let cy = if self.is_alternate { self.alt_cursor_y } else { self.cursor_y };
+            let mut iter = self.ensure_cursor_position(cx, cy);
+            let buffer = self.active_buffer();
+            buffer.insert(&mut iter, &c.to_string());
+            return;
+        }
+
         let cx;
         let cy;
         {
@@ -245,10 +262,14 @@ impl Perform for TerminalState {
         let mut iter = self.ensure_cursor_position(cx, cy);
         let buffer = self.active_buffer();
         
-        if !iter.ends_line() {
-            let mut next = iter.clone();
-            next.forward_char();
-            buffer.delete(&mut iter, &mut next);
+        // Delete characters to make room for the new width
+        let mut del_iter = iter.clone();
+        for _ in 0..width {
+            if !del_iter.ends_line() {
+                let mut next = del_iter.clone();
+                next.forward_char();
+                buffer.delete(&mut del_iter, &mut next);
+            }
         }
         
         let start_offset = iter.offset();
@@ -258,9 +279,9 @@ impl Perform for TerminalState {
         buffer.remove_all_tags(&start_iter, &iter);
         
         if self.is_alternate {
-            self.alt_cursor_x += 1;
+            self.alt_cursor_x += width;
         } else {
-            self.cursor_x += 1;
+            self.cursor_x += width;
         }
         
         let buffer = self.active_buffer();

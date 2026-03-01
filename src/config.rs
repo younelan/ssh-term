@@ -221,3 +221,32 @@ pub fn save_app_config(cfg: &AppConfig) {
         let _ = std::fs::write(path, content);
     }
 }
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct KnownHost {
+    pub host: String,
+    pub port: u16,
+    pub fingerprint: String,
+}
+
+pub fn get_known_hosts_path() -> std::path::PathBuf {
+    let mut path = dirs_next::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    path.push(".terminal_ssh_known_hosts.json");
+    path
+}
+
+pub fn load_known_hosts() -> Vec<KnownHost> {
+    let path = get_known_hosts_path();
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        serde_json::from_str(&content).unwrap_or_default()
+    } else {
+        Vec::new()
+    }
+}
+
+pub fn save_known_hosts(hosts: &[KnownHost]) {
+    let path = get_known_hosts_path();
+    if let Ok(content) = serde_json::to_string_pretty(hosts) {
+        let _ = std::fs::write(path, content);
+    }
+}

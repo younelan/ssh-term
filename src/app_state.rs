@@ -10,6 +10,7 @@ thread_local! {
     pub static TARGET_NB: std::cell::RefCell<glib::object::WeakRef<Notebook>> = std::cell::RefCell::new(glib::object::WeakRef::new());
     pub static ACTIVE_TERMINALS: std::cell::RefCell<Vec<ActiveTerminal>> = std::cell::RefCell::new(Vec::new());
     pub static IS_PROGRAMMATIC: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    pub static KNOWN_HOSTS_LIST: std::cell::RefCell<glib::object::WeakRef<gtk::ListBox>> = std::cell::RefCell::new(glib::object::WeakRef::new());
 }
 
 pub struct ActiveTerminal {

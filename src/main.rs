@@ -545,9 +545,34 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
     
     extra_page.append(&scroll_grid);
 
+    let hosts_page = GtkBox::new(Orientation::Vertical, 10);
+    hosts_page.set_margin_top(10); hosts_page.set_margin_bottom(10);
+    hosts_page.set_margin_start(10); hosts_page.set_margin_end(10);
+    let hosts_list = ListBox::builder().selection_mode(gtk::SelectionMode::None).css_classes(["boxed-list"]).build();
+    crate::app_state::KNOWN_HOSTS_LIST.with(|cell| *cell.borrow_mut() = hosts_list.downgrade());
+    
+    let hl_weak = hosts_list.downgrade();
+    hosts_list.connect_destroy(move |_| {
+        crate::app_state::KNOWN_HOSTS_LIST.with(|cell| {
+            let mut current = cell.borrow_mut();
+            if let Some(existing) = current.upgrade() {
+                if let Some(target) = hl_weak.upgrade() {
+                    if existing == target {
+                        *current = glib::object::WeakRef::new();
+                    }
+                }
+            }
+        });
+    });
+
+    crate::session_manager_ui::populate_known_hosts_list(&hosts_list);
+    let hosts_scroll = ScrolledWindow::builder().child(&hosts_list).vexpand(true).min_content_height(400).build();
+    hosts_page.append(&hosts_scroll);
+
     settings_nb.append_page(&conn_page, Some(&Label::new(Some("Connection"))));
     settings_nb.append_page(&style_page, Some(&Label::new(Some("Appearance"))));
     settings_nb.append_page(&extra_page, Some(&Label::new(Some("Advanced"))));
+    settings_nb.append_page(&hosts_page, Some(&Label::new(Some("Known Hosts"))));
 
     let scroll_list = ScrolledWindow::builder().child(&list).vexpand(true).min_content_height(250).build();
     conn_page.append(&scroll_list);
