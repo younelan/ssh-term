@@ -1,713 +1,295 @@
-use crate::config::{ConnectionSettings, THEMES, get_config_path};
-use crate::app_state::{ACTIVE_TERMINALS, ActiveTerminal, update_active_terminals};
-use crate::ssh::{connect_ssh, SshEvent};
-use crate::terminal_state::TerminalState;
-use flume;
 use gtk4 as gtk;
 use gtk::prelude::*;
-use gtk::{
-    glib, Label, Notebook, ScrolledWindow, TextView, CssProvider, 
-    EventControllerKey, Orientation, Box as GtkBox, Button
-};
-use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use vte::Parser;
-use ssh2;
+use std::io::{Read, Write};
+use portable_pty::{CommandBuilder, NativePtySystem, PtySystem, PtySize};
+
+use crate::ssh::{connect_ssh, SshEvent};
+use crate::terminal_state::TerminalState;
 
 pub enum ConnectionControl {
     Input(Vec<u8>),
     Resize(u32, u32, u32, u32),
-    SetSsh(ssh2::Session, ssh2::Channel),
+    SetBackend(TerminalBackend),
 }
 
-fn load_sessions() -> Vec<ConnectionSettings> {
-    let path = get_config_path();
-    if let Ok(content) = std::fs::read_to_string(&path) {
-        serde_json::from_str(&content).unwrap_or_default()
-    } else {
-        Vec::new()
-    }
+pub enum TerminalBackend {
+    Ssh(ssh2::Channel),
+    Local(LocalPty),
 }
 
-fn save_sessions(sessions: &[ConnectionSettings]) {
-    let path = get_config_path();
-    if let Ok(content) = serde_json::to_string_pretty(sessions) {
-        let _ = std::fs::write(path, content);
-    }
+pub struct LocalPty {
+    pub master: Box<dyn portable_pty::MasterPty + Send>,
+    pub writer: Box<dyn std::io::Write + Send>,
 }
 
-fn keyval_to_bytes(keyval: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> Option<Vec<u8>> {
-    let is_ctrl = state.contains(gtk::gdk::ModifierType::CONTROL_MASK);
-    if is_ctrl && keyval == gtk::gdk::Key::space {
-        return Some(vec![0]);
-    }
+fn spawn_local_shell(cols: u16, rows: u16) -> Result<(LocalPty, Box<dyn std::io::Read + Send>), Box<dyn std::error::Error + Send + Sync>> {
+    let pty_system = NativePtySystem::default();
+    let pair = pty_system.openpty(PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
 
-    use gtk::gdk::Key;
-    match keyval {
-        Key::Return | Key::KP_Enter => Some(b"\r".to_vec()),
-        Key::BackSpace => Some(b"\x08".to_vec()),
-        Key::Tab => Some(b"\t".to_vec()),
-        Key::Escape => Some(b"\x1b".to_vec()),
-        Key::Left => Some(b"\x1b[D".to_vec()),
-        Key::Right => Some(b"\x1b[C".to_vec()),
-        Key::Up => Some(b"\x1b[A".to_vec()),
-        Key::Down => Some(b"\x1b[B".to_vec()),
-        Key::Home => Some(b"\x1b[H".to_vec()),
-        Key::End => Some(b"\x1b[F".to_vec()),
-        Key::Page_Up => Some(b"\x1b[5~".to_vec()),
-        Key::Page_Down => Some(b"\x1b[6~".to_vec()),
-        Key::Insert => Some(b"\x1b[2~".to_vec()),
-        Key::Delete => Some(b"\x1b[3~".to_vec()),
-        Key::F1 => Some(b"\x1bOP".to_vec()),
-        Key::F2 => Some(b"\x1bOQ".to_vec()),
-        Key::F3 => Some(b"\x1bOR".to_vec()),
-        Key::F4 => Some(b"\x1bOS".to_vec()),
-        Key::F5 => Some(b"\x1b[15~".to_vec()),
-        Key::F6 => Some(b"\x1b[17~".to_vec()),
-        Key::F7 => Some(b"\x1b[18~".to_vec()),
-        Key::F8 => Some(b"\x1b[19~".to_vec()),
-        Key::F9 => Some(b"\x1b[20~".to_vec()),
-        Key::F10 => Some(b"\x1b[21~".to_vec()),
-        Key::F11 => Some(b"\x1b[23~".to_vec()),
-        Key::F12 => Some(b"\x1b[24~".to_vec()),
-        _ => {
-            if is_ctrl {
-                if let Some(lower) = keyval.to_lower().to_unicode() {
-                    if lower >= 'a' && lower <= 'z' {
-                        return Some(vec![(lower as u8) - b'a' + 1]);
-                    }
-                }
-                
-                let val = keyval.to_unicode().unwrap_or('\0');
-                if val == '[' { return Some(vec![27]); }
-                if val == '\\' { return Some(vec![28]); }
-                if val == ']' { return Some(vec![29]); }
-                if val == '^' { return Some(vec![30]); }
-                if val == '_' { return Some(vec![31]); }
-                if val == '?' { return Some(vec![127]); }
-                if val == ' ' || val == '@' { return Some(vec![0]); }
-                
-                return None;
-            }
-            if let Some(c) = keyval.to_unicode() { 
-                if c >= ' ' { 
-                    return Some(c.to_string().into_bytes()); 
-                } 
-            }
-            None
-        }
-    }
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+    let cmd = CommandBuilder::new(shell);
+    let _child = pair.slave.spawn_command(cmd)?;
+
+    let reader = pair.master.try_clone_reader()?;
+    let writer = pair.master.take_writer()?;
+
+    Ok((LocalPty {
+        master: pair.master,
+        writer,
+    }, reader))
 }
 
-pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, override_pass: Option<String>) {
-    let text_view = TextView::builder()
+pub fn add_terminal_tab(
+    stack: &gtk::Widget, // Using Widget to be flexible for now, but expecting Notebook or similar
+    settings: crate::config::ConnectionSettings,
+    override_pass: Option<String>,
+    is_local: bool,
+) {
+    let scrolled = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .build();
+
+    let text_view = gtk::TextView::builder()
         .editable(false)
         .monospace(true)
         .cursor_visible(true)
         .focusable(true)
         .can_focus(true)
+        .wrap_mode(gtk::WrapMode::None)
+        .accepts_tab(false)
         .build();
+
+    text_view.add_css_class("terminal-view");
+
     text_view.set_direction(gtk::TextDirection::Ltr);
-    let provider = CssProvider::new();
+    let provider = gtk::CssProvider::new();
+    let bg = &settings.bg_color;
+    let fg = &settings.fg_color;
     let css = format!(
-        "textview, textview text {{ background-color: {0}; background: {0}; color: {1}; font-size: {2}pt; }}" ,
-        settings.bg_color, settings.fg_color, settings.font_size
+        ".terminal-view {{ background-color: {0}; color: {1}; }} \
+         .terminal-view text {{ background-color: {0}; color: {1}; font-size: {2}pt; }} \
+         .terminal-view selection {{ background-color: #3584e4; color: #ffffff; }}",
+        bg, fg, settings.font_size
     );
     provider.load_from_data(&css);
     text_view.style_context().add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 500);
 
-    let scrolled = ScrolledWindow::builder()
-        .child(&text_view)
-        .vexpand(true)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .build();
-    let label = Label::new(Some(&settings.name));
-    let close_btn = Button::builder()
-        .icon_name("window-close-symbolic")
-        .css_classes(["flat"])
-        .focus_on_click(false)
-        .build();
-    let label_box = GtkBox::new(Orientation::Horizontal, 4);
-    label_box.append(&label);
-    label_box.append(&close_btn);
+    scrolled.set_child(Some(&text_view));
+
+    let dummy_label = gtk::Label::new(Some(&settings.name));
     
-    let overlay = gtk::Overlay::new();
-    let search_bar = GtkBox::new(Orientation::Horizontal, 6);
-    search_bar.set_valign(gtk::Align::Start);
-    search_bar.set_halign(gtk::Align::End);
-    search_bar.set_margin_top(10);
-    search_bar.set_margin_end(10);
-    search_bar.set_visible(false);
-    search_bar.add_css_class("search-bar");
-
-    let search_entry = gtk::SearchEntry::builder().width_request(200).build();
-    let next_btn = gtk::Button::builder().icon_name("go-down-symbolic").build();
-    let prev_btn = gtk::Button::builder().icon_name("go-up-symbolic").build();
-    let close_search = gtk::Button::builder().icon_name("window-close-symbolic").build();
-    
-    search_bar.append(&search_entry);
-    search_bar.append(&prev_btn);
-    search_bar.append(&next_btn);
-    search_bar.append(&close_search);
-    
-    overlay.set_child(Some(&scrolled));
-    overlay.add_overlay(&search_bar);
-    
-    notebook.append_page(&overlay, Some(&label_box));
-    let index = notebook.page_num(&overlay).unwrap();
-    notebook.set_tab_reorderable(&overlay, true);
-
-    let nb_close = notebook.clone();
-    let ov_close = overlay.clone();
-    close_btn.connect_clicked(move |_| {
-        let idx = nb_close.page_num(&ov_close).unwrap();
-        nb_close.remove_page(Some(idx));
-        if nb_close.n_pages() == 0 {
-            if let Some(win) = nb_close.root().and_then(|r| r.downcast::<gtk::Window>().ok()) {
-                win.close();
-            }
-        }
-    });
-
-    notebook.set_current_page(Some(index));
-    text_view.grab_focus();
-
-    let context_menu = gtk::gio::Menu::new();
-    let theme_submenu = gtk::gio::Menu::new();
-    let action_group = gtk::gio::SimpleActionGroup::new();
-    label_box.insert_action_group("term", Some(&action_group));
-
-    let sid_for_menu = settings.name.clone();
-    
-    for (theme_idx, theme) in THEMES.iter().enumerate() {
-        let action_name = format!("set_theme_{}", theme_idx);
-        theme_submenu.append(Some(theme.name), Some(&format!("term.{}", action_name)));
-
-        let action_theme = gtk::gio::SimpleAction::new(&action_name, None);
-        let theme_name = theme.name.to_string();
-        let theme_fg = theme.fg.to_string();
-        let theme_bg = theme.bg.to_string();
-        let theme_pal = theme.palette.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let sid_clone = sid_for_menu.clone();
-
-        action_theme.connect_activate(move |_, _| {
-            let mut sessions = load_sessions();
-            let mut updated_settings = None;
-            if let Some(s) = sessions.iter_mut().find(|s| s.name == sid_clone) {
-                s.theme = theme_name.clone();
-                s.fg_color = theme_fg.clone();
-                s.bg_color = theme_bg.clone();
-                s.palette = theme_pal.clone();
-                updated_settings = Some(s.clone());
-            }
-            if let Some(s) = updated_settings {
-                save_sessions(&sessions);
-                update_active_terminals(&sid_clone, &s);
-            }
-        });
-        action_group.add_action(&action_theme);
+    if let Some(nb) = stack.downcast_ref::<gtk::Notebook>() {
+        nb.append_page(&scrolled, Some(&dummy_label));
+        nb.set_tab_reorderable(&scrolled, true);
+        nb.set_tab_detachable(&scrolled, true);
     }
-    context_menu.append_submenu(Some("Quick Set Theme"), &theme_submenu);
-
-    let popover = gtk::PopoverMenu::from_model(Some(&context_menu));
-    popover.set_parent(&label_box);
-    popover.set_has_arrow(false);
-    
-    let gesture = gtk::GestureClick::new();
-    gesture.set_button(3);
-    let p_weak = popover.downgrade();
-    gesture.connect_pressed(move |_, _, _, _| {
-        if let Some(p) = p_weak.upgrade() {
-            p.popup();
-        }
-    });
-    label_box.add_controller(gesture);
 
     let (input_tx, input_rx) = flume::unbounded::<ConnectionControl>();
     let (output_tx, output_rx) = flume::unbounded::<Vec<u8>>();
-    
-    let term_state = Arc::new(Mutex::new(TerminalState::new(text_view.downgrade(), label.downgrade(), settings.palette.clone())));
-    let ts_weak = term_state.clone();
 
-    // SEARCH LOGIC (Moved here after ts_weak)
-    let search_bar_init_clone = search_bar.clone();
-    let search_entry_init_clone = search_entry.clone();
-    close_search.connect_clicked({
-        let search_bar_init_clone = search_bar_init_clone.clone();
-        move |_| {
-            search_bar_init_clone.set_visible(false);
+    let palette = settings.palette.clone();
+    let state = TerminalState::new(text_view.downgrade(), dummy_label.downgrade(), palette);
+    let state_rc = std::rc::Rc::new(std::cell::RefCell::new(state));
+
+    let state_for_output = state_rc.clone();
+    let mut parser = vte::Parser::new();
+    gtk::glib::timeout_add_local(Duration::from_millis(10), move || {
+        let mut received = false;
+        while let Ok(data) = output_rx.try_recv() {
+            let mut state = state_for_output.borrow_mut();
+            parser.advance(&mut *state, &data);
+            received = true;
         }
+        if received {
+            state_for_output.borrow().update_visual_cursor();
+        }
+        gtk::glib::ControlFlow::Continue
     });
 
-    let tv_search = text_view.clone();
-    let ts_search_cl = ts_weak.clone();
-    search_entry.connect_search_changed(move |entry| {
-        let text = entry.text().to_string();
-        if text.is_empty() {
-            let cursor_x = ts_search_cl.lock().unwrap().cursor_x as i32;
-            tv_search.buffer().select_range(&tv_search.buffer().iter_at_offset(cursor_x), &tv_search.buffer().iter_at_offset(cursor_x));
-            return;
-        }
-        let buffer = tv_search.buffer();
-        let start = buffer.start_iter();
-        if let Some((mut m_start, m_end)) = start.forward_search(&text, gtk::TextSearchFlags::CASE_INSENSITIVE, None) {
-            buffer.select_range(&m_start, &m_end);
-            tv_search.scroll_to_iter(&mut m_start, 0.0, false, 0.0, 0.0);
-        }
-    });
-
-    let tv_next = text_view.clone();
-    let se_next = search_entry.clone();
-    next_btn.connect_clicked(move |_| {
-        let text = se_next.text().to_string();
-        if text.is_empty() { return; }
-        let buffer = tv_next.buffer();
-        if let Some((_, mut cursor)) = buffer.selection_bounds() {
-            if let Some((mut m_start, m_end)) = cursor.forward_search(&text, gtk::TextSearchFlags::CASE_INSENSITIVE, None) {
-                buffer.select_range(&m_start, &m_end);
-                tv_next.scroll_to_iter(&mut m_start, 0.0, false, 0.0, 0.0);
+    let itx_key = input_tx.clone();
+    let key_controller = gtk::EventControllerKey::new();
+    let tv_key = text_view.clone();
+    key_controller.connect_key_pressed(move |_, keyval, _, state| {
+        let is_super = state.contains(gtk::gdk::ModifierType::SUPER_MASK);
+        if is_super {
+            match keyval {
+                gtk::gdk::Key::c | gtk::gdk::Key::C => {
+                    tv_key.emit_by_name::<()>("copy-clipboard", &[]);
+                }
+                gtk::gdk::Key::v | gtk::gdk::Key::V => {
+                    let clipboard = tv_key.clipboard();
+                    let itx_v = itx_key.clone();
+                    clipboard.read_text_async(gtk::gio::Cancellable::NONE, move |res| {
+                        if let Ok(Some(text)) = res {
+                            let _ = itx_v.send(ConnectionControl::Input(text.into_bytes()));
+                        }
+                    });
+                }
+                _ => return gtk::glib::Propagation::Proceed,
             }
+            return gtk::glib::Propagation::Stop;
         }
-    });
 
-    let tv_prev = text_view.clone();
-    let se_prev = search_entry.clone();
-    prev_btn.connect_clicked(move |_| {
-        let text = se_prev.text().to_string();
-        if text.is_empty() { return; }
-        let buffer = tv_prev.buffer();
-        if let Some((mut cursor, _)) = buffer.selection_bounds() {
-            if let Some((mut m_start, m_end)) = cursor.backward_search(&text, gtk::TextSearchFlags::CASE_INSENSITIVE, None) {
-                buffer.select_range(&m_start, &m_end);
-                tv_prev.scroll_to_iter(&mut m_start, 0.0, false, 0.0, 0.0);
-            }
+        let bytes = crate::terminal_state::keyval_to_bytes(keyval, state);
+        if let Some(data) = bytes {
+            let _ = itx_key.send(ConnectionControl::Input(data));
+            return gtk::glib::Propagation::Stop;
         }
+        gtk::glib::Propagation::Proceed
     });
-    
-    let sid = settings.name.clone();
-    let tv_weak = text_view.downgrade();
-    let prov_clone = provider.clone();
-    let ts_clone = term_state.clone();
-    ACTIVE_TERMINALS.with(|at| {
-        at.borrow_mut().push(ActiveTerminal {
-            session_id: sid,
-            text_view: tv_weak,
-            css_provider: prov_clone,
-            term_state: ts_clone,
-        });
-    });
-    let mut parser = Parser::new();
+    text_view.add_controller(key_controller);
 
-    let tv_weak = text_view.downgrade();
-    let out_rx_clone = output_rx.clone();
+    let tv_for_resize = text_view.clone();
     let itx_resize = input_tx.clone();
     let mut last_cols = 0;
     let mut last_rows = 0;
-    let font_size_u32 = settings.font_size as u32;
-
-    let ts_weak_loop = term_state.clone();
-    glib::timeout_add_local(Duration::from_millis(20), move || {
-        let tv = match tv_weak.upgrade() { Some(v) => v, None => return glib::ControlFlow::Break };
-        
-        let width = tv.width();
-        let height = tv.height();
+    let font_size_u32 = settings.font_size;
+    
+    let state_for_resize = state_rc.clone();
+    gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+        let width = tv_for_resize.width();
+        let height = tv_for_resize.height();
         if width > 0 && height > 0 {
-            // Precise measurement using Pango
-            let pango_ctx = tv.pango_context();
             let font_desc = gtk::pango::FontDescription::from_string(&format!("monospace {}", font_size_u32));
+            let pango_ctx = tv_for_resize.pango_context();
             let metrics = pango_ctx.metrics(Some(&font_desc), None);
+            
             let char_w = (metrics.approximate_char_width() as f32 / gtk::pango::SCALE as f32).max(1.0);
             let char_h = ((metrics.ascent() + metrics.descent()) as f32 / gtk::pango::SCALE as f32).max(1.0);
 
-            {
-                let mut state = ts_weak_loop.lock().unwrap();
-                state.char_width = char_w;
-                state.char_height = char_h;
-            }
-
-            let cols = (width as f32 / char_w).floor().max(1.0) as u32;
-            let rows = (height as f32 / char_h).floor().max(1.0) as u32;
+            // Account for TextView internal padding and potential borders
+            // 4px padding in CSS + GTK defaults
+            let cols = (((width - 10) as f32) / char_w).floor().max(1.0) as u32;
+            let rows = (((height - 10) as f32) / char_h).floor().max(1.0) as u32;
 
             if cols != last_cols || rows != last_rows {
                 last_cols = cols;
                 last_rows = rows;
+                state_for_resize.borrow_mut().resize(cols as usize, rows as usize);
                 let _ = itx_resize.send(ConnectionControl::Resize(cols, rows, width as u32, height as u32));
             }
         }
-
-        let mut updated = false;
-        while let Ok(bytes) = out_rx_clone.try_recv() {
-            let mut state = ts_weak_loop.lock().unwrap();
-            parser.advance(&mut *state, &bytes);
-            updated = true;
-        }
-        if updated {
-            if let Some(adj) = tv.vadjustment() {
-                let current = adj.value();
-                let upper = adj.upper();
-                let page_size = adj.page_size();
-                
-                if current >= (upper - page_size - 100.0) {
-                    let tv_scroll = tv.clone();
-                    glib::idle_add_local(move || {
-                        let buffer = tv_scroll.buffer();
-                        if let Some(mark) = buffer.mark("insert") {
-                            tv_scroll.scroll_to_mark(&mark, 0.0, true, 0.0, 1.0);
-                        }
-                        glib::ControlFlow::Break
-                    });
-                }
-            }
-        }
-        glib::ControlFlow::Continue
+        gtk::glib::ControlFlow::Continue
     });
 
-    // CONTROLLERS
-    let itx = input_tx.clone();
-    let tv_for_key = text_view.clone();
-    let key_controller = EventControllerKey::new();
-    key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
-    let s_arc_key = ts_weak.clone();
-    let original_font_size = font_size_u32;
-    let sid_for_key = sid_for_menu.clone();
-    let nb_key = notebook.clone();
-    let sb_key = search_bar_init_clone.clone();
-    let se_key = search_entry_init_clone.clone();
-    key_controller.connect_key_pressed(move |_controller, keyval, _keycode, state| {
-        let is_ctrl = state.contains(gtk::gdk::ModifierType::CONTROL_MASK);
-        let is_shift = state.contains(gtk::gdk::ModifierType::SHIFT_MASK);
-        let is_cmd = state.contains(gtk::gdk::ModifierType::META_MASK) || state.contains(gtk::gdk::ModifierType::SUPER_MASK);
-
-        let is_copy = (is_ctrl && is_shift && (keyval == gtk::gdk::Key::c || keyval == gtk::gdk::Key::C)) ||
-                      (is_cmd && (keyval == gtk::gdk::Key::c || keyval == gtk::gdk::Key::C));
-        let is_paste = (is_ctrl && is_shift && (keyval == gtk::gdk::Key::v || keyval == gtk::gdk::Key::V)) ||
-                       (is_cmd && (keyval == gtk::gdk::Key::v || keyval == gtk::gdk::Key::V));
-        let is_zoom_in = (is_ctrl || is_cmd) && (keyval == gtk::gdk::Key::equal || keyval == gtk::gdk::Key::plus || keyval == gtk::gdk::Key::KP_Add);
-        let is_zoom_out = (is_ctrl || is_cmd) && (keyval == gtk::gdk::Key::minus || keyval == gtk::gdk::Key::KP_Subtract);
-        let is_zoom_reset = (is_ctrl || is_cmd) && (keyval == gtk::gdk::Key::_0 || keyval == gtk::gdk::Key::KP_0);
-        let is_clear = (is_ctrl || is_cmd) && (keyval == gtk::gdk::Key::k || keyval == gtk::gdk::Key::K);
-        let is_find = (is_ctrl || is_cmd) && (keyval == gtk::gdk::Key::f || keyval == gtk::gdk::Key::F);
-        let is_close = (is_ctrl || is_cmd) && (keyval == gtk::gdk::Key::w || keyval == gtk::gdk::Key::W);
-
-        if is_close {
-            if let Some(pos) = nb_key.current_page() {
-                nb_key.remove_page(Some(pos));
-                if nb_key.n_pages() == 0 {
-                    if let Some(win) = nb_key.root().and_then(|r| r.downcast::<gtk::Window>().ok()) {
-                        win.close();
-                    }
-                }
-            }
-            return glib::Propagation::Stop;
-        }
-
-        if is_find {
-            sb_key.set_visible(!sb_key.get_visible());
-            if sb_key.get_visible() { se_key.grab_focus(); }
-            return glib::Propagation::Stop;
-        }
-
-        if is_copy {
-            let clipboard = tv_for_key.clipboard();
-            if let Some((start, end)) = tv_for_key.buffer().selection_bounds() {
-                let text = tv_for_key.buffer().text(&start, &end, false);
-                clipboard.set_text(&text);
-            }
-            return glib::Propagation::Stop;
-        } else if is_paste {
-            let clipboard = tv_for_key.clipboard();
-            let itx_clone = itx.clone();
-            let ts_paste = s_arc_key.clone();
-            clipboard.read_text_async(None::<&gtk::gio::Cancellable>, move |result| {
-                if let Ok(Some(text)) = result {
-                    let is_bracketed = ts_paste.lock().unwrap().bracketed_paste_mode;
-                    let mut data = Vec::new();
-                    if is_bracketed { data.extend_from_slice(b"\x1b[200~"); }
-                    data.extend_from_slice(text.as_bytes());
-                    if is_bracketed { data.extend_from_slice(b"\x1b[201~"); }
-                    let _ = itx_clone.send(ConnectionControl::Input(data));
-                }
-            });
-            return glib::Propagation::Stop;
-        } else if is_clear {
-            let mut state = s_arc_key.lock().unwrap();
-            let mut p_end = state.primary_buffer.end_iter();
-            let mut p_start = state.primary_buffer.start_iter();
-            state.primary_buffer.delete(&mut p_start, &mut p_end);
-            let mut a_end = state.alternate_buffer.end_iter();
-            let mut a_start = state.alternate_buffer.start_iter();
-            state.alternate_buffer.delete(&mut a_start, &mut a_end);
-            state.cursor_x = 0; state.cursor_y = 0;
-            state.alt_cursor_x = 0; state.alt_cursor_y = 0;
-            return glib::Propagation::Stop;
-        } else if is_zoom_in || is_zoom_out || is_zoom_reset {
-            let sid_to_update = sid_for_key.clone();
-            ACTIVE_TERMINALS.with(|at| {
-                let mut list = at.borrow_mut();
-                if let Some(term) = list.iter_mut().find(|t| t.session_id == sid_to_update) {
-                    let mut sessions = load_sessions();
-                    if let Some(s) = sessions.iter_mut().find(|s| s.name == sid_to_update) {
-                        let new_size = if is_zoom_reset { original_font_size as i32 } 
-                                     else if is_zoom_in { s.font_size + 1 } 
-                                     else { (s.font_size - 1).clone().max(6) };
-                        s.font_size = new_size;
-                        let css = format!("textview, textview text {{ background-color: {0}; background: {0}; color: {1}; font-size: {2}pt; }}", s.bg_color, s.fg_color, new_size);
-                        term.css_provider.load_from_data(&css);
-                        save_sessions(&sessions);
-                    }
-                }
-            });
-            return glib::Propagation::Stop;
-        }
-        if let Some(data) = keyval_to_bytes(keyval, state) {
-            let _ = itx.send(ConnectionControl::Input(data));
-            return glib::Propagation::Stop;
-        }
-        glib::Propagation::Proceed
-    });
-    text_view.add_controller(key_controller);
-
-    let scroll_controller = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
-    let s_arc_scroll = ts_weak.clone();
-    let itx_scroll = input_tx.clone();
-    scroll_controller.connect_scroll(move |_controller, _dx, dy| {
-        let ts = s_arc_scroll.lock().unwrap();
-        if ts.mouse_tracking_mode > 0 {
-            let button = if dy < 0.0 { 64 } else { 65 };
-            let sgr = format!("\x1b[<{};1;1M", button);
-            let _ = itx_scroll.send(ConnectionControl::Input(sgr.into_bytes()));
-            return glib::Propagation::Stop;
-        }
-        glib::Propagation::Proceed
-    });
-    text_view.add_controller(scroll_controller);
-
-    let click_controller = gtk::GestureClick::new();
-    click_controller.set_button(0); 
-    let s_arc_click = ts_weak.clone();
-    let itx_click = input_tx.clone();
-    let tv_click = text_view.clone();
-    
-    click_controller.connect_pressed(move |gesture, n_press, x, y| {
-        let ts = s_arc_click.lock().unwrap();
-        if n_press == 2 {
-            // Double click: Selection
-            let buffer = tv_click.buffer();
-            if let Some(mut start) = tv_click.iter_at_location(x as i32, y as i32) {
-                let mut end = start.clone();
-                if !start.starts_word() { start.backward_word_start(); }
-                if !end.ends_word() { end.forward_word_end(); }
-                buffer.select_range(&start, &end);
-            }
-            return;
-        }
-
-        if ts.mouse_tracking_mode > 0 {
-            let button = match gesture.current_button() { 1 => 0, 2 => 1, 3 => 2, _ => 0 };
-            let col = (x as f32 / ts.char_width).max(0.0) as u32 + 1;
-            let row = (y as f32 / ts.char_height).max(0.0) as u32 + 1;
-            let sgr = format!("\x1b[<{};{};{}M", button, col, row);
-            let _ = itx_click.send(ConnectionControl::Input(sgr.into_bytes()));
-            gesture.set_state(gtk::EventSequenceState::Claimed);
-        } else {
-            // Check for link click
-            if let Some(iter) = tv_click.iter_at_location(x as i32, y as i32) {
-                let tags = iter.tags();
-                for tag in tags {
-                    if let Some(name) = tag.name() {
-                        if name.starts_with("url:") {
-                            let url = name.strip_prefix("url:").unwrap().to_string();
-                            let _ = gtk::gio::AppInfo::launch_default_for_uri(&url, None::<&gtk::gio::AppLaunchContext>);
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-    });
-
-    let motion_controller = gtk::EventControllerMotion::new();
-    let tv_motion = text_view.clone();
-    motion_controller.connect_motion(move |_controller, x, y| {
-        if let Some(iter) = tv_motion.iter_at_location(x as i32, y as i32) {
-            let tags = iter.tags();
-            let mut is_link = false;
-            for tag in tags {
-                if let Some(name) = tag.name() {
-                    if name.starts_with("url:") { is_link = true; break; }
-                }
-            }
-            if is_link {
-                tv_motion.set_cursor_from_name(Some("pointer"));
-            } else {
-                tv_motion.set_cursor_from_name(Some("text"));
-            }
-        }
-    });
-    text_view.add_controller(motion_controller);
-
-    let s_arc_release = ts_weak.clone();
-    let itx_release = input_tx.clone();
-    click_controller.connect_released(move |gesture, _n_press, x, y| {
-        let ts = s_arc_release.lock().unwrap();
-        if ts.mouse_tracking_mode > 0 {
-            let button = match gesture.current_button() { 1 => 0, 2 => 1, 3 => 2, _ => 0 };
-            let col = (x as f32 / ts.char_width).max(0.0) as u32 + 1;
-            let row = (y as f32 / ts.char_height).max(0.0) as u32 + 1;
-            let sgr = format!("\x1b[<{};{};{}m", button, col, row);
-            let _ = itx_release.send(ConnectionControl::Input(sgr.into_bytes()));
-            gesture.set_state(gtk::EventSequenceState::Claimed);
-        }
-    });
-    text_view.add_controller(click_controller);
-
-    // CONNECTION LOGIC
-    let _sid_for_thread = settings.name.clone();
     let s_clone = settings.clone();
     let final_pass = override_pass.clone();
     let (event_tx, event_rx) = flume::unbounded::<SshEvent>();
 
+    // Shared Emulation Loop
+    let output_tx_shared = output_tx.clone();
+    let input_rx_shared = input_rx.clone();
     std::thread::spawn(move || {
-        match connect_ssh(&s_clone.host, s_clone.port, &s_clone.username, final_pass.as_deref().unwrap_or(""), s_clone.private_key.as_deref(), s_clone.keepalive, s_clone.agent_forwarding, &s_clone.term_type, Some(event_tx)) {
-            Ok((session, mut channel)) => {
-                let _ = output_tx.send(b"Connection established.\r\n".to_vec());
+        let mut backend: Option<TerminalBackend> = None;
+        let mut buffer = [0u8; 8192];
 
-                // PARSE LOCAL FORWARDS
-                let mut local_listeners = Vec::new();
-                for forward in s_clone.local_forwards.split(',') {
-                    let parts: Vec<&str> = forward.trim().split(':').collect();
-                    if parts.len() == 3 {
-                        if let (Ok(l_port), Ok(r_port)) = (parts[0].parse::<u16>(), parts[2].parse::<u16>()) {
-                            let r_host = parts[1].to_string();
-                            if let Ok(listener) = std::net::TcpListener::bind(format!("127.0.0.1:{}", l_port)) {
-                                let _ = listener.set_nonblocking(true);
-                                local_listeners.push((listener, r_host, r_port));
-                                let _ = output_tx.send(format!("-L {}:{}:{} forwarded.\r\n", l_port, parts[1], r_port).into_bytes());
-                            }
+        loop {
+            if let Some(ref mut b) = backend {
+                match b {
+                    TerminalBackend::Local(_) => {
+                        // Handled by background thread
+                    }
+                    TerminalBackend::Ssh(channel) => {
+                        match channel.read(&mut buffer) {
+                            Ok(0) => { backend = None; let _ = output_tx_shared.send(b"\r\n[SSH connection closed]\r\n".to_vec()); }
+                            Ok(n) => { let _ = output_tx_shared.send(buffer[..n].to_vec()); }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(_) => { backend = None; }
                         }
                     }
                 }
-
-                // PARSE REMOTE FORWARDS
-                let mut remote_listeners = Vec::new();
-                for forward in s_clone.remote_forwards.split(',') {
-                    let parts: Vec<&str> = forward.trim().split(':').collect();
-                    if parts.len() == 3 {
-                        if let (Ok(r_port), Ok(l_port)) = (parts[0].parse::<u16>(), parts[2].parse::<u16>()) {
-                            let l_host = parts[1].to_string();
-                            match session.channel_forward_listen(r_port, Some("0.0.0.0"), None) {
-                                Ok((listener, _bound_port)) => {
-                                    remote_listeners.push((listener, l_host, l_port));
-                                    let _ = output_tx.send(format!("-R {}:{}:{} forwarded.\r\n", r_port, parts[1], l_port).into_bytes());
-                                }
-                                Err(e) => {
-                                    let _ = output_tx.send(format!("-R proxy failed to bind remote port {}: {}\r\n", r_port, e).into_bytes());
-                                }
-                            }
-                        }
-                    }
-                }
-
-                let _ = session.set_blocking(false);
-                let mut buffer = [0; 8192];
-                let mut active_local_tunnels: Vec<(std::net::TcpStream, ssh2::Channel)> = Vec::new();
-                let mut active_remote_tunnels: Vec<(std::net::TcpStream, ssh2::Channel)> = Vec::new();
-                
-                loop {
-                    match channel.read(&mut buffer) {
-                        Ok(0) => break,
-                        Ok(size) => { let _ = output_tx.send(buffer[..size].to_vec()); }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            while let Ok(ctrl) = input_rx.try_recv() {
-                                match ctrl {
-                                    ConnectionControl::Input(data) => {
-                                        let mut pos = 0;
-                                        while pos < data.len() {
-                                            match channel.write(&data[pos..]) {
-                                                Ok(written) => pos += written,
-                                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                                                Err(_) => break,
-                                            }
-                                        }
-                                    },
-                                    ConnectionControl::Resize(cols, rows, width_px, height_px) => {
-                                        let _ = channel.request_pty_size(cols, rows, Some(width_px), Some(height_px));
-                                    },
-                                    ConnectionControl::SetSsh(_, _) => (),
-                                }
-                                let _ = channel.flush();
-                            }
-                            
-                            for (listener, r_host, r_port) in &local_listeners {
-                                if let Ok((tcp_stream, _addr)) = listener.accept() {
-                                    let _ = tcp_stream.set_nonblocking(true);
-                                    let _ = session.set_blocking(true);
-                                    if let Ok(forward_channel) = session.channel_direct_tcpip(r_host, *r_port, None) {
-                                        active_local_tunnels.push((tcp_stream, forward_channel));
-                                    }
-                                    let _ = session.set_blocking(false);
-                                }
-                            }
-                            
-                            for (listener, l_host, l_port) in &mut remote_listeners {
-                                match listener.accept() {
-                                    Ok(forward_channel) => {
-                                        if let Ok(tcp_stream) = std::net::TcpStream::connect(format!("{}:{}", l_host, l_port)) {
-                                            let _ = tcp_stream.set_nonblocking(true);
-                                            active_remote_tunnels.push((tcp_stream, forward_channel));
-                                        }
-                                    }
-                                    Err(_) => {}
-                                }
-                            }
-                            
-                            let mut drop_local_idx = Vec::new();
-                            for (idx, (tcp, ch)) in active_local_tunnels.iter_mut().enumerate() {
-                                match tcp.read(&mut buffer) {
-                                    Ok(0) => drop_local_idx.push(idx),
-                                    Ok(size) => { let _ = ch.write_all(&buffer[..size]); }
-                                    Err(_) => ()
-                                }
-                                match ch.read(&mut buffer) {
-                                    Ok(size) => { let _ = tcp.write_all(&buffer[..size]); }
-                                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => if !drop_local_idx.contains(&idx) { drop_local_idx.push(idx) },
-                                    Err(_) => ()
-                                }
-                            }
-                            for idx in drop_local_idx.into_iter().rev() { active_local_tunnels.remove(idx); }
-                            
-                            let mut drop_remote_idx = Vec::new();
-                            for (idx, (tcp, ch)) in active_remote_tunnels.iter_mut().enumerate() {
-                                match ch.read(&mut buffer) {
-                                    Ok(size) => { let _ = tcp.write_all(&buffer[..size]); }
-                                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => drop_remote_idx.push(idx),
-                                    Err(_) => ()
-                                }
-                                match tcp.read(&mut buffer) {
-                                    Ok(0) => if !drop_remote_idx.contains(&idx) { drop_remote_idx.push(idx) },
-                                    Ok(size) => { let _ = ch.write_all(&buffer[..size]); }
-                                    Err(_) => ()
-                                }
-                            }
-                            for idx in drop_remote_idx.into_iter().rev() { active_remote_tunnels.remove(idx); }
-
-                            std::thread::sleep(Duration::from_millis(10));
-                        }
-                        Err(_) => break,
-                    }
-                }
-                let _ = output_tx.send(b"\r\n[Connection closed]\r\n".to_vec());
             }
-            Err(e) => {
-                let _ = output_tx.send(format!("Connection failed: {}\r\n", e).as_bytes().to_vec());
+
+            while let Ok(ctrl) = input_rx_shared.try_recv() {
+                match ctrl {
+                    ConnectionControl::SetBackend(b) => {
+                        backend = Some(b);
+                    }
+                    ConnectionControl::Input(data) => {
+                        if let Some(ref mut b) = backend {
+                            match b {
+                                TerminalBackend::Local(local) => { let _ = local.writer.write_all(&data); let _ = local.writer.flush(); }
+                                TerminalBackend::Ssh(channel) => { let _ = channel.write_all(&data); let _ = channel.flush(); }
+                            }
+                        }
+                    }
+                    ConnectionControl::Resize(cols, rows, width_px, height_px) => {
+                        if let Some(ref mut b) = backend {
+                            match b {
+                                TerminalBackend::Local(local) => {
+                                    let _ = local.master.resize(portable_pty::PtySize {
+                                        rows: rows as u16,
+                                        cols: cols as u16,
+                                        pixel_width: width_px as u16,
+                                        pixel_height: height_px as u16,
+                                    });
+                                }
+                                TerminalBackend::Ssh(channel) => {
+                                    let _ = channel.request_pty_size(cols, rows, Some(width_px), Some(height_px));
+                                }
+                            }
+                        }
+                    }
+                }
             }
+            std::thread::sleep(Duration::from_millis(10));
         }
     });
 
+    if is_local {
+        let itx_l = input_tx.clone();
+        let otx_l = output_tx.clone();
+        std::thread::spawn(move || {
+            match spawn_local_shell(80, 24) {
+                Ok((local, mut reader)) => {
+                    let _ = otx_l.send(b"Local shell spawned.\r\n".to_vec());
+                    let _ = itx_l.send(ConnectionControl::SetBackend(TerminalBackend::Local(local)));
+
+                    let otx_bg = otx_l.clone();
+                    std::thread::spawn(move || {
+                        let mut buf = [0u8; 8192];
+                        loop {
+                            match reader.read(&mut buf) {
+                                Ok(0) => { let _ = otx_bg.send(b"\r\n[Local shell closed]\r\n".to_vec()); break; }
+                                Ok(n) => { let _ = otx_bg.send(buf[..n].to_vec()); }
+                                Err(_) => break,
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    let _ = otx_l.send(format!("Failed to spawn local shell: {}\r\n", e).into_bytes());
+                }
+            }
+        });
+    } else {
+        let itx_s = input_tx.clone();
+        let otx_s = output_tx.clone();
+        let otx_s2 = output_tx.clone();
+        std::thread::spawn(move || {
+            match connect_ssh(&s_clone, final_pass.as_deref().unwrap_or(""), Some(event_tx), otx_s2) {
+                Ok((session, channel)) => {
+                    let _ = otx_s.send(b"Connection established.\r\n".to_vec());
+                    let _ = session.set_blocking(false);
+                    let _ = itx_s.send(ConnectionControl::SetBackend(TerminalBackend::Ssh(channel)));
+                }
+                Err(e) => {
+                    let _ = otx_s.send(format!("Connection failed: {}\r\n", e).as_bytes().to_vec());
+                }
+            }
+        });
+    }
+
     // EVENT LISTENER
     let tv_for_event = text_view.clone();
-    glib::timeout_add_local(Duration::from_millis(100), move || {
+    gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
         while let Ok(event) = event_rx.try_recv() {
             match event {
                 SshEvent::HostKeyVerify { host, port, fingerprint, response } => {
@@ -754,6 +336,6 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
                 }
             }
         }
-        glib::ControlFlow::Continue
+        gtk::glib::ControlFlow::Continue
     });
 }

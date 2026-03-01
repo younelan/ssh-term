@@ -42,6 +42,33 @@ pub struct ConnectionSettings {
     pub remote_forwards: String,
 }
 
+impl Default for ConnectionSettings {
+    fn default() -> Self {
+        Self {
+            name: "Local Shell".to_string(),
+            host: "localhost".to_string(),
+            port: 0,
+            username: "local".to_string(),
+            password: None,
+            fg_color: "#ffffff".to_string(),
+            bg_color: "#000000".to_string(),
+            font_size: 14,
+            palette: THEMES[0].palette.iter().map(|s| s.to_string()).collect(),
+            cursor_style: "Block".to_string(),
+            cursor_blink: true,
+            scrollback: 1000,
+            private_key: None,
+            keepalive: 0,
+            agent_forwarding: false,
+            theme: "Basic".to_string(),
+            method: 0,
+            term_type: "xterm-256color".to_string(),
+            local_forwards: String::new(),
+            remote_forwards: String::new(),
+        }
+    }
+}
+
 fn default_keepalive() -> u32 { 0 }
 fn default_theme() -> String { "Default".to_string() }
 fn default_method() -> u32 { 0 }

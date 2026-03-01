@@ -316,7 +316,7 @@ fn setup_sessions_actions(app: &Application, menu: &gio::Menu) {
         let s_clone = s.clone();
         action.connect_activate(move |_, _| {
             if let Some(app) = app_weak.upgrade() {
-                handle_connect(&app, &s_clone, s_clone.password.clone());
+                handle_connect(&app, &s_clone, s_clone.password.clone(), false);
             }
         });
         app.add_action(&action);
@@ -448,6 +448,8 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
     let btn_box = GtkBox::new(Orientation::Horizontal, 12);
     let connect_btn = Button::builder().label("Connect").css_classes(["suggested-action"]).hexpand(true).build();
     btn_box.append(&connect_btn);
+    let local_btn = Button::builder().label("Local Shell").css_classes(["suggested-action"]).build();
+    btn_box.append(&local_btn);
     let save_btn = Button::builder().label("Save").css_classes(["secondary-action"]).build();
     btn_box.append(&save_btn);
     conn_page.append(&btn_box);
@@ -720,7 +722,14 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
             term_type: term_item,
             local_forwards: lf_str,
             remote_forwards: rf_str,
-        }, if pass.is_empty() { None } else { Some(pass) });
+        }, if pass.is_empty() { None } else { Some(pass) }, false);
+    });
+
+    let app_clone_local = app.clone();
+    local_btn.connect_clicked(move |_| {
+        let mut local_set = ConnectionSettings::default();
+        local_set.name = "Local Shell".to_string();
+        handle_connect(&app_clone_local, &local_set, None, true);
     });
 
     window.connect_destroy(move |_| {
@@ -728,28 +737,27 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
         TARGET_NB.with(|cell| *cell.borrow_mut() = glib::object::WeakRef::new());
     });
     
-    window.set_hide_on_close(true);
     CONN_WIN.with(|cell| *cell.borrow_mut() = Some(window.clone()));
     window.present();
 }
 
-fn handle_connect(app: &Application, settings: &ConnectionSettings, override_pass: Option<String>) {
+fn handle_connect(app: &Application, settings: &ConnectionSettings, override_pass: Option<String>, is_local: bool) {
     let target = TARGET_NB.with(|cell| cell.borrow().upgrade());
     if let Some(nb) = target {
-        add_terminal_tab(&nb, settings, override_pass);
+        add_terminal_tab(nb.upcast_ref::<gtk::Widget>(), settings.clone(), override_pass.clone(), is_local);
         TARGET_NB.with(|cell| *cell.borrow_mut() = glib::object::WeakRef::new());
         if let Some(win) = nb.root().and_then(|r| r.downcast::<gtk::Window>().ok()) {
             win.present();
         }
         if let Some(win) = CONN_WIN.with(|cell| cell.borrow().clone()) {
-            win.close();
+            win.destroy();
         }
     } else {
-        create_terminal_window(app, settings, override_pass);
+        create_terminal_window(app, settings, override_pass, is_local);
     }
 }
 
-fn create_terminal_window(app: &Application, settings: &ConnectionSettings, override_pass: Option<String>) {
+fn create_terminal_window(app: &Application, settings: &ConnectionSettings, override_pass: Option<String>, is_local: bool) {
     let window = ApplicationWindow::builder().application(app).title(&format!("Terminal SSH: {}", settings.name)).default_width(1000).default_height(750).build();
     let header = HeaderBar::new();
     header.set_show_title_buttons(true);
@@ -758,6 +766,7 @@ fn create_terminal_window(app: &Application, settings: &ConnectionSettings, over
     menu.append(Some("New Tab (Same Host)"), Some("win.new_tab_same"));
     menu.append(Some("New Tab (Other Host)"), Some("win.new_tab_other"));
     menu.append(Some("New Connection (New Window)"), Some("win.new_window"));
+    menu.append(Some("New Local Terminal"), Some("win.new_tab_local"));
     
     let menu_btn = MenuButton::builder().icon_name("list-add-symbolic").menu_model(&menu).tooltip_text("New Connection Options").build();
     header.pack_start(&menu_btn);
@@ -785,7 +794,7 @@ fn create_terminal_window(app: &Application, settings: &ConnectionSettings, over
     let action_same = gio::SimpleAction::new("new_tab_same", None);
     action_same.connect_activate(move |_, _| {
         if let Some(nb) = nb_weak.upgrade() {
-            add_terminal_tab(&nb, &s_clone, p_clone.clone());
+            add_terminal_tab(nb.upcast_ref::<gtk::Widget>(), s_clone.clone(), p_clone.clone(), false);
         }
     });
     window.add_action(&action_same);
@@ -809,6 +818,18 @@ fn create_terminal_window(app: &Application, settings: &ConnectionSettings, over
     });
     window.add_action(&action_window);
 
-    add_terminal_tab(&notebook, settings, override_pass);
+    let nb_weak3 = notebook.downgrade();
+    let s_local = settings.clone();
+    let action_local = gio::SimpleAction::new("new_tab_local", None);
+    action_local.connect_activate(move |_, _| {
+        if let Some(nb) = nb_weak3.upgrade() {
+            let mut local_set = s_local.clone();
+            local_set.name = "Local Shell".to_string();
+            add_terminal_tab(nb.upcast_ref::<gtk::Widget>(), local_set, None, true);
+        }
+    });
+    window.add_action(&action_local);
+
+    add_terminal_tab(notebook.upcast_ref::<gtk::Widget>(), settings.clone(), override_pass, is_local);
     window.present();
 }
