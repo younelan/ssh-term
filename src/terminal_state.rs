@@ -1,3 +1,4 @@
+use std::time::Duration;
 use gtk4 as gtk;
 use gtk::{glib, Label, TextBuffer, TextTag, TextView};
 use gtk::prelude::*;
@@ -79,6 +80,10 @@ impl TerminalState {
         let st_tag = TextTag::new(Some("strikethrough"));
         st_tag.set_strikethrough(true);
         tag_table.add(&st_tag);
+
+        let link_tag = TextTag::new(Some("link"));
+        link_tag.set_underline(gtk::pango::Underline::Single);
+        tag_table.add(&link_tag);
         
         Self { 
             primary_buffer, 
@@ -235,6 +240,20 @@ impl TerminalState {
         let iter = self.ensure_cursor_position(cx, cy);
         buffer.place_cursor(&iter);
     }
+
+    pub fn bell(&mut self) {
+        if let Some(tv) = self.view.upgrade() {
+            let context = tv.style_context();
+            context.add_class("bell-flash");
+            glib::timeout_add_local(Duration::from_millis(100), move || {
+                context.remove_class("bell-flash");
+                glib::ControlFlow::Break
+            });
+        }
+        if let Some(display) = gtk::gdk::Display::default() {
+            display.beep();
+        }
+    }
 }
 
 use unicode_width::UnicodeWidthChar;
@@ -243,7 +262,6 @@ impl Perform for TerminalState {
     fn print(&mut self, c: char) {
         let width = c.width().unwrap_or(0);
         if width == 0 {
-            // Combining character or zero-width: just insert it at current position without advancing
             let cx = if self.is_alternate { self.alt_cursor_x } else { self.cursor_x };
             let cy = if self.is_alternate { self.alt_cursor_y } else { self.cursor_y };
             let mut iter = self.ensure_cursor_position(cx, cy);
@@ -262,7 +280,6 @@ impl Perform for TerminalState {
         let mut iter = self.ensure_cursor_position(cx, cy);
         let buffer = self.active_buffer();
         
-        // Delete characters to make room for the new width
         let mut del_iter = iter.clone();
         for _ in 0..width {
             if !del_iter.ends_line() {
@@ -286,15 +303,27 @@ impl Perform for TerminalState {
         
         let buffer = self.active_buffer();
         if !self.current_tags.is_empty() {
-            let end_iter = buffer.iter_at_offset(start_offset + 1);
             for tag_name in &self.current_tags {
-                if let Some(tag) = buffer.tag_table().lookup(tag_name) {
-                    buffer.apply_tag(&tag, &start_iter, &end_iter);
+                if tag_name.starts_with("url:") {
+                    if let Some(tag) = buffer.tag_table().lookup("link") {
+                        buffer.apply_tag(&tag, &start_iter, &iter);
+                    }
+                    if buffer.tag_table().lookup(tag_name).is_none() {
+                        let url_tag = TextTag::new(Some(tag_name));
+                        buffer.tag_table().add(&url_tag);
+                    }
+                    if let Some(tag) = buffer.tag_table().lookup(tag_name) {
+                        buffer.apply_tag(&tag, &start_iter, &iter);
+                    }
+                } else if let Some(tag) = buffer.tag_table().lookup(tag_name) {
+                    buffer.apply_tag(&tag, &start_iter, &iter);
                 }
             }
         }
         self.update_visual_cursor();
     }
+
+    // Removal of broken trait hook
 
     fn execute(&mut self, byte: u8) {
         match byte {
@@ -585,18 +614,6 @@ impl Perform for TerminalState {
         self.update_visual_cursor();
     }
 
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        if params.len() >= 2 {
-            if params[0] == b"0" || params[0] == b"1" || params[0] == b"2" {
-                if let Ok(title) = std::str::from_utf8(params[1]) {
-                    if let Some(lbl) = self.tab_label.upgrade() {
-                        lbl.set_text(title);
-                    }
-                }
-            }
-        }
-    }
-
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
         if intermediates.is_empty() {
             match byte {
@@ -613,7 +630,6 @@ impl Perform for TerminalState {
                     }
                 }
                 b'D' => {
-                    // Index (IND)
                     let cy = if self.is_alternate { self.alt_cursor_y } else { self.cursor_y };
                     if cy == self.scroll_bottom && self.scroll_bottom != usize::MAX {
                         let top = self.scroll_top;
@@ -630,7 +646,6 @@ impl Perform for TerminalState {
                     }
                 }
                 b'M' => {
-                    // Reverse Index (RI)
                     let cy = if self.is_alternate { self.alt_cursor_y } else { self.cursor_y };
                     if cy == self.scroll_top {
                         let bottom = if self.scroll_bottom == usize::MAX { self.active_buffer().line_count().saturating_sub(1) as usize } else { self.scroll_bottom };
@@ -654,5 +669,25 @@ impl Perform for TerminalState {
             }
         }
         self.update_visual_cursor();
+    }
+
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        if params.len() >= 2 {
+            if params[0] == b"0" || params[0] == b"1" || params[0] == b"2" {
+                if let Ok(title) = std::str::from_utf8(params[1]) {
+                    if let Some(lbl) = self.tab_label.upgrade() {
+                        lbl.set_text(title);
+                    }
+                }
+            } else if params[0] == b"8" {
+                let url = if params.len() > 2 { std::str::from_utf8(params[2]).unwrap_or("") } else { "" };
+                if !url.is_empty() {
+                    self.current_tags.retain(|t| !t.starts_with("url:"));
+                    self.current_tags.push(format!("url:{}", url));
+                } else {
+                    self.current_tags.retain(|t| !t.starts_with("url:"));
+                }
+            }
+        }
     }
 }

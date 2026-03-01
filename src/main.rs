@@ -212,6 +212,20 @@ fn apply_app_theme(theme_name: &str) {
             background-color: transparent; 
             color: inherit; 
         }}
+
+        .search-bar {{
+            background: {2};
+            padding: 6px;
+            border-radius: 8px;
+            border: 1px solid alpha({1}, 0.1);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+        }}
+        .search-bar entry {{
+            border-radius: 6px;
+        }}
+        .bell-flash {{
+            background-color: alpha({1}, 0.2);
+        }}
         "#,
         bg, fg, hb_bg
     );

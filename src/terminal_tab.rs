@@ -7,7 +7,7 @@ use gtk4 as gtk;
 use gtk::prelude::*;
 use gtk::{
     glib, Label, Notebook, ScrolledWindow, TextView, CssProvider, 
-    EventControllerKey, Orientation, Box as GtkBox
+    EventControllerKey, Orientation, Box as GtkBox, Button
 };
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
@@ -123,10 +123,53 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
         .hscrollbar_policy(gtk::PolicyType::Never)
         .build();
     let label = Label::new(Some(&settings.name));
-    let label_box = GtkBox::new(Orientation::Horizontal, 0);
+    let close_btn = Button::builder()
+        .icon_name("window-close-symbolic")
+        .css_classes(["flat"])
+        .focus_on_click(false)
+        .build();
+    let label_box = GtkBox::new(Orientation::Horizontal, 4);
     label_box.append(&label);
+    label_box.append(&close_btn);
     
-    let index = notebook.append_page(&scrolled, Some(&label_box));
+    let overlay = gtk::Overlay::new();
+    let search_bar = GtkBox::new(Orientation::Horizontal, 6);
+    search_bar.set_valign(gtk::Align::Start);
+    search_bar.set_halign(gtk::Align::End);
+    search_bar.set_margin_top(10);
+    search_bar.set_margin_end(10);
+    search_bar.set_visible(false);
+    search_bar.add_css_class("search-bar");
+
+    let search_entry = gtk::SearchEntry::builder().width_request(200).build();
+    let next_btn = gtk::Button::builder().icon_name("go-down-symbolic").build();
+    let prev_btn = gtk::Button::builder().icon_name("go-up-symbolic").build();
+    let close_search = gtk::Button::builder().icon_name("window-close-symbolic").build();
+    
+    search_bar.append(&search_entry);
+    search_bar.append(&prev_btn);
+    search_bar.append(&next_btn);
+    search_bar.append(&close_search);
+    
+    overlay.set_child(Some(&scrolled));
+    overlay.add_overlay(&search_bar);
+    
+    notebook.append_page(&overlay, Some(&label_box));
+    let index = notebook.page_num(&overlay).unwrap();
+    notebook.set_tab_reorderable(&overlay, true);
+
+    let nb_close = notebook.clone();
+    let ov_close = overlay.clone();
+    close_btn.connect_clicked(move |_| {
+        let idx = nb_close.page_num(&ov_close).unwrap();
+        nb_close.remove_page(Some(idx));
+        if nb_close.n_pages() == 0 {
+            if let Some(win) = nb_close.root().and_then(|r| r.downcast::<gtk::Window>().ok()) {
+                win.close();
+            }
+        }
+    });
+
     notebook.set_current_page(Some(index));
     text_view.grab_focus();
 
@@ -185,6 +228,62 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
     let (output_tx, output_rx) = flume::unbounded::<Vec<u8>>();
     
     let term_state = Arc::new(Mutex::new(TerminalState::new(text_view.downgrade(), label.downgrade(), settings.palette.clone())));
+    let ts_weak = term_state.clone();
+
+    // SEARCH LOGIC (Moved here after ts_weak)
+    let search_bar_init_clone = search_bar.clone();
+    let search_entry_init_clone = search_entry.clone();
+    close_search.connect_clicked({
+        let search_bar_init_clone = search_bar_init_clone.clone();
+        move |_| {
+            search_bar_init_clone.set_visible(false);
+        }
+    });
+
+    let tv_search = text_view.clone();
+    let ts_search_cl = ts_weak.clone();
+    search_entry.connect_search_changed(move |entry| {
+        let text = entry.text().to_string();
+        if text.is_empty() {
+            let cursor_x = ts_search_cl.lock().unwrap().cursor_x as i32;
+            tv_search.buffer().select_range(&tv_search.buffer().iter_at_offset(cursor_x), &tv_search.buffer().iter_at_offset(cursor_x));
+            return;
+        }
+        let buffer = tv_search.buffer();
+        let start = buffer.start_iter();
+        if let Some((mut m_start, m_end)) = start.forward_search(&text, gtk::TextSearchFlags::CASE_INSENSITIVE, None) {
+            buffer.select_range(&m_start, &m_end);
+            tv_search.scroll_to_iter(&mut m_start, 0.0, false, 0.0, 0.0);
+        }
+    });
+
+    let tv_next = text_view.clone();
+    let se_next = search_entry.clone();
+    next_btn.connect_clicked(move |_| {
+        let text = se_next.text().to_string();
+        if text.is_empty() { return; }
+        let buffer = tv_next.buffer();
+        if let Some((_, mut cursor)) = buffer.selection_bounds() {
+            if let Some((mut m_start, m_end)) = cursor.forward_search(&text, gtk::TextSearchFlags::CASE_INSENSITIVE, None) {
+                buffer.select_range(&m_start, &m_end);
+                tv_next.scroll_to_iter(&mut m_start, 0.0, false, 0.0, 0.0);
+            }
+        }
+    });
+
+    let tv_prev = text_view.clone();
+    let se_prev = search_entry.clone();
+    prev_btn.connect_clicked(move |_| {
+        let text = se_prev.text().to_string();
+        if text.is_empty() { return; }
+        let buffer = tv_prev.buffer();
+        if let Some((mut cursor, _)) = buffer.selection_bounds() {
+            if let Some((mut m_start, m_end)) = cursor.backward_search(&text, gtk::TextSearchFlags::CASE_INSENSITIVE, None) {
+                buffer.select_range(&m_start, &m_end);
+                tv_prev.scroll_to_iter(&mut m_start, 0.0, false, 0.0, 0.0);
+            }
+        }
+    });
     
     let sid = settings.name.clone();
     let tv_weak = text_view.downgrade();
@@ -201,14 +300,13 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
     let mut parser = Parser::new();
 
     let tv_weak = text_view.downgrade();
-    let ts_weak = term_state.clone();
     let out_rx_clone = output_rx.clone();
     let itx_resize = input_tx.clone();
     let mut last_cols = 0;
     let mut last_rows = 0;
     let font_size_u32 = settings.font_size as u32;
 
-    let ts_weak_loop = ts_weak.clone();
+    let ts_weak_loop = term_state.clone();
     glib::timeout_add_local(Duration::from_millis(20), move || {
         let tv = match tv_weak.upgrade() { Some(v) => v, None => return glib::ControlFlow::Break };
         
@@ -273,6 +371,9 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
     let s_arc_key = ts_weak.clone();
     let original_font_size = font_size_u32;
     let sid_for_key = sid_for_menu.clone();
+    let nb_key = notebook.clone();
+    let sb_key = search_bar_init_clone.clone();
+    let se_key = search_entry_init_clone.clone();
     key_controller.connect_key_pressed(move |_controller, keyval, _keycode, state| {
         let is_ctrl = state.contains(gtk::gdk::ModifierType::CONTROL_MASK);
         let is_shift = state.contains(gtk::gdk::ModifierType::SHIFT_MASK);
@@ -286,6 +387,26 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
         let is_zoom_out = (is_ctrl || is_cmd) && (keyval == gtk::gdk::Key::minus || keyval == gtk::gdk::Key::KP_Subtract);
         let is_zoom_reset = (is_ctrl || is_cmd) && (keyval == gtk::gdk::Key::_0 || keyval == gtk::gdk::Key::KP_0);
         let is_clear = (is_ctrl || is_cmd) && (keyval == gtk::gdk::Key::k || keyval == gtk::gdk::Key::K);
+        let is_find = (is_ctrl || is_cmd) && (keyval == gtk::gdk::Key::f || keyval == gtk::gdk::Key::F);
+        let is_close = (is_ctrl || is_cmd) && (keyval == gtk::gdk::Key::w || keyval == gtk::gdk::Key::W);
+
+        if is_close {
+            if let Some(pos) = nb_key.current_page() {
+                nb_key.remove_page(Some(pos));
+                if nb_key.n_pages() == 0 {
+                    if let Some(win) = nb_key.root().and_then(|r| r.downcast::<gtk::Window>().ok()) {
+                        win.close();
+                    }
+                }
+            }
+            return glib::Propagation::Stop;
+        }
+
+        if is_find {
+            sb_key.set_visible(!sb_key.get_visible());
+            if sb_key.get_visible() { se_key.grab_focus(); }
+            return glib::Propagation::Stop;
+        }
 
         if is_copy {
             let clipboard = tv_for_key.clipboard();
@@ -366,8 +487,22 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
     click_controller.set_button(0); 
     let s_arc_click = ts_weak.clone();
     let itx_click = input_tx.clone();
-    click_controller.connect_pressed(move |gesture, _n_press, x, y| {
+    let tv_click = text_view.clone();
+    
+    click_controller.connect_pressed(move |gesture, n_press, x, y| {
         let ts = s_arc_click.lock().unwrap();
+        if n_press == 2 {
+            // Double click: Selection
+            let buffer = tv_click.buffer();
+            if let Some(mut start) = tv_click.iter_at_location(x as i32, y as i32) {
+                let mut end = start.clone();
+                if !start.starts_word() { start.backward_word_start(); }
+                if !end.ends_word() { end.forward_word_end(); }
+                buffer.select_range(&start, &end);
+            }
+            return;
+        }
+
         if ts.mouse_tracking_mode > 0 {
             let button = match gesture.current_button() { 1 => 0, 2 => 1, 3 => 2, _ => 0 };
             let col = (x as f32 / ts.char_width).max(0.0) as u32 + 1;
@@ -375,8 +510,42 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
             let sgr = format!("\x1b[<{};{};{}M", button, col, row);
             let _ = itx_click.send(ConnectionControl::Input(sgr.into_bytes()));
             gesture.set_state(gtk::EventSequenceState::Claimed);
+        } else {
+            // Check for link click
+            if let Some(iter) = tv_click.iter_at_location(x as i32, y as i32) {
+                let tags = iter.tags();
+                for tag in tags {
+                    if let Some(name) = tag.name() {
+                        if name.starts_with("url:") {
+                            let url = name.strip_prefix("url:").unwrap().to_string();
+                            let _ = gtk::gio::AppInfo::launch_default_for_uri(&url, None::<&gtk::gio::AppLaunchContext>);
+                            return;
+                        }
+                    }
+                }
+            }
         }
     });
+
+    let motion_controller = gtk::EventControllerMotion::new();
+    let tv_motion = text_view.clone();
+    motion_controller.connect_motion(move |_controller, x, y| {
+        if let Some(iter) = tv_motion.iter_at_location(x as i32, y as i32) {
+            let tags = iter.tags();
+            let mut is_link = false;
+            for tag in tags {
+                if let Some(name) = tag.name() {
+                    if name.starts_with("url:") { is_link = true; break; }
+                }
+            }
+            if is_link {
+                tv_motion.set_cursor_from_name(Some("pointer"));
+            } else {
+                tv_motion.set_cursor_from_name(Some("text"));
+            }
+        }
+    });
+    text_view.add_controller(motion_controller);
 
     let s_arc_release = ts_weak.clone();
     let itx_release = input_tx.clone();
