@@ -263,10 +263,16 @@ impl TerminalState {
             let (cx, cy) = if self.is_alternate { (self.alt_cursor_x, self.alt_cursor_y) } else { (self.cursor_x, self.cursor_y) };
             let mut iter = self.ensure_cursor_position(cx, cy);
             buffer.place_cursor(&iter);
-            // use_align=false: scroll the minimum amount to make the cursor visible.
-            // If the cursor is already on screen nothing happens; if it is below the
-            // viewport GTK scrolls it in at the bottom edge — correct terminal behaviour.
+            // use_align=false: scroll the minimum amount to make the cursor line
+            // visible anywhere in the viewport.  This keeps vi's status bar (which
+            // sits one line below scroll_bottom) in view — yalign=1.0 would pin the
+            // cursor to the very bottom edge and push the status line off-screen.
             tv.scroll_to_iter(&mut iter, 0.0, false, 0.0, 0.0);
+            // Always reset horizontal scroll to 0 — scroll_to_iter scrolls both axes
+            // and can drift right when the cursor approaches cols.
+            if let Some(hadj) = tv.hadjustment() {
+                hadj.set_value(0.0);
+            }
         }
     }
 
@@ -389,12 +395,19 @@ impl Perform for TerminalState {
         match byte {
             b'\n' => {
                 let cy = if self.is_alternate { self.alt_cursor_y } else { self.cursor_y };
-                if cy == self.scroll_bottom {
-                    // Cursor is at the bottom margin — scroll the region up instead of
-                    // moving the cursor down.  This is what every terminal app (vi, less,
-                    // etc.) relies on: LF at scroll_bottom = scroll, not cursor advance.
+                // Use scroll-region logic only when:
+                //   a) in the alternate buffer (vi/less/etc.), or
+                //   b) an explicit restricted scroll region was set via CSI r
+                //      (scroll_top > 0 or scroll_bottom < rows-1)
+                // For the primary buffer with the default full-screen region, the
+                // buffer must GROW so scrollback history is preserved.  Calling
+                // scroll_region_up on the primary buffer deleted line 0 on every LF
+                // at the bottom, wiping scrollback and corrupting cursor positions.
+                let restricted = self.scroll_top > 0
+                    || self.scroll_bottom < self.rows.saturating_sub(1);
+                if (self.is_alternate || restricted) && cy == self.scroll_bottom {
                     self.scroll_region_up(1);
-                    // cursor_y stays the same (still at scroll_bottom)
+                    // cursor stays at scroll_bottom
                 } else {
                     if self.is_alternate { self.alt_cursor_y += 1; } else { self.cursor_y += 1; }
                 }
@@ -576,11 +589,12 @@ impl Perform for TerminalState {
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
         match byte {
             b'D' => {
-                // Index: same as LF — advance cursor, scroll if at scroll_bottom
+                // Index: same as LF — advance cursor, scroll only when appropriate
                 let cy = if self.is_alternate { self.alt_cursor_y } else { self.cursor_y };
-                if cy == self.scroll_bottom {
+                let restricted = self.scroll_top > 0
+                    || self.scroll_bottom < self.rows.saturating_sub(1);
+                if (self.is_alternate || restricted) && cy == self.scroll_bottom {
                     self.scroll_region_up(1);
-                    // cursor stays at scroll_bottom
                 } else {
                     if self.is_alternate { self.alt_cursor_y += 1; } else { self.cursor_y += 1; }
                 }

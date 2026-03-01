@@ -86,10 +86,19 @@ pub fn add_terminal_tab(
     let dummy_label = gtk::Label::new(Some(&settings.name));
     
     if let Some(nb) = stack.downcast_ref::<gtk::Notebook>() {
-        nb.append_page(&scrolled, Some(&dummy_label));
+        let page_num = nb.append_page(&scrolled, Some(&dummy_label));
         nb.set_tab_reorderable(&scrolled, true);
         nb.set_tab_detachable(&scrolled, true);
+        // Switch to the newly created tab immediately.
+        nb.set_current_page(Some(page_num));
     }
+
+    // Focus the TextView so keyboard input works immediately without requiring
+    // a mouse click.  Do it on the next idle tick so the widget is fully mapped.
+    let tv_focus = text_view.clone();
+    gtk::glib::idle_add_local_once(move || {
+        tv_focus.grab_focus();
+    });
 
     let (input_tx, input_rx) = flume::unbounded::<ConnectionControl>();
     let (output_tx, output_rx) = flume::unbounded::<Vec<u8>>();
@@ -163,7 +172,6 @@ pub fn add_terminal_tab(
     let itx_resize = input_tx.clone();
     let mut last_cols = 0;
     let mut last_rows = 0;
-    let font_size_u32 = settings.font_size;
     
     let state_for_resize = state_rc.clone();
     let current_size_thread = current_size.clone(); // cloned before the timer moves current_size
@@ -174,21 +182,17 @@ pub fn add_terminal_tab(
         let width  = scrolled_for_resize.width();
         let height = scrolled_for_resize.height();
         if width > 0 && height > 0 {
-            let font_desc = gtk::pango::FontDescription::from_string(&format!("monospace {}", font_size_u32));
-            // Measure char size using a multi-char multi-line layout so that:
-            //   char_w  = advance width (not just ink width)
-            //   char_h  = line height INCLUDING line spacing (not just glyph height)
-            // Using 10 chars × 10 lines gives stable pixel-averaged values.
+            // Measure using the exact font the TextView is already rendering with.
+            // Use layout.size() which returns Pango units (never rounded to integers)
+            // and divide by pango::SCALE to get exact float pixel dimensions.
+            // pixel_size() rounds to integers — for fractional char heights that makes
+            // rows/cols 1 wrong, producing the persistent empty strip at bottom/right.
             let sample = "MMMMMMMMMM\nMMMMMMMMMM\nMMMMMMMMMM\nMMMMMMMMMM\nMMMMMMMMMM\nMMMMMMMMMM\nMMMMMMMMMM\nMMMMMMMMMM\nMMMMMMMMMM\nMMMMMMMMMM";
             let layout = tv_for_resize.create_pango_layout(Some(sample));
-            layout.set_font_description(Some(&font_desc));
-            let (w_px, h_px) = layout.pixel_size();
-            let char_w = (w_px as f32 / 10.0).max(1.0);
-            // pixel_size() is pure Pango — it does NOT include the per-line extra
-            // spacing that GTK TextView adds via pixels_above_lines / pixels_below_lines.
-            // We must add those back so char_h matches what the TextView actually renders.
-            let line_extra = (tv_for_resize.pixels_above_lines() + tv_for_resize.pixels_below_lines()) as f32;
-            let char_h = (h_px as f32 / 10.0 + line_extra).max(1.0);
+            let (w_pu, h_pu) = layout.size(); // Pango units
+            let scale = gtk::pango::SCALE as f32;
+            let char_w = (w_pu as f32 / scale / 10.0).max(1.0);
+            let char_h = (h_pu as f32 / scale / 10.0).max(1.0);
 
             let cols = (width  as f32 / char_w).floor().max(1.0) as u32;
             let rows = (height as f32 / char_h).floor().max(1.0) as u32;

@@ -831,5 +831,31 @@ fn create_terminal_window(app: &Application, settings: &ConnectionSettings, over
     window.add_action(&action_local);
 
     add_terminal_tab(notebook.upcast_ref::<gtk::Widget>(), settings.clone(), override_pass, is_local);
+
+    // Focus the current tab's TextView whenever the user switches tabs.
+    notebook.connect_switch_page(|_nb, page, _num| {
+        if let Some(sw) = page.downcast_ref::<gtk::ScrolledWindow>() {
+            if let Some(child) = sw.child() {
+                child.grab_focus();
+            }
+        }
+    });
+
+    // Focus the current tab's TextView whenever this window becomes the active window
+    // (e.g. switching back from another app or another terminal window).
+    let nb_for_active = notebook.downgrade();
+    window.connect_is_active_notify(move |win| {
+        if !win.is_active() { return; }
+        if let Some(nb) = nb_for_active.upgrade() {
+            if let Some(page) = nb.current_page().and_then(|n| nb.nth_page(Some(n))) {
+                if let Some(sw) = page.downcast_ref::<gtk::ScrolledWindow>() {
+                    if let Some(child) = sw.child() {
+                        child.grab_focus();
+                    }
+                }
+            }
+        }
+    });
+
     window.present();
 }
