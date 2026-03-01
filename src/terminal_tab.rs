@@ -105,7 +105,11 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
     provider.load_from_data(&css);
     text_view.style_context().add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 500);
 
-    let scrolled = ScrolledWindow::builder().child(&text_view).vexpand(true).build();
+    let scrolled = ScrolledWindow::builder()
+        .child(&text_view)
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .build();
     let label = Label::new(Some(&settings.name));
     let label_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     label_box.append(&label);
@@ -193,16 +197,22 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
     let font_size_u32 = settings.font_size as u32;
 
     let ts_weak_loop = ts_weak.clone();
-    glib::timeout_add_local(Duration::from_millis(10), move || {
+    glib::timeout_add_local(Duration::from_millis(20), move || {
         let tv = match tv_weak.upgrade() { Some(v) => v, None => return glib::ControlFlow::Break };
         
         let width = tv.width();
         let height = tv.height();
         if width > 0 && height > 0 {
-            let char_w = (font_size_u32 as f32 * 0.6).max(1.0);
-            let char_h = (font_size_u32 as f32 * 1.5).max(1.0);
-            let cols = (width as f32 / char_w).max(1.0) as u32;
-            let rows = (height as f32 / char_h).max(1.0) as u32;
+            // Precise measurement using Pango
+            let pango_ctx = tv.pango_context();
+            let font_desc = gtk::pango::FontDescription::from_string(&format!("monospace {}", font_size_u32));
+            let metrics = pango_ctx.metrics(Some(&font_desc), None);
+            let char_w = (metrics.approximate_char_width() as f32 / gtk::pango::SCALE as f32).max(1.0);
+            let char_h = ((metrics.ascent() + metrics.descent()) as f32 / gtk::pango::SCALE as f32).max(1.0);
+
+            let cols = (width as f32 / char_w).floor().max(1.0) as u32;
+            let rows = (height as f32 / char_h).floor().max(1.0) as u32;
+
             if cols != last_cols || rows != last_rows {
                 last_cols = cols;
                 last_rows = rows;
