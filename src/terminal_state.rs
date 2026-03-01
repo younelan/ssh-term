@@ -3,6 +3,8 @@ use gtk4 as gtk;
 use gtk::{glib, Label, TextBuffer, TextTag, TextView};
 use gtk::prelude::*;
 use vte::Perform;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 
 pub struct TerminalState {
     pub primary_buffer: TextBuffer,
@@ -24,6 +26,8 @@ pub struct TerminalState {
     pub bracketed_paste_mode: bool,
     pub char_width: f32,
     pub char_height: f32,
+    pub image_buffer: Vec<u8>,
+    pub is_sixel: bool,
 }
 
 impl TerminalState {
@@ -103,8 +107,29 @@ impl TerminalState {
             saved_cursor_y: 0,
             saved_tags: Vec::new(),
             bracketed_paste_mode: false,
-            char_width: 1.0,
-            char_height: 1.0,
+            char_width: 8.0,
+            char_height: 16.0,
+            image_buffer: Vec::new(),
+            is_sixel: false,
+        }
+    }
+
+    pub fn insert_image(&mut self, data: Vec<u8>) {
+        if let Some(tv) = self.view.upgrade() {
+            let buffer = self.active_buffer();
+            let cx = if self.is_alternate { self.alt_cursor_x } else { self.cursor_x };
+            let cy = if self.is_alternate { self.alt_cursor_y } else { self.cursor_y };
+            let mut iter = self.ensure_cursor_position(cx, cy);
+            
+            let anchor = buffer.create_child_anchor(&mut iter);
+            let pixbuf_loader = gtk::gdk_pixbuf::PixbufLoader::new();
+            if pixbuf_loader.write(&data).is_ok() && pixbuf_loader.close().is_ok() {
+                if let Some(pixbuf) = pixbuf_loader.pixbuf() {
+                    let picture = gtk::Picture::for_pixbuf(&pixbuf);
+                    picture.set_can_shrink(true);
+                    tv.add_child_at_anchor(&picture, &anchor);
+                }
+            }
         }
     }
 
@@ -686,6 +711,74 @@ impl Perform for TerminalState {
                     self.current_tags.push(format!("url:{}", url));
                 } else {
                     self.current_tags.retain(|t| !t.starts_with("url:"));
+                }
+            } else if params[0] == b"1337" && params[1].starts_with(b"File=") {
+                // iTerm2 Image Protocol
+                let data_parts: Vec<&[u8]> = params[1].split(|&b| b == b':').collect();
+                if data_parts.len() >= 2 {
+                    if let Ok(data) = BASE64.decode(data_parts[1]) {
+                        self.insert_image(data);
+                    }
+                }
+            } else if params[0] == b"108" {
+                // Kitty Image Protocol (simple implementation)
+                if let Ok(data) = BASE64.decode(params[1]) {
+                    self.insert_image(data);
+                }
+            }
+        }
+    }
+
+    fn hook(&mut self, params: &vte::Params, intermediates: &[u8], _ignore: bool, action: char) {
+        if action == 'q' && intermediates.is_empty() {
+            self.is_sixel = true;
+            self.image_buffer.clear();
+            // Optional: add DCS header back if icy_sixel needs it
+            self.image_buffer.extend_from_slice(b"\x1bP");
+            for (i, param) in params.iter().enumerate() {
+                if i > 0 { self.image_buffer.push(b';'); }
+                self.image_buffer.extend_from_slice(param[0].to_string().as_bytes());
+            }
+            self.image_buffer.push(b'q');
+        }
+    }
+
+    fn put(&mut self, byte: u8) {
+        if self.is_sixel {
+            self.image_buffer.push(byte);
+        }
+    }
+
+    fn unhook(&mut self) {
+        if self.is_sixel {
+            self.is_sixel = false;
+            // Add ST (String Terminator) \x1b\
+            self.image_buffer.extend_from_slice(b"\x1b\\");
+            
+            // icy_sixel 0.5 SixelImage::decode expects the whole DCS string
+            if let Ok(image) = icy_sixel::SixelImage::decode(&self.image_buffer) {
+                let width = image.width as i32;
+                let height = image.height as i32;
+                let bytes = gtk::glib::Bytes::from(&image.pixels);
+                let pixbuf = gtk::gdk_pixbuf::Pixbuf::from_bytes(
+                    &bytes,
+                    gtk::gdk_pixbuf::Colorspace::Rgb,
+                    true,
+                    8,
+                    width,
+                    height,
+                    width * 4,
+                );
+                
+                if let Some(tv) = self.view.upgrade() {
+                    let buffer = self.active_buffer();
+                    let cx = if self.is_alternate { self.alt_cursor_x } else { self.cursor_x };
+                    let cy = if self.is_alternate { self.alt_cursor_y } else { self.cursor_y };
+                    let mut iter = self.ensure_cursor_position(cx, cy);
+                    let anchor = buffer.create_child_anchor(&mut iter);
+                    let picture = gtk::Picture::for_pixbuf(&pixbuf);
+                    picture.set_can_shrink(true);
+                    tv.add_child_at_anchor(&picture, &anchor);
                 }
             }
         }
