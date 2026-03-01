@@ -89,6 +89,14 @@ pub struct TerminalState {
     pub rows: usize,
     /// Sender to push bytes back into the PTY (widget events go here).
     pub pty_input_tx: Option<flume::Sender<Vec<u8>>>,
+    /// Named panels (containers) that widgets can be added to.
+    pub panels: std::collections::HashMap<String, gtk::Box>,
+    /// Named grid panels for row/col positioning.
+    pub grids: std::collections::HashMap<String, gtk::Grid>,
+    /// Radio button groups — first button per group name is the leader.
+    pub radio_groups: std::collections::HashMap<String, gtk::CheckButton>,
+    /// All created widgets by ID, for later updates via WidgetUpdate.
+    pub widgets: std::collections::HashMap<String, gtk::Widget>,
 }
 
 impl TerminalState {
@@ -158,6 +166,10 @@ impl TerminalState {
             cols: 80,
             rows: 24,
             pty_input_tx: None,
+            panels: std::collections::HashMap::new(),
+            grids: std::collections::HashMap::new(),
+            radio_groups: std::collections::HashMap::new(),
+            widgets: std::collections::HashMap::new(),
         }
     }
 
@@ -348,6 +360,7 @@ impl TerminalState {
     }
 
     /// Send a widget event response back to the PTY.
+    #[allow(dead_code)]
     fn send_widget_event(&self, id: &str, action: &str, value: &str) {
         if let Some(ref tx) = self.pty_input_tx {
             // Format: ESC ] 1337 ; WidgetEvent=id:ID;action:ACTION;value:VALUE ST
@@ -356,30 +369,119 @@ impl TerminalState {
         }
     }
 
-    /// Insert a GTK widget into the text buffer at the current cursor position.
-    /// `spec` is the part after "Widget=" e.g. "type:button;id:btn1;label:Click Me"
-    pub fn insert_widget(&mut self, spec: &str) {
+    /// Create a panel (container). If `panel` property is set, nest inside that parent;
+    /// otherwise embed inline in the text buffer.
+    /// `spec` is e.g. "id:panel1;layout:vertical;title:Settings;width:300;spacing:8"
+    pub fn insert_panel(&mut self, spec: &str) {
         let props = Self::parse_widget_props(spec);
-        let widget_type = match props.get("type") {
-            Some(t) => t.as_str(),
-            None => { eprintln!("[WIDGET] no type specified"); return; }
-        };
-        let id = props.get("id").cloned().unwrap_or_else(|| "unnamed".to_string());
+        let id = props.get("id").cloned().unwrap_or_else(|| "panel".into());
+        let layout = props.get("layout").cloned().unwrap_or_else(|| "vertical".into());
+        let title = props.get("title").cloned();
+        let parent_id = props.get("panel").cloned();
+        let width: i32 = props.get("width").and_then(|w| w.parse().ok()).unwrap_or(-1);
+        let height: i32 = props.get("height").and_then(|h| h.parse().ok()).unwrap_or(-1);
+        let spacing: i32 = props.get("spacing").and_then(|s| s.parse().ok()).unwrap_or(6);
+        let margin: i32 = props.get("margin").and_then(|m| m.parse().ok()).unwrap_or(8);
+        let expand: bool = props.get("expand").map(|v| v == "true" || v == "1").unwrap_or(false);
 
+        // Build the inner container
+        let (inner_widget, panel_box, grid_opt) = if layout == "grid" {
+            let grid = gtk::Grid::new();
+            grid.set_row_spacing(spacing as u32);
+            grid.set_column_spacing(spacing as u32);
+            grid.set_margin_start(margin);
+            grid.set_margin_end(margin);
+            grid.set_margin_top(margin);
+            grid.set_margin_bottom(margin);
+            if width > 0 || height > 0 { grid.set_size_request(width, height); }
+            let outer: gtk::Widget = if let Some(ref t) = title {
+                let frame = gtk::Frame::new(Some(t));
+                frame.set_child(Some(&grid));
+                frame.upcast()
+            } else {
+                grid.clone().upcast()
+            };
+            (outer, None, Some(grid))
+        } else {
+            let orientation = if layout == "horizontal" || layout == "hbox" {
+                gtk::Orientation::Horizontal
+            } else {
+                gtk::Orientation::Vertical
+            };
+            let bx = gtk::Box::new(orientation, spacing);
+            bx.set_margin_start(margin);
+            bx.set_margin_end(margin);
+            bx.set_margin_top(margin);
+            bx.set_margin_bottom(margin);
+            if width > 0 || height > 0 { bx.set_size_request(width, height); }
+            let outer: gtk::Widget = if let Some(ref t) = title {
+                let frame = gtk::Frame::new(Some(t));
+                frame.set_child(Some(&bx));
+                frame.upcast()
+            } else {
+                bx.clone().upcast()
+            };
+            (outer, Some(bx), None)
+        };
+        inner_widget.set_visible(true);
+        if expand {
+            inner_widget.set_hexpand(true);
+            inner_widget.set_vexpand(true);
+        }
+
+        // Place: into parent panel, or inline in buffer
+        if let Some(ref pid) = parent_id {
+            let mut placed = false;
+            if let Some(parent_grid) = self.grids.get(pid) {
+                let row: i32 = props.get("row").and_then(|r| r.parse().ok()).unwrap_or(0);
+                let col: i32 = props.get("col").and_then(|c| c.parse().ok()).unwrap_or(0);
+                let colspan: i32 = props.get("colspan").and_then(|c| c.parse().ok()).unwrap_or(1);
+                let rowspan: i32 = props.get("rowspan").and_then(|r| r.parse().ok()).unwrap_or(1);
+                parent_grid.attach(&inner_widget, col, row, colspan, rowspan);
+                placed = true;
+            }
+            if !placed {
+                if let Some(parent_box) = self.panels.get(pid) {
+                    parent_box.append(&inner_widget);
+                    placed = true;
+                }
+            }
+            if !placed {
+                eprintln!("[PANEL] parent '{}' not found, inserting inline", pid);
+            } else {
+                // Register and return early
+                if let Some(g) = grid_opt { self.grids.insert(id.clone(), g); }
+                if let Some(b) = panel_box { self.panels.insert(id.clone(), b); }
+                eprintln!("[PANEL] inserted panel id={} layout={} into parent={}", id, layout, pid);
+                return;
+            }
+        }
+
+        // Inline: embed in text buffer
         let tv = match self.view.upgrade() {
             Some(tv) => tv,
             None => return,
         };
-
         let buffer = self.active_buffer();
         let cx = if self.is_alternate { self.alt_cursor_x } else { self.cursor_x };
         let cy = if self.is_alternate { self.alt_cursor_y } else { self.cursor_y };
         let mut iter = self.ensure_cursor_position(cx, cy);
         let anchor = buffer.create_child_anchor(&mut iter);
+        tv.add_child_at_anchor(&inner_widget, &anchor);
 
+        if let Some(g) = grid_opt { self.grids.insert(id.clone(), g); }
+        if let Some(b) = panel_box { self.panels.insert(id.clone(), b); }
+        if self.is_alternate { self.alt_cursor_x += 1; } else { self.cursor_x += 1; }
+        eprintln!("[PANEL] inserted panel id={} layout={} inline", id, layout);
+    }
+
+    /// Build a widget from parsed properties and return it (without placing it).
+    fn build_widget(&mut self, props: &std::collections::HashMap<String, String>) -> Option<gtk::Widget> {
+        let widget_type = props.get("type")?.as_str();
+        let id = props.get("id").cloned().unwrap_or_else(|| "unnamed".to_string());
         let pty_tx = self.pty_input_tx.clone();
 
-        let widget: Option<gtk::Widget> = match widget_type {
+        match widget_type {
             "button" => {
                 let label = props.get("label").cloned().unwrap_or_else(|| "Button".into());
                 let btn = gtk::Button::with_label(&label);
@@ -410,6 +512,22 @@ impl TerminalState {
                 });
                 Some(entry.upcast())
             }
+            "password" | "passwordentry" => {
+                let placeholder = props.get("placeholder").cloned().unwrap_or_else(|| "Password".into());
+                let pe = gtk::PasswordEntry::new();
+                pe.set_placeholder_text(Some(&placeholder));
+                pe.set_show_peek_icon(true);
+                let wid = id.clone();
+                let tx = pty_tx.clone();
+                pe.connect_activate(move |e| {
+                    if let Some(ref tx) = tx {
+                        let text = e.text().to_string();
+                        let msg = format!("\x1b]1337;WidgetEvent=id:{};action:submit;value:{}\x07", wid, text);
+                        let _ = tx.send(msg.into_bytes());
+                    }
+                });
+                Some(pe.upcast())
+            }
             "checkbox" | "check" => {
                 let label = props.get("label").cloned().unwrap_or_else(|| "Check".into());
                 let checked: bool = props.get("checked").map(|v| v == "true" || v == "1").unwrap_or(false);
@@ -428,19 +546,23 @@ impl TerminalState {
             }
             "radio" => {
                 let label = props.get("label").cloned().unwrap_or_else(|| "Option".into());
-                let group = props.get("group").cloned().unwrap_or_default();
+                let group = props.get("group").cloned().unwrap_or_else(|| "default".into());
                 let rb = gtk::CheckButton::with_label(&label);
-                // For radio groups, look for an existing radio button with the same group tag
-                // in the buffer's text anchors. For simplicity, we just create standalone radios;
-                // grouping is done by the demo via the group property name echoed in events.
+                // Link to existing group leader so only one can be active
+                if let Some(leader) = self.radio_groups.get(&group) {
+                    rb.set_group(Some(leader));
+                } else {
+                    self.radio_groups.insert(group.clone(), rb.clone());
+                }
                 let wid = id.clone();
                 let tx = pty_tx.clone();
                 let grp = group.clone();
                 rb.connect_toggled(move |c| {
-                    if let Some(ref tx) = tx {
-                        let val = if c.is_active() { "true" } else { "false" };
-                        let msg = format!("\x1b]1337;WidgetEvent=id:{};action:toggled;value:{};group:{}\x07", wid, val, grp);
-                        let _ = tx.send(msg.into_bytes());
+                    if c.is_active() {
+                        if let Some(ref tx) = tx {
+                            let msg = format!("\x1b]1337;WidgetEvent=id:{};action:selected;value:true;group:{}\x07", wid, grp);
+                            let _ = tx.send(msg.into_bytes());
+                        }
                     }
                 });
                 Some(rb.upcast())
@@ -538,18 +660,277 @@ impl TerminalState {
                 });
                 Some(spin.upcast())
             }
+            "separator" | "sep" => {
+                let orient = if props.get("orient").map(|o| o == "vertical" || o == "v").unwrap_or(false) {
+                    gtk::Orientation::Vertical
+                } else {
+                    gtk::Orientation::Horizontal
+                };
+                let sep = gtk::Separator::new(orient);
+                Some(sep.upcast())
+            }
+            "calendar" | "date" | "datepicker" => {
+                let cal = gtk::Calendar::new();
+                let wid = id.clone();
+                let tx = pty_tx.clone();
+                cal.connect_day_selected(move |c| {
+                    if let Some(ref tx) = tx {
+                        let dt = c.date();
+                        let val = format!("{:04}-{:02}-{:02}", dt.year(), dt.month(), dt.day_of_month());
+                        let msg = format!("\x1b]1337;WidgetEvent=id:{};action:selected;value:{}\x07", wid, val);
+                        let _ = tx.send(msg.into_bytes());
+                    }
+                });
+                Some(cal.upcast())
+            }
+            "color" | "colorbutton" | "colorpicker" => {
+                let btn = gtk::ColorButton::new();
+                if let Some(c) = props.get("value") {
+                    let rgba = gtk::gdk::RGBA::parse(c).unwrap_or(gtk::gdk::RGBA::BLACK);
+                    btn.set_rgba(&rgba);
+                }
+                btn.set_use_alpha(props.get("alpha").map(|v| v == "true" || v == "1").unwrap_or(false));
+                if let Some(t) = props.get("title") {
+                    btn.set_title(t);
+                }
+                let wid = id.clone();
+                let tx = pty_tx.clone();
+                btn.connect_color_set(move |b| {
+                    if let Some(ref tx) = tx {
+                        let c = b.rgba();
+                        let hex = format!("#{:02x}{:02x}{:02x}",
+                            (c.red() * 255.0) as u8,
+                            (c.green() * 255.0) as u8,
+                            (c.blue() * 255.0) as u8);
+                        let msg = format!("\x1b]1337;WidgetEvent=id:{};action:selected;value:{}\x07", wid, hex);
+                        let _ = tx.send(msg.into_bytes());
+                    }
+                });
+                Some(btn.upcast())
+            }
+            "link" | "linkbutton" => {
+                let uri = props.get("uri").cloned().unwrap_or_else(|| "https://example.com".into());
+                let label = props.get("label").cloned().unwrap_or_else(|| uri.clone());
+                let lb = gtk::LinkButton::with_label(&uri, &label);
+                Some(lb.upcast())
+            }
+            "togglebutton" => {
+                let label = props.get("label").cloned().unwrap_or_else(|| "Toggle".into());
+                let active: bool = props.get("active").map(|v| v == "true" || v == "1").unwrap_or(false);
+                let tb = gtk::ToggleButton::with_label(&label);
+                tb.set_active(active);
+                let wid = id.clone();
+                let tx = pty_tx.clone();
+                tb.connect_toggled(move |b| {
+                    if let Some(ref tx) = tx {
+                        let val = if b.is_active() { "true" } else { "false" };
+                        let msg = format!("\x1b]1337;WidgetEvent=id:{};action:toggled;value:{}\x07", wid, val);
+                        let _ = tx.send(msg.into_bytes());
+                    }
+                });
+                Some(tb.upcast())
+            }
+            "levelbar" | "level" => {
+                let min: f64 = props.get("min").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                let max: f64 = props.get("max").and_then(|v| v.parse().ok()).unwrap_or(100.0);
+                let value: f64 = props.get("value").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                let width: i32 = props.get("width").and_then(|w| w.parse().ok()).unwrap_or(200);
+                let lb = gtk::LevelBar::for_interval(min, max);
+                lb.set_value(value);
+                lb.set_size_request(width, -1);
+                Some(lb.upcast())
+            }
+            "image" | "picture" => {
+                // Inline image from a file path
+                let path = props.get("path").cloned().unwrap_or_default();
+                let w: i32 = props.get("width").and_then(|v| v.parse().ok()).unwrap_or(-1);
+                let h: i32 = props.get("height").and_then(|v| v.parse().ok()).unwrap_or(-1);
+                let img = gtk::Image::from_file(&path);
+                if w > 0 || h > 0 { img.set_size_request(w, h); }
+                Some(img.upcast())
+            }
+            "expander" => {
+                let label = props.get("label").cloned().unwrap_or_else(|| "Details".into());
+                let expanded: bool = props.get("expanded").map(|v| v == "true" || v == "1").unwrap_or(false);
+                let exp = gtk::Expander::new(Some(&label));
+                exp.set_expanded(expanded);
+                // The expander is a container — register it as a panel so children use panel:<id>
+                let inner = gtk::Box::new(gtk::Orientation::Vertical, 4);
+                exp.set_child(Some(&inner));
+                self.panels.insert(id.clone(), inner);
+                Some(exp.upcast())
+            }
+            "textview" | "textarea" => {
+                let text = props.get("text").cloned().unwrap_or_default();
+                let width: i32 = props.get("width").and_then(|w| w.parse().ok()).unwrap_or(300);
+                let height: i32 = props.get("height").and_then(|h| h.parse().ok()).unwrap_or(200);
+                let editable: bool = props.get("editable").map(|v| v == "true" || v == "1").unwrap_or(false);
+                let wrap = props.get("wrap").map(|w| w.as_str()).unwrap_or("word");
+                let tv = gtk::TextView::new();
+                tv.set_editable(editable);
+                tv.set_cursor_visible(editable);
+                tv.buffer().set_text(&text);
+                tv.set_wrap_mode(match wrap {
+                    "none" => gtk::WrapMode::None,
+                    "char" => gtk::WrapMode::Char,
+                    "wordchar" => gtk::WrapMode::WordChar,
+                    _ => gtk::WrapMode::Word,
+                });
+                tv.set_left_margin(4);
+                tv.set_right_margin(4);
+                tv.set_top_margin(4);
+                tv.set_bottom_margin(4);
+                // Wrap in a scrolled window
+                let sw = gtk::ScrolledWindow::new();
+                sw.set_child(Some(&tv));
+                sw.set_size_request(width, height);
+                sw.set_vexpand(true);
+                sw.set_hexpand(true);
+                // Store the inner TextView as the widget so we can update its buffer
+                self.widgets.insert(id.clone(), tv.clone().upcast());
+                Some(sw.upcast())
+            }
             _ => {
                 eprintln!("[WIDGET] unknown type: {}", widget_type);
                 None
             }
+        }
+    }
+
+    /// Insert a GTK widget. If `panel` property is set, add to that panel;
+    /// otherwise embed directly in the text buffer at cursor.
+    pub fn insert_widget(&mut self, spec: &str) {
+        let props = Self::parse_widget_props(spec);
+        let widget_type = match props.get("type") {
+            Some(t) => t.clone(),
+            None => { eprintln!("[WIDGET] no type specified"); return; }
+        };
+        let id = props.get("id").cloned().unwrap_or_else(|| "unnamed".to_string());
+        let panel_id = props.get("panel").cloned();
+        let row: i32 = props.get("row").and_then(|r| r.parse().ok()).unwrap_or(0);
+        let col: i32 = props.get("col").and_then(|c| c.parse().ok()).unwrap_or(0);
+        let colspan: i32 = props.get("colspan").and_then(|c| c.parse().ok()).unwrap_or(1);
+        let rowspan: i32 = props.get("rowspan").and_then(|r| r.parse().ok()).unwrap_or(1);
+        let expand: bool = props.get("expand").map(|v| v == "true" || v == "1").unwrap_or(false);
+
+        let widget = match self.build_widget(&props) {
+            Some(w) => w,
+            None => return,
+        };
+        widget.set_visible(true);
+        if expand {
+            widget.set_hexpand(true);
+        }
+
+        // Store widget by ID for later updates (textview stores itself inside build_widget)
+        if !self.widgets.contains_key(&id) {
+            self.widgets.insert(id.clone(), widget.clone());
+        }
+
+        // Route to panel, grid, or inline
+        if let Some(ref pid) = panel_id {
+            if let Some(grid) = self.grids.get(pid) {
+                grid.attach(&widget, col, row, colspan, rowspan);
+                eprintln!("[WIDGET] {}(id={}) -> grid {} at row={} col={}", widget_type, id, pid, row, col);
+                return;
+            }
+            if let Some(bx) = self.panels.get(pid) {
+                bx.append(&widget);
+                eprintln!("[WIDGET] {}(id={}) -> panel {}", widget_type, id, pid);
+                return;
+            }
+            eprintln!("[WIDGET] panel '{}' not found, inserting inline", pid);
+        }
+
+        // Inline: embed in text buffer via anchor
+        let tv = match self.view.upgrade() {
+            Some(tv) => tv,
+            None => return,
+        };
+        let buffer = self.active_buffer();
+        let cx = if self.is_alternate { self.alt_cursor_x } else { self.cursor_x };
+        let cy = if self.is_alternate { self.alt_cursor_y } else { self.cursor_y };
+        let mut iter = self.ensure_cursor_position(cx, cy);
+        let anchor = buffer.create_child_anchor(&mut iter);
+        tv.add_child_at_anchor(&widget, &anchor);
+        if self.is_alternate { self.alt_cursor_x += 1; } else { self.cursor_x += 1; }
+        eprintln!("[WIDGET] inserted {}(id={}) inline at ({}, {})", widget_type, id, cx, cy);
+    }
+
+    /// Update an existing widget's properties.
+    /// `spec` is e.g. "id:lbl1;text:New text" or "id:pb1;value:75" or "id:tv1;append:new line"
+    pub fn update_widget(&mut self, spec: &str) {
+        let props = Self::parse_widget_props(spec);
+        let id = match props.get("id") {
+            Some(id) => id.clone(),
+            None => { eprintln!("[UPDATE] no id specified"); return; }
+        };
+        let widget = match self.widgets.get(&id) {
+            Some(w) => w.clone(),
+            None => { eprintln!("[UPDATE] widget '{}' not found", id); return; }
         };
 
-        if let Some(w) = widget {
-            w.set_visible(true);
-            tv.add_child_at_anchor(&w, &anchor);
-            if self.is_alternate { self.alt_cursor_x += 1; } else { self.cursor_x += 1; }
-            eprintln!("[WIDGET] inserted {}(id={}) at ({}, {})", widget_type, id, cx, cy);
+        // Try each property update
+        if let Some(text) = props.get("text") {
+            if let Some(lbl) = widget.downcast_ref::<gtk::Label>() {
+                lbl.set_text(text);
+            } else if let Some(btn) = widget.downcast_ref::<gtk::Button>() {
+                btn.set_label(text);
+            } else if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
+                entry.set_text(text);
+            } else if let Some(tv) = widget.downcast_ref::<gtk::TextView>() {
+                tv.buffer().set_text(text);
+            } else if let Some(pb) = widget.downcast_ref::<gtk::ProgressBar>() {
+                pb.set_text(Some(text));
+                pb.set_show_text(true);
+            }
         }
+        if let Some(append_text) = props.get("append") {
+            if let Some(tv) = widget.downcast_ref::<gtk::TextView>() {
+                let buf = tv.buffer();
+                let mut end = buf.end_iter();
+                buf.insert(&mut end, append_text);
+                buf.insert(&mut end, "\n");
+                // Auto-scroll to bottom
+                let mark = buf.create_mark(None, &buf.end_iter(), false);
+                tv.scroll_mark_onscreen(&mark);
+            }
+        }
+        if let Some(val_str) = props.get("value") {
+            if let Ok(val) = val_str.parse::<f64>() {
+                if let Some(pb) = widget.downcast_ref::<gtk::ProgressBar>() {
+                    pb.set_fraction((val / 100.0).clamp(0.0, 1.0));
+                } else if let Some(scale) = widget.downcast_ref::<gtk::Scale>() {
+                    scale.set_value(val);
+                } else if let Some(spin) = widget.downcast_ref::<gtk::SpinButton>() {
+                    spin.set_value(val);
+                } else if let Some(lb) = widget.downcast_ref::<gtk::LevelBar>() {
+                    lb.set_value(val);
+                }
+            }
+            // Also handle boolean value for switch/check
+            if let Some(sw) = widget.downcast_ref::<gtk::Switch>() {
+                sw.set_active(val_str == "true" || val_str == "1");
+            } else if let Some(cb) = widget.downcast_ref::<gtk::CheckButton>() {
+                cb.set_active(val_str == "true" || val_str == "1");
+            }
+        }
+        if let Some(label) = props.get("label") {
+            if let Some(btn) = widget.downcast_ref::<gtk::Button>() {
+                btn.set_label(label);
+            } else if let Some(cb) = widget.downcast_ref::<gtk::CheckButton>() {
+                cb.set_label(Some(label));
+            } else if let Some(exp) = widget.downcast_ref::<gtk::Expander>() {
+                exp.set_label(Some(label));
+            }
+        }
+        if let Some(sensitive) = props.get("sensitive") {
+            widget.set_sensitive(sensitive == "true" || sensitive == "1");
+        }
+        if let Some(visible) = props.get("visible") {
+            widget.set_visible(visible == "true" || visible == "1");
+        }
+        eprintln!("[UPDATE] widget '{}' updated", id);
     }
 
     pub fn insert_image(&mut self, data: Vec<u8>) {
@@ -558,7 +939,7 @@ impl TerminalState {
             eprintln!("[IMG] first 4 bytes: {:02x} {:02x} {:02x} {:02x}",
                 data[0], data[1], data[2], data[3]);
         }
-        if let Some(tv) = self.view.upgrade() {
+        if let Some(_tv) = self.view.upgrade() {
             let pixbuf_loader = gtk::gdk_pixbuf::PixbufLoader::new();
             if let Err(e) = pixbuf_loader.write(&data) {
                 eprintln!("[IMG] pixbuf_loader.write failed: {}", e);
@@ -882,7 +1263,10 @@ impl Perform for TerminalState {
             params.first().and_then(|p| std::str::from_utf8(p).ok()));
         if params.len() >= 2 {
             if params[0] == b"0" || params[0] == b"1" || params[0] == b"2" {
-                if let Ok(title) = std::str::from_utf8(params[1]) {
+                // Rejoin for title too — title might contain semicolons
+                let title_parts: Vec<&[u8]> = params[1..].to_vec();
+                let title_bytes: Vec<u8> = title_parts.join(&b';');
+                if let Ok(title) = std::str::from_utf8(&title_bytes) {
                     if let Some(lbl) = self.tab_label.upgrade() {
                         lbl.set_text(title);
                     }
@@ -895,26 +1279,40 @@ impl Perform for TerminalState {
                 } else {
                     self.current_tags.retain(|t| !t.starts_with("url:"));
                 }
-            } else if params[0] == b"1337" && params[1].starts_with(b"Widget=") {
-                // Widget embedding: OSC 1337 ; Widget=type:button;id:btn1;label:Click ST
-                if let Ok(spec) = std::str::from_utf8(&params[1][7..]) {
+            } else if params[0] == b"1337" {
+                // VTE splits on ';', but our custom protocols use ';' as property
+                // separator. Rejoin params[1..] to reconstruct the full payload.
+                let payload_parts: Vec<&[u8]> = params[1..].to_vec();
+                let payload_bytes: Vec<u8> = payload_parts.join(&b';');
+                let payload = match std::str::from_utf8(&payload_bytes) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => return,
+                };
+
+                if let Some(spec) = payload.strip_prefix("Panel=") {
+                    eprintln!("[PANEL] OSC 1337 Panel spec: {}", spec);
+                    self.insert_panel(spec);
+                } else if let Some(spec) = payload.strip_prefix("Widget=") {
                     eprintln!("[WIDGET] OSC 1337 Widget spec: {}", spec);
                     self.insert_widget(spec);
-                }
-            } else if params[0] == b"1337" && params[1].starts_with(b"File=") {
-                eprintln!("[IMG] OSC 1337 received, params[1] len={}", params[1].len());
-                if let Some(colon_pos) = params[1].iter().position(|&b| b == b':') {
-                    let b64 = &params[1][colon_pos + 1..];
-                    eprintln!("[IMG] base64 slice len={}", b64.len());
-                    match BASE64.decode(b64) {
-                        Ok(data) => {
-                            eprintln!("[IMG] decoded {} bytes, calling insert_image", data.len());
-                            self.insert_image(data);
+                } else if let Some(spec) = payload.strip_prefix("WidgetUpdate=") {
+                    eprintln!("[UPDATE] OSC 1337 WidgetUpdate spec: {}", spec);
+                    self.update_widget(spec);
+                } else if payload.starts_with("File=") {
+                    eprintln!("[IMG] OSC 1337 received, payload len={}", payload.len());
+                    if let Some(colon_pos) = payload.find(':') {
+                        let b64 = &payload.as_bytes()[colon_pos + 1..];
+                        eprintln!("[IMG] base64 slice len={}", b64.len());
+                        match BASE64.decode(b64) {
+                            Ok(data) => {
+                                eprintln!("[IMG] decoded {} bytes, calling insert_image", data.len());
+                                self.insert_image(data);
+                            }
+                            Err(e) => eprintln!("[IMG] base64 decode error: {}", e),
                         }
-                        Err(e) => eprintln!("[IMG] base64 decode error: {}", e),
+                    } else {
+                        eprintln!("[IMG] no colon found in File= payload");
                     }
-                } else {
-                    eprintln!("[IMG] no colon found in File= payload");
                 }
             } else if params[0] == b"108" {
                 if let Ok(data) = BASE64.decode(params[1]) {

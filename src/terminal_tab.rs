@@ -24,6 +24,17 @@ pub struct LocalPty {
 }
 
 fn spawn_local_shell(cols: u16, rows: u16) -> Result<(LocalPty, Box<dyn std::io::Read + Send>), Box<dyn std::error::Error + Send + Sync>> {
+    // On macOS, TMPDIR can be very long (>100 chars) which causes ENAMETOOLONG (error 40)
+    // when portable-pty creates unix sockets. Use a shorter temp dir.
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(tmpdir) = std::env::var("TMPDIR") {
+            if tmpdir.len() > 80 {
+                unsafe { std::env::set_var("TMPDIR", "/tmp"); }
+            }
+        }
+    }
+
     let pty_system = NativePtySystem::default();
     let pair = pty_system.openpty(PtySize {
         rows,
