@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+echo "demo showing image"
+
+python3 -c "
+import base64, sys
+data = open('../smartterm.png','rb').read()
+print('\033]1337;File=inline=1:' + base64.b64encode(data).decode() + '\a', end='')
+"
