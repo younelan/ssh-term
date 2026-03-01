@@ -98,11 +98,12 @@ fn keyval_to_bytes(keyval: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> Opti
 pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, override_pass: Option<String>) {
     let text_view = TextView::builder().editable(false).monospace(true).cursor_visible(true).focusable(true).can_focus(true).build();
     let provider = CssProvider::new();
-    provider.load_from_data(&format!(
-        "textview, textview text {{ background-color: {}; color: {}; font-size: {}pt; }}",
+    let css = format!(
+        "textview, textview text {{ background-color: {0}; background: {0}; color: {1}; font-size: {2}pt; }}" ,
         settings.bg_color, settings.fg_color, settings.font_size
-    ));
-    text_view.style_context().add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 200);
+    );
+    provider.load_from_data(&css);
+    text_view.style_context().add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 500);
 
     let scrolled = ScrolledWindow::builder().child(&text_view).vexpand(true).build();
     let label = Label::new(Some(&settings.name));
@@ -297,10 +298,11 @@ pub fn add_terminal_tab(notebook: &Notebook, settings: &ConnectionSettings, over
                         
                         s.font_size = new_size;
                         
-                        term.css_provider.load_from_data(&format!(
-                            "textview, textview text {{ background-color: {}; color: {}; font-size: {}pt; }}",
+                        let css = format!(
+                            "textview, textview text {{ background-color: {0}; background: {0}; color: {1}; font-size: {2}pt; }}",
                             s.bg_color, s.fg_color, new_size
-                        ));
+                        );
+                        term.css_provider.load_from_data(&css);
                         
                         save_sessions(&sessions);
                     }

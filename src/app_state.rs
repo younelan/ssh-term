@@ -26,10 +26,11 @@ pub fn update_active_terminals(session_id: &str, settings: &ConnectionSettings) 
         
         for t in list.iter() {
             if t.session_id == session_id {
-                t.css_provider.load_from_data(&format!(
-                    "textview, textview text {{ background-color: {}; color: {}; font-size: {}pt; }}",
+                let css = format!(
+                    "textview, textview text {{ background-color: {0}; background: {0}; color: {1}; font-size: {2}pt; }}",
                     settings.bg_color, settings.fg_color, settings.font_size
-                ));
+                );
+                t.css_provider.load_from_data(&css);
                 if let Ok(mut state) = t.term_state.lock() {
                     state.update_palette(&settings.palette);
                     state.primary_buffer.tag_table().foreach(|tag| {

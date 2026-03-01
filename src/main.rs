@@ -118,47 +118,131 @@ fn setup_app(app: &Application) {
 }
 
 fn apply_app_theme(theme_name: &str) {
-    let settings = gtk::Settings::default().expect("Could not get default settings");
-    let (is_dark, css_data) = match theme_name {
-        "Light" => (false, ""),
-        "Dark Blue" => (
-            true,
-            r#"
-            @define-color window_bg_color #0a192f;
-            @define-color view_bg_color #112240;
-            @define-color headerbar_bg_color #020c1b;
-            "#
-        ),
-        "Coffee" => (
-            true,
-            r#"
-            @define-color window_bg_color #2c211b;
-            @define-color view_bg_color #3e2e25;
-            @define-color headerbar_bg_color #1e1511;
-            "#
-        ),
-        _ => (true, ""), // Default to Dark
+    let display = gdk::Display::default().expect("Could not connect to a display.");
+    let settings = gtk::Settings::for_display(&display);
+    
+    // Explicit UI colors for reliable switching
+    let (bg, fg, hb_bg, is_dark) = match theme_name {
+        "Light" => ("#ffffff", "#000000", "#f6f6f6", false),
+        "Coffee" => ("#2c211b", "#f3e5ab", "#1e1511", true),
+        "Dark Blue" => ("#0a192f", "#ffffff", "#020c1b", true),
+        _ => ("#242424", "#ffffff", "#303030", true), // Default to Dark
     };
 
     settings.set_gtk_application_prefer_dark_theme(is_dark);
 
-    let provider = CssProvider::new();
-    provider.load_from_data(css_data);
-    gtk::style_context_add_provider_for_display(
-        &gdk::Display::default().expect("Could not connect to a display."),
-        &provider,
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1, // Override default app styles
+    let css = format!(
+        r#"
+        @define-color window_bg_color {0};
+        @define-color window_fg_color {1};
+        @define-color theme_bg_color {0};
+        @define-color theme_fg_color {1};
+        @define-color headerbar_bg_color {2};
+        @define-color headerbar_fg_color {1};
+        @define-color card_bg_color {0};
+        @define-color popover_bg_color {0};
+
+        /* Force theme on major UI containers */
+        window, .background, .main-app-window, .connection-box, 
+        box, grid, notebook, stack, scrolledwindow, viewport,
+        list, row, entry, entry > text,
+        popover, popover contents {{ 
+            background-color: {0}; 
+            color: {1}; 
+            background-image: none;
+            box-shadow: none;
+        }}
+
+        headerbar, headerbar > box, headerbar label, headerbar .title {{ 
+            background-color: {2}; 
+            color: {1}; 
+            background-image: none; 
+        }}
+
+        /* Specific widget fixes */
+        entry, dropdown > button {{
+            background-color: {0};
+            color: {1};
+            border: 1px solid alpha({1}, 0.2);
+            border-radius: 4px;
+            background-image: none;
+        }}
+        
+        dropdown, dropdown:hover {{
+            background-color: transparent;
+            border: none;
+            box-shadow: none;
+        }}
+        
+        dropdown > button > box, 
+        dropdown > button > stack, 
+        dropdown > button label,
+        dropdown > button image {{
+            background-color: transparent;
+        }}
+
+        button {{
+            border: 1px solid alpha({1}, 0.1);
+            background-color: alpha({1}, 0.05);
+            color: {1};
+            border-radius: 4px;
+        }}
+        button:hover, dropdown > button:hover {{
+            background-color: alpha({1}, 0.1);
+        }}
+
+        /* Notebook and Tab specific styling */
+        notebook > header {{
+            background-color: alpha({1}, 0.03);
+            border-bottom: 1px solid alpha({1}, 0.1);
+        }}
+        notebook tab {{
+            background-color: transparent;
+            color: alpha({1}, 0.6);
+            border: none;
+            padding: 8px 12px;
+        }}
+        notebook tab:checked {{
+            color: {1};
+            background-color: alpha({1}, 0.1);
+            border-bottom: 2px solid {1};
+        }}
+
+        label, label.title {{ 
+            background-color: transparent; 
+            color: inherit; 
+        }}
+        "#,
+        bg, fg, hb_bg
     );
+
+    thread_local! {
+        static APP_THEME_PROVIDER: CssProvider = CssProvider::new();
+        static PROVIDER_ADDED: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    }
+
+    APP_THEME_PROVIDER.with(|provider| {
+        provider.load_from_data(&css);
+        if !PROVIDER_ADDED.get() {
+            gtk::style_context_add_provider_for_display(
+                &display,
+                provider,
+                gtk::STYLE_PROVIDER_PRIORITY_USER,
+            );
+            PROVIDER_ADDED.set(true);
+        }
+    });
 }
 
 fn show_settings_window(app: &Application) {
     let window = ApplicationWindow::builder()
         .application(app)
         .title("App Settings")
-        .default_width(300)
-        .default_height(200)
+        .default_width(310)
+        .default_height(220)
         .modal(true)
         .build();
+    window.add_css_class("main-app-window");
 
     let vbox = GtkBox::new(Orientation::Vertical, 12);
     vbox.set_margin_top(20); vbox.set_margin_bottom(20); 
@@ -187,8 +271,13 @@ fn show_settings_window(app: &Application) {
         if let Some(item) = theme_dropdown.selected_item() {
             if let Ok(strobj) = item.downcast::<gtk::StringObject>() {
                 let text = strobj.string().to_string();
-                apply_app_theme(&text);
-                save_app_config(&AppConfig { theme: text });
+                save_app_config(&AppConfig { theme: text.clone() });
+                
+                // Change theme in next idle loop to avoid "Broken accounting" during window closure
+                glib::idle_add_local(move || {
+                    apply_app_theme(&text);
+                    glib::ControlFlow::Break
+                });
             }
         }
         if let Some(w) = win_weak.upgrade() {
@@ -238,6 +327,7 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
         .default_width(600)
         .default_height(650)
         .build();
+    window.add_css_class("main-app-window");
     let header = HeaderBar::new();
     header.set_show_title_buttons(true);
     

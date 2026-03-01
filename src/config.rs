@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use gtk4 as gtk;
+
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ConnectionSettings {
@@ -52,7 +54,7 @@ pub struct Theme {
     pub palette: [&'static str; 16],
 }
 
-pub const THEMES: [Theme; 6] = [
+pub const THEMES: [Theme; 7] = [
     Theme {
         name: "Basic",
         fg: "#ffffff",
@@ -107,6 +109,15 @@ pub const THEMES: [Theme; 6] = [
             "#6272a4", "#ff6e6e", "#69ff94", "#ffffa5", "#d6acff", "#ff92df", "#a4ffff", "#ffffff",
         ],
     },
+    Theme {
+        name: "Coffee",
+        fg: "#f3e5ab",
+        bg: "#2c211b",
+        palette: [
+            "#3e2e25", "#c0392b", "#27ae60", "#f1c40f", "#2980b9", "#8e44ad", "#16a085", "#bdc3c7",
+            "#7f8c8d", "#e74c3c", "#2ecc71", "#f39c12", "#3498db", "#9b59b6", "#1abc9c", "#ecf0f1",
+        ],
+    },
 ];
 
 fn default_fg() -> String { "#00ff00".to_string() }
@@ -137,6 +148,26 @@ pub fn get_256_color(n: u8, cur_palette: &[String]) -> String {
         let gray = (n - 232) * 10 + 8;
         format!("#{:02x}{:02x}{:02x}", gray, gray, gray)
     }
+}
+
+pub fn get_theme(name: &str) -> Option<&'static Theme> {
+    THEMES.iter().find(|t| t.name == name)
+}
+
+pub fn rgba_to_hex(rgba: gtk::gdk::RGBA) -> String {
+    format!("#{:02x}{:02x}{:02x}",
+        (rgba.red() * 255.0) as u8,
+        (rgba.green() * 255.0) as u8,
+        (rgba.blue() * 255.0) as u8)
+}
+
+pub fn hex_to_rgba(hex: &str) -> gtk::gdk::RGBA {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() != 6 { return gtk::gdk::RGBA::builder().red(0.0).green(0.0).blue(0.0).alpha(1.0).build(); }
+    let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0) as f32 / 255.0;
+    let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0) as f32 / 255.0;
+    let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0) as f32 / 255.0;
+    gtk::gdk::RGBA::builder().red(r).green(g).blue(b).alpha(1.0).build()
 }
 
 pub fn get_config_path() -> std::path::PathBuf {
