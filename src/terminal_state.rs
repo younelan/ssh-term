@@ -4,6 +4,382 @@ use gtk4 as gtk;
 use gtk::{glib, gio, Label, TextBuffer, TextTag, TextView};
 use gtk::prelude::*;
 use vte::Perform;
+
+// ── Graph widget ──────────────────────────────────────────────────────────────
+
+const GRAPH_PALETTE: &[&str] = &[
+    "#5b8dee", "#ff6b6b", "#51cf66", "#fcc419",
+    "#cc5de8", "#ff922b", "#20c997", "#f06595",
+];
+
+pub struct GraphData {
+    pub kind:       String,        // "bar" | "line" | "pie"
+    pub values:     Vec<Vec<f64>>, // outer = series, inner = data points
+    pub labels:     Vec<String>,   // x-axis / pie-slice labels
+    pub series_labels: Vec<String>,
+    pub color_strs: Vec<String>,
+    pub title:      String,
+    pub bg:         String,        // background hex, "" = default
+}
+
+fn parse_hex(hex: &str) -> (f64, f64, f64) {
+    let s = hex.trim_start_matches('#');
+    if s.len() < 6 { return (0.5, 0.5, 0.5); }
+    let r = u8::from_str_radix(&s[0..2], 16).unwrap_or(128) as f64 / 255.0;
+    let g = u8::from_str_radix(&s[2..4], 16).unwrap_or(128) as f64 / 255.0;
+    let b = u8::from_str_radix(&s[4..6], 16).unwrap_or(128) as f64 / 255.0;
+    (r, g, b)
+}
+
+fn series_color(gd: &GraphData, s: usize) -> (f64, f64, f64) {
+    parse_hex(gd.color_strs.get(s).map(|c| c.as_str())
+        .unwrap_or(GRAPH_PALETTE[s % GRAPH_PALETTE.len()]))
+}
+
+/// Returns (width, height) of a text string on the given cairo context, or (0,0) on error.
+fn text_size(cr: &gtk::cairo::Context, s: &str) -> (f64, f64) {
+    match cr.text_extents(s) {
+        Ok(e) => (e.width(), e.height()),
+        Err(_) => (0.0, 0.0),
+    }
+}
+
+fn set_fg(cr: &gtk::cairo::Context) {
+    cr.set_source_rgb(0.886, 0.910, 0.941);
+}
+fn set_dim(cr: &gtk::cairo::Context) {
+    cr.set_source_rgb(0.58, 0.635, 0.722);
+}
+
+fn draw_graph(cr: &gtk::cairo::Context, w: i32, h: i32, gd: &GraphData) {
+    // Background
+    if gd.bg.is_empty() {
+        cr.set_source_rgb(0.137, 0.118, 0.176);
+    } else {
+        let (r, g, b) = parse_hex(&gd.bg);
+        cr.set_source_rgb(r, g, b);
+    }
+    let _ = cr.paint();
+
+    let flat: Vec<f64> = gd.values.iter().flat_map(|s| s.iter().copied()).collect();
+    if flat.is_empty() { return; }
+
+    match gd.kind.as_str() {
+        "pie"  => draw_pie(cr, w, h, gd),
+        "line" => draw_line(cr, w, h, gd),
+        _      => draw_bar(cr, w, h, gd),
+    }
+
+    // Title
+    if !gd.title.is_empty() {
+        set_fg(cr);
+        cr.set_font_size(13.0);
+        let (tw, _) = text_size(cr, &gd.title);
+        cr.move_to((w as f64 - tw) / 2.0, 15.0);
+        let _ = cr.show_text(&gd.title);
+    }
+}
+
+fn grid_and_yaxis(cr: &gtk::cairo::Context, w: f64, margin_l: f64, margin_r: f64,
+                  margin_t: f64, ph: f64, h: f64, min_val: f64, range: f64) {
+    for i in 0..=4 {
+        let y = margin_t + ph * (1.0 - i as f64 / 4.0);
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.08);
+        cr.set_line_width(0.5);
+        cr.move_to(margin_l, y);
+        cr.line_to(w - margin_r, y);
+        let _ = cr.stroke();
+        set_dim(cr);
+        cr.set_font_size(9.0);
+        let val = min_val + range * i as f64 / 4.0;
+        let label = if range < 10.0 { format!("{:.1}", val) } else { format!("{:.0}", val) };
+        let (tw, th) = text_size(cr, &label);
+        cr.move_to((margin_l - tw - 4.0).max(0.0), y + th / 2.0);
+        let _ = cr.show_text(&label);
+        let _ = h; // suppress unused warning
+    }
+}
+
+fn draw_bar(cr: &gtk::cairo::Context, w: i32, h: i32, gd: &GraphData) {
+    let n_series = gd.values.len();
+    let n_groups = gd.values.iter().map(|s| s.len()).max().unwrap_or(0);
+    if n_groups == 0 { return; }
+
+    let margin_l = 42.0f64;
+    let margin_b = if gd.labels.is_empty() { 10.0 } else { 28.0 };
+    let margin_t = if gd.title.is_empty() { 10.0 } else { 26.0 };
+    let margin_r = 10.0f64;
+    let pw = w as f64 - margin_l - margin_r;
+    let ph = h as f64 - margin_t - margin_b;
+
+    let max_val: f64 = gd.values.iter().flat_map(|s| s.iter()).cloned().fold(0.0f64, f64::max).max(1.0);
+
+    grid_and_yaxis(cr, w as f64, margin_l, margin_r, margin_t, ph, h as f64, 0.0, max_val);
+
+    let group_w = pw / n_groups as f64;
+    let bar_gap  = 2.0f64;
+    let group_pad = 4.0f64;
+    let bar_w = ((group_w - group_pad * 2.0 - bar_gap * (n_series.saturating_sub(1)) as f64)
+                  / n_series as f64).max(2.0);
+
+    for g in 0..n_groups {
+        for s in 0..n_series {
+            let val = gd.values[s].get(g).copied().unwrap_or(0.0);
+            let bh = (val / max_val * ph).max(0.0);
+            let x  = margin_l + g as f64 * group_w + group_pad
+                     + s as f64 * (bar_w + bar_gap);
+            let y  = margin_t + ph - bh;
+
+            let (r, cg, b) = series_color(gd, s);
+            cr.set_source_rgb(r, cg, b);
+            cr.rectangle(x, y, bar_w, bh);
+            let _ = cr.fill();
+
+            // Value label on top (if room)
+            if bh > 14.0 {
+                cr.set_source_rgba(0.0, 0.0, 0.0, 0.6);
+                cr.set_font_size(8.0);
+                let label = if val == val.floor() { format!("{:.0}", val) } else { format!("{:.1}", val) };
+                let (tw, _) = text_size(cr, &label);
+                cr.move_to(x + bar_w / 2.0 - tw / 2.0, y + 10.0);
+                let _ = cr.show_text(&label);
+            }
+        }
+
+        // Group label
+        if let Some(lbl) = gd.labels.get(g) {
+            set_dim(cr);
+            cr.set_font_size(9.0);
+            let gx = margin_l + g as f64 * group_w + group_w / 2.0;
+            let (lw, _) = text_size(cr, lbl);
+            cr.move_to(gx - lw / 2.0, h as f64 - margin_b + 12.0);
+            let _ = cr.show_text(lbl);
+        }
+    }
+
+    // Series legend (top-right)
+    if n_series > 1 {
+        for s in 0..n_series {
+            let (r, cg, b) = series_color(gd, s);
+            let lx = margin_l + s as f64 * 80.0;
+            let ly = margin_t - 6.0;
+            cr.set_source_rgb(r, cg, b);
+            cr.rectangle(lx, ly, 10.0, 8.0);
+            let _ = cr.fill();
+            set_dim(cr);
+            cr.set_font_size(9.0);
+            let name = gd.series_labels.get(s).map(|s| s.as_str()).unwrap_or("");
+            cr.move_to(lx + 13.0, ly + 8.0);
+            let _ = cr.show_text(name);
+        }
+    }
+}
+
+fn draw_line(cr: &gtk::cairo::Context, w: i32, h: i32, gd: &GraphData) {
+    let n_series = gd.values.len();
+    let n_pts    = gd.values.iter().map(|s| s.len()).max().unwrap_or(0);
+    if n_pts == 0 { return; }
+
+    let margin_l = 42.0f64;
+    let margin_b = if gd.labels.is_empty() { 10.0 } else { 28.0 };
+    let margin_t = if gd.title.is_empty() { 10.0 } else { 26.0 };
+    let margin_r = 10.0f64;
+    let pw = w as f64 - margin_l - margin_r;
+    let ph = h as f64 - margin_t - margin_b;
+
+    let all: Vec<f64> = gd.values.iter().flat_map(|s| s.iter().copied()).collect();
+    let min_val = all.iter().cloned().fold(f64::MAX, f64::min);
+    let max_val = all.iter().cloned().fold(f64::MIN, f64::max);
+    let range   = (max_val - min_val).max(1.0);
+
+    grid_and_yaxis(cr, w as f64, margin_l, margin_r, margin_t, ph, h as f64, min_val, range);
+
+    let pt = |i: usize, v: f64| -> (f64, f64) {
+        let x = margin_l + if n_pts > 1 { i as f64 * pw / (n_pts - 1) as f64 } else { pw / 2.0 };
+        let y = margin_t + ph * (1.0 - (v - min_val) / range);
+        (x, y)
+    };
+
+    for s in 0..n_series {
+        let series = &gd.values[s];
+        if series.is_empty() { continue; }
+        let (r, cg, b) = series_color(gd, s);
+
+        // Fill under line
+        cr.new_path();
+        let (x0, y0) = pt(0, series[0]);
+        cr.move_to(x0, margin_t + ph);
+        cr.line_to(x0, y0);
+        for i in 1..series.len() {
+            let (xi, yi) = pt(i, series[i]);
+            cr.line_to(xi, yi);
+        }
+        let (xn, _) = pt(series.len() - 1, series[series.len() - 1]);
+        cr.line_to(xn, margin_t + ph);
+        cr.close_path();
+        cr.set_source_rgba(r, cg, b, 0.18);
+        let _ = cr.fill();
+
+        // Line
+        cr.set_line_width(2.0);
+        cr.set_source_rgb(r, cg, b);
+        let (x0, y0) = pt(0, series[0]);
+        cr.move_to(x0, y0);
+        for i in 1..series.len() {
+            let (xi, yi) = pt(i, series[i]);
+            cr.line_to(xi, yi);
+        }
+        let _ = cr.stroke();
+
+        // Dots
+        for i in 0..series.len() {
+            let (xi, yi) = pt(i, series[i]);
+            cr.arc(xi, yi, 3.5, 0.0, std::f64::consts::TAU);
+            cr.set_source_rgb(r, cg, b);
+            let _ = cr.fill();
+        }
+    }
+
+    // X labels
+    set_dim(cr);
+    cr.set_font_size(9.0);
+    for i in 0..n_pts {
+        if let Some(lbl) = gd.labels.get(i) {
+            let (xi, _) = pt(i, 0.0);
+            let (lw, _) = text_size(cr, lbl);
+            cr.move_to(xi - lw / 2.0, h as f64 - margin_b + 12.0);
+            let _ = cr.show_text(lbl);
+        }
+    }
+
+    // Series legend
+    if n_series > 1 {
+        for s in 0..n_series {
+            let (r, cg, b) = series_color(gd, s);
+            let lx = margin_l + s as f64 * 80.0;
+            let ly = margin_t - 6.0;
+            cr.set_source_rgb(r, cg, b);
+            cr.rectangle(lx, ly, 10.0, 8.0);
+            let _ = cr.fill();
+            set_dim(cr);
+            cr.set_font_size(9.0);
+            let name = gd.series_labels.get(s).map(|s| s.as_str()).unwrap_or("");
+            cr.move_to(lx + 13.0, ly + 8.0);
+            let _ = cr.show_text(name);
+        }
+    }
+}
+
+fn draw_pie(cr: &gtk::cairo::Context, w: i32, h: i32, gd: &GraphData) {
+    let empty = Vec::new();
+    let vals: &Vec<f64> = gd.values.first().unwrap_or(&empty);
+    let n = vals.len();
+    if n == 0 { return; }
+    let total: f64 = vals.iter().sum();
+    if total == 0.0 { return; }
+
+    let title_h  = if gd.title.is_empty() { 4.0 } else { 28.0 };
+    let legend_rows = (n + 1) / 2;
+    let legend_h = legend_rows as f64 * 18.0 + 6.0;
+    let pie_h    = (h as f64 - title_h - legend_h - 8.0).max(20.0);
+
+    let cx     = w as f64 / 2.0;
+    let cy     = title_h + pie_h / 2.0;
+    let radius = (w.min(pie_h as i32) as f64 / 2.0 - 10.0).max(10.0);
+
+    let mut angle = -std::f64::consts::FRAC_PI_2;
+    for (i, &val) in vals.iter().enumerate() {
+        let sweep = std::f64::consts::TAU * val / total;
+        let (r, cg, b) = series_color(gd, i);
+
+        cr.set_source_rgb(r, cg, b);
+        cr.move_to(cx, cy);
+        cr.arc(cx, cy, radius, angle, angle + sweep);
+        cr.close_path();
+        let _ = cr.fill();
+
+        // Thin border
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.25);
+        cr.set_line_width(1.0);
+        cr.move_to(cx, cy);
+        cr.arc(cx, cy, radius, angle, angle + sweep);
+        cr.close_path();
+        let _ = cr.stroke();
+
+        // Percentage label inside slice (only if sweep big enough)
+        if sweep > 0.2 {
+            let mid = angle + sweep / 2.0;
+            let lx  = cx + radius * 0.65 * mid.cos();
+            let ly  = cy + radius * 0.65 * mid.sin();
+            let pct = format!("{:.0}%", 100.0 * val / total);
+            cr.set_source_rgb(1.0, 1.0, 1.0);
+            cr.set_font_size(10.0);
+            let (pw, ph2) = text_size(cr, &pct);
+            cr.move_to(lx - pw / 2.0, ly + ph2 / 2.0);
+            let _ = cr.show_text(&pct);
+        }
+
+        angle += sweep;
+    }
+
+    // Legend (2 columns)
+    let legend_y = title_h + pie_h + 8.0;
+    let col_w = w as f64 / 2.0;
+    for (i, &val) in vals.iter().enumerate() {
+        let col = i % 2;
+        let row = i / 2;
+        let lx  = col as f64 * col_w + 10.0;
+        let ly  = legend_y + row as f64 * 18.0;
+
+        let (r, cg, b) = series_color(gd, i);
+        cr.set_source_rgb(r, cg, b);
+        cr.rectangle(lx, ly + 2.0, 10.0, 10.0);
+        let _ = cr.fill();
+
+        set_fg(cr);
+        cr.set_font_size(10.0);
+        let name = gd.labels.get(i).map(|s| s.as_str()).unwrap_or("");
+        let pct  = 100.0 * val / total;
+        let txt  = if name.is_empty() { format!("{:.1}%", pct) } else { format!("{} – {:.1}%", name, pct) };
+        cr.move_to(lx + 14.0, ly + 11.0);
+        let _ = cr.show_text(&txt);
+    }
+}
+
+fn parse_graph_data(spec: &str) -> GraphData {
+    let mut kind        = "bar".to_string();
+    let mut all_values: Vec<Vec<f64>> = Vec::new();
+    let mut labels      = Vec::new();
+    let mut series_labels = Vec::new();
+    let mut color_strs  = Vec::new();
+    let mut title       = String::new();
+    let mut bg          = String::new();
+
+    for part in spec.split(';') {
+        if let Some((k, v)) = part.split_once(':') {
+            match k.trim() {
+                "kind"   => kind = v.to_string(),
+                "title"  => title = v.to_string(),
+                "bg"     => bg = v.to_string(),
+                "labels" => labels = v.split('|').map(|s| s.to_string()).collect(),
+                "series" => series_labels = v.split('|').map(|s| s.to_string()).collect(),
+                "colors" => color_strs = v.split('|').map(|s| s.to_string()).collect(),
+                // data can be multi-series: "data:10|20|30,15|25|35"
+                "data" => {
+                    all_values = v.split(',')
+                        .map(|s| s.split('|').filter_map(|n| n.parse().ok()).collect())
+                        .collect();
+                }
+                _ => {}
+            }
+        }
+    }
+    if all_values.is_empty() {
+        all_values.push(Vec::new());
+    }
+    GraphData { kind, values: all_values, labels, series_labels, color_strs, title, bg }
+}
+
 pub fn keyval_to_bytes(keyval: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> Option<Vec<u8>> {
     let is_ctrl = state.contains(gtk::gdk::ModifierType::CONTROL_MASK);
     if is_ctrl && keyval == gtk::gdk::Key::space {
@@ -121,6 +497,14 @@ pub struct TerminalState {
     pub windows: std::collections::HashMap<String, gtk::Window>,
     /// Number of data columns per table/listview (excludes the 2 hidden fg/bg colour columns).
     pub table_data_cols: std::collections::HashMap<String, usize>,
+    /// Live data backing each graph widget (id -> GraphData).  Shared with the draw closure.
+    pub graph_data: std::collections::HashMap<String, std::rc::Rc<std::cell::RefCell<GraphData>>>,
+    /// Per-widget font family override.
+    pub widget_fonts: std::collections::HashMap<String, String>,
+    /// Per-widget font size override (px).
+    pub widget_sizes: std::collections::HashMap<String, u32>,
+    /// FlowBox containers for flowbox panels (id -> FlowBox).
+    pub flow_panels: std::collections::HashMap<String, gtk::FlowBox>,
 }
 
 impl TerminalState {
@@ -206,6 +590,10 @@ impl TerminalState {
             widget_fg_colors: std::collections::HashMap::new(),
             windows: std::collections::HashMap::new(),
             table_data_cols: std::collections::HashMap::new(),
+            graph_data: std::collections::HashMap::new(),
+            widget_fonts: std::collections::HashMap::new(),
+            widget_sizes: std::collections::HashMap::new(),
+            flow_panels: std::collections::HashMap::new(),
         }
     }
 
@@ -215,14 +603,22 @@ impl TerminalState {
     fn apply_widget_colors(&mut self, id: &str, widget: &gtk::Widget, bg: Option<&str>, fg: Option<&str>) {
         if let Some(b) = bg { self.widget_bg_colors.insert(id.to_string(), b.to_string()); }
         if let Some(f) = fg { self.widget_fg_colors.insert(id.to_string(), f.to_string()); }
-        let eff_bg = self.widget_bg_colors.get(id).cloned();
-        let eff_fg = self.widget_fg_colors.get(id).cloned();
-        if eff_bg.is_none() && eff_fg.is_none() { return; }
+        self.rebuild_widget_css(id, widget);
+    }
+
+    fn apply_widget_font(&mut self, id: &str, widget: &gtk::Widget, font: Option<&str>, size: Option<u32>) {
+        if let Some(f) = font { self.widget_fonts.insert(id.to_string(), f.to_string()); }
+        if let Some(s) = size  { self.widget_sizes.insert(id.to_string(), s); }
+        self.rebuild_widget_css(id, widget);
+    }
+
+    fn rebuild_widget_css(&mut self, id: &str, widget: &gtk::Widget) {
+        let eff_bg   = self.widget_bg_colors.get(id).cloned();
+        let eff_fg   = self.widget_fg_colors.get(id).cloned();
+        let eff_font = self.widget_fonts.get(id).cloned();
+        let eff_size = self.widget_sizes.get(id).copied();
+        if eff_bg.is_none() && eff_fg.is_none() && eff_font.is_none() && eff_size.is_none() { return; }
         widget.set_widget_name(&format!("wgt-{}", id));
-        // Build a CSS block that covers:
-        //   - the widget node itself  (background, and color for Label)
-        //   - the inner `label` node  (color for Button/CheckButton/etc.)
-        // `background-image:none` is required to strip GTK4's default gradient.
         let mut widget_props = String::new();
         let mut label_props  = String::new();
         if let Some(ref b) = eff_bg {
@@ -231,6 +627,16 @@ impl TerminalState {
         if let Some(ref f) = eff_fg {
             widget_props.push_str(&format!("color:{};", f));
             label_props.push_str(&format!("color:{};", f));
+        }
+        if let Some(ref font) = eff_font {
+            let fs = format!("font-family:\"{}\";", font);
+            widget_props.push_str(&fs);
+            label_props.push_str(&fs);
+        }
+        if let Some(sz) = eff_size {
+            let ss = format!("font-size:{}px;", sz);
+            widget_props.push_str(&ss);
+            label_props.push_str(&ss);
         }
         let mut css = format!("#wgt-{} {{ {} }}", id, widget_props);
         if !label_props.is_empty() {
@@ -249,6 +655,7 @@ impl TerminalState {
             self.widget_css_providers.insert(id.to_string(), provider);
         }
     }
+
 
     /// Ensure buffer has at least `n+1` lines (lines 0..=n exist).
     fn ensure_lines(&self, n: usize) {
@@ -428,7 +835,29 @@ impl TerminalState {
     /// Parse semicolon-separated key:value pairs from a widget spec string.
     fn parse_widget_props(spec: &str) -> std::collections::HashMap<String, String> {
         let mut map = std::collections::HashMap::new();
-        for part in spec.split(';') {
+        // Split on unescaped ';' and unescape values in one pass.
+        // Supported escapes inside any value: \n \r \\ \;
+        let mut parts: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut chars = spec.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                match chars.next() {
+                    Some('n')  => cur.push('\n'),
+                    Some('r')  => cur.push('\r'),
+                    Some(';')  => cur.push(';'),
+                    Some('\\') => cur.push('\\'),
+                    Some(c)    => { cur.push('\\'); cur.push(c); }
+                    None       => cur.push('\\'),
+                }
+            } else if ch == ';' {
+                parts.push(std::mem::take(&mut cur));
+            } else {
+                cur.push(ch);
+            }
+        }
+        parts.push(cur);
+        for part in parts {
             if let Some((k, v)) = part.split_once(':') {
                 map.insert(k.to_string(), v.to_string());
             }
@@ -556,6 +985,106 @@ impl TerminalState {
         if let Some(b) = panel_box { self.panels.insert(id.clone(), b); }
         if self.is_alternate { self.alt_cursor_x += 1; } else { self.cursor_x += 1; }
         eprintln!("[PANEL] inserted panel id={} layout={} inline", id, layout);
+    }
+
+    /// Read the current value of a widget and send it back as a WidgetEvent.
+    /// Spec: "id:editor"  →  WidgetEvent=id:editor;action:value;value:<text>
+    fn get_widget_value(&self, spec: &str) {
+        let props = Self::parse_widget_props(spec);
+        let id = match props.get("id") {
+            Some(v) => v.clone(),
+            None => return,
+        };
+        let value = if let Some(widget) = self.widgets.get(&id) {
+            if let Some(tv) = widget.downcast_ref::<gtk::TextView>() {
+                let buf = tv.buffer();
+                let start = buf.start_iter();
+                let end   = buf.end_iter();
+                buf.text(&start, &end, false).to_string()
+            } else if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
+                entry.text().to_string()
+            } else if let Some(lbl) = widget.downcast_ref::<gtk::Label>() {
+                lbl.text().to_string()
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+        // Escape so the single OSC sequence stays intact:
+        // \ → \\, newline → \n, ; → \; (semicolons would break Python's event parser)
+        let escaped = value.replace('\\', "\\\\").replace('\n', "\\n").replace(';', "\\;");
+        if let Some(ref tx) = self.pty_input_tx {
+            let msg = format!("\x1b]1337;WidgetEvent=id:{};action:value;value:{}\x07", id, escaped);
+            let _ = tx.send(msg.into_bytes());
+        }
+    }
+
+    /// Show a native file open/save dialog and send the result back as a WidgetEvent.
+    /// Spec format (first segment is mode): "open;id:fd1;title:Open;filter:*.py"
+    ///                                  or: "save;id:fd2;title:Save;default:out.py"
+    fn show_file_dialog(&self, spec: &str) {
+        let mode = spec.split(';').next().unwrap_or("open").trim().to_lowercase();
+        let props = Self::parse_widget_props(spec);
+        let id = props.get("id").cloned().unwrap_or_else(|| "fd".to_string());
+        let title = props.get("title").cloned().unwrap_or_else(|| {
+            if mode == "save" { "Save File".to_string() } else { "Open File".to_string() }
+        });
+        let default_name = props.get("default").cloned().unwrap_or_default();
+        let filter_pattern = props.get("filter").cloned();
+
+        let pty_tx = self.pty_input_tx.clone();
+        let id_save = id.clone();
+        let id_open = id.clone();
+
+        let dialog = gtk::FileDialog::builder()
+            .title(&title)
+            .modal(true)
+            .build();
+
+        if let Some(pattern) = filter_pattern {
+            let filter = gtk::FileFilter::new();
+            filter.add_pattern(&pattern);
+            let filters = gio::ListStore::new::<gtk::FileFilter>();
+            filters.append(&filter);
+            dialog.set_filters(Some(&filters));
+        }
+
+        if !default_name.is_empty() {
+            dialog.set_initial_name(Some(&default_name));
+        }
+
+        if mode == "save" {
+            dialog.save(None::<&gtk::Window>, None::<&gio::Cancellable>, move |result| {
+                let msg = match result {
+                    Ok(file) => {
+                        let path = file.path()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        format!("\x1b]1337;WidgetEvent=id:{};action:file;value:{}\x07", id_save, path)
+                    }
+                    Err(_) => format!("\x1b]1337;WidgetEvent=id:{};action:cancel;value:\x07", id_save),
+                };
+                if let Some(ref tx) = pty_tx {
+                    let _ = tx.send(msg.into_bytes());
+                }
+            });
+        } else {
+            dialog.open(None::<&gtk::Window>, None::<&gio::Cancellable>, move |result| {
+                let msg = match result {
+                    Ok(file) => {
+                        let path = file.path()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        format!("\x1b]1337;WidgetEvent=id:{};action:file;value:{}\x07", id_open, path)
+                    }
+                    Err(_) => format!("\x1b]1337;WidgetEvent=id:{};action:cancel;value:\x07", id_open),
+                };
+                if let Some(ref tx) = pty_tx {
+                    let _ = tx.send(msg.into_bytes());
+                }
+            });
+        }
     }
 
     /// Build a widget from parsed properties and return it (without placing it).
@@ -753,6 +1282,26 @@ impl TerminalState {
                 }
                 Some(pb.upcast())
             }
+            "graph" | "chart" => {
+                let width: i32  = props.get("width").and_then(|v| v.parse().ok()).unwrap_or(320);
+                let height: i32 = props.get("height").and_then(|v| v.parse().ok()).unwrap_or(220);
+                // Rebuild a spec string from all remaining props so parse_graph_data can handle them
+                let spec = props.iter()
+                    .map(|(k, v)| format!("{}:{}", k, v))
+                    .collect::<Vec<_>>()
+                    .join(";");
+                let gd = std::rc::Rc::new(std::cell::RefCell::new(parse_graph_data(&spec)));
+                let da = gtk::DrawingArea::new();
+                da.set_content_width(width);
+                da.set_content_height(height);
+                da.set_size_request(width, height);
+                let gd_draw = gd.clone();
+                da.set_draw_func(move |_, cr, w, h| {
+                    draw_graph(cr, w, h, &gd_draw.borrow());
+                });
+                self.graph_data.insert(id.clone(), gd);
+                Some(da.upcast())
+            }
             "badge" => {
                 let text = props.get("text").or(props.get("label")).cloned().unwrap_or_default();
                 let lbl = gtk::Label::new(Some(&text));
@@ -764,6 +1313,87 @@ impl TerminalState {
                     self.apply_widget_colors(&id, &lbl.clone().upcast(), bg.as_deref(), fg.as_deref());
                 }
                 Some(lbl.upcast())
+            }
+            "spinner" => {
+                let sp = gtk::Spinner::new();
+                let spinning = props.get("spinning").map(|v| v != "false" && v != "0").unwrap_or(true);
+                if spinning { sp.start(); }
+                let sz: i32 = props.get("size").and_then(|v| v.parse().ok()).unwrap_or(32);
+                sp.set_size_request(sz, sz);
+                Some(sp.upcast())
+            }
+            "colorpicker" | "colorbutton" => {
+                let dialog = gtk::ColorDialog::new();
+                dialog.set_with_alpha(
+                    props.get("alpha").map(|v| v == "true" || v == "1").unwrap_or(false)
+                );
+                let btn = gtk::ColorDialogButton::new(Some(dialog));
+                if let Some(hex) = props.get("value") {
+                    if let Ok(rgba) = hex.parse::<gtk::gdk::RGBA>() {
+                        btn.set_rgba(&rgba);
+                    }
+                }
+                let wid = id.clone();
+                let tx = pty_tx.clone();
+                btn.connect_rgba_notify(move |b| {
+                    let rgba = b.rgba();
+                    let hex = format!("#{:02x}{:02x}{:02x}",
+                        (rgba.red()   * 255.0) as u8,
+                        (rgba.green() * 255.0) as u8,
+                        (rgba.blue()  * 255.0) as u8);
+                    if let Some(ref tx) = tx {
+                        let msg = format!("\x1b]1337;WidgetEvent=id:{};action:changed;value:{}\x07", wid, hex);
+                        let _ = tx.send(msg.into_bytes());
+                    }
+                });
+                Some(btn.upcast())
+            }
+            "flowbox" | "flowpanel" => {
+                let width: i32  = props.get("width").and_then(|v| v.parse().ok()).unwrap_or(-1);
+                let height: i32 = props.get("height").and_then(|v| v.parse().ok()).unwrap_or(200);
+                let col_min: u32 = props.get("min_cols").and_then(|v| v.parse().ok()).unwrap_or(1);
+                let col_max: u32 = props.get("max_cols").and_then(|v| v.parse().ok()).unwrap_or(10);
+                let row_sp: u32 = props.get("row_spacing").and_then(|v| v.parse().ok()).unwrap_or(6);
+                let col_sp: u32 = props.get("col_spacing").and_then(|v| v.parse().ok()).unwrap_or(6);
+                let fb = gtk::FlowBox::new();
+                fb.set_min_children_per_line(col_min);
+                fb.set_max_children_per_line(col_max);
+                fb.set_row_spacing(row_sp);
+                fb.set_column_spacing(col_sp);
+                fb.set_selection_mode(gtk::SelectionMode::None);
+                fb.set_hexpand(true);
+                let sw = gtk::ScrolledWindow::new();
+                sw.set_child(Some(&fb));
+                sw.set_size_request(width, height);
+                sw.set_hexpand(true);
+                sw.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+                // Register FlowBox in its own map so insert_widget can route children to it
+                self.flow_panels.insert(id.clone(), fb);
+                Some(sw.upcast())
+            }
+            "scrollarea" => {
+                let width: i32  = props.get("width").and_then(|v| v.parse().ok()).unwrap_or(-1);
+                let height: i32 = props.get("height").and_then(|v| v.parse().ok()).unwrap_or(200);
+                let hpol = match props.get("hscroll").map(|s| s.as_str()) {
+                    Some("never")    => gtk::PolicyType::Never,
+                    Some("always")   => gtk::PolicyType::Always,
+                    _                => gtk::PolicyType::Automatic,
+                };
+                let vpol = match props.get("vscroll").map(|s| s.as_str()) {
+                    Some("never")    => gtk::PolicyType::Never,
+                    Some("always")   => gtk::PolicyType::Always,
+                    _                => gtk::PolicyType::Automatic,
+                };
+                let inner = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                inner.set_hexpand(true);
+                let sw = gtk::ScrolledWindow::new();
+                sw.set_child(Some(&inner));
+                sw.set_size_request(width, height);
+                sw.set_hexpand(true);
+                sw.set_vexpand(height < 0);
+                sw.set_policy(hpol, vpol);
+                self.panels.insert(id.clone(), inner);
+                Some(sw.upcast())
             }
             "label" => {
                 let text = props.get("label").or(props.get("text")).cloned().unwrap_or_default();
@@ -1038,6 +1668,8 @@ impl TerminalState {
                     tv.append_column(&col);
                 }
                 self.table_data_cols.insert(id.clone(), n);
+                // Single click = selection changed → action:selected
+                tv.set_activate_on_single_click(false);
                 let wid = id.clone();
                 let tx = pty_tx.clone();
                 let ncols = n;
@@ -1049,6 +1681,23 @@ impl TerminalState {
                         if let Some(ref tx) = tx {
                             let msg = format!("\x1b]1337;WidgetEvent=id:{};action:selected;value:{}\x07", wid, vals.join("|"));
                             let _ = tx.send(msg.into_bytes());
+                        }
+                    }
+                });
+                // Double click = row activated → action:activated
+                let wid2 = id.clone();
+                let tx2 = pty_tx.clone();
+                let ncols2 = n;
+                tv.connect_row_activated(move |tv, path, _col| {
+                    if let Some(model) = tv.model() {
+                        if let Some(iter) = model.iter(path) {
+                            let vals: Vec<String> = (0..ncols2)
+                                .filter_map(|i| model.get_value(&iter, i as i32).get::<String>().ok())
+                                .collect();
+                            if let Some(ref tx) = tx2 {
+                                let msg = format!("\x1b]1337;WidgetEvent=id:{};action:activated;value:{}\x07", wid2, vals.join("|"));
+                                let _ = tx.send(msg.into_bytes());
+                            }
                         }
                     }
                 });
@@ -1763,10 +2412,30 @@ impl TerminalState {
         };
         widget.set_visible(true);
         // Apply per-widget colours if provided
-        let bg = props.get("bg_color").map(|s| s.as_str());
-        let fg = props.get("fg_color").or(props.get("color")).map(|s| s.as_str());
+        let bg = props.get("bg_color").or(props.get("bg")).map(|s| s.as_str());
+        let fg = props.get("fg_color").or(props.get("fg")).or(props.get("color")).map(|s| s.as_str());
         if bg.is_some() || fg.is_some() {
             self.apply_widget_colors(&id, &widget, bg, fg);
+        }
+        // Font / size
+        let font = props.get("font").cloned();
+        let fsize: Option<u32> = props.get("size").and_then(|v| v.parse().ok());
+        if font.is_some() || fsize.is_some() {
+            self.apply_widget_font(&id, &widget, font.as_deref(), fsize);
+        }
+        // Tooltip
+        if let Some(tip) = props.get("tooltip") {
+            widget.set_tooltip_text(Some(tip));
+        }
+        // Visible / enabled overrides (default is shown + enabled)
+        if let Some(vis) = props.get("visible") {
+            widget.set_visible(vis == "true" || vis == "1");
+        }
+        if let Some(ena) = props.get("enabled") {
+            widget.set_sensitive(ena != "false" && ena != "0");
+        }
+        if let Some(sens) = props.get("sensitive") {
+            widget.set_sensitive(sens == "true" || sens == "1");
         }
         // Block-level widgets always fill horizontal space when placed inline.
         let default_expand = matches!(widget_type.as_str(),
@@ -1787,6 +2456,11 @@ impl TerminalState {
             if let Some(grid) = self.grids.get(pid) {
                 grid.attach(&widget, col, row, colspan, rowspan);
                 eprintln!("[WIDGET] {}(id={}) -> grid {} at row={} col={}", widget_type, id, pid, row, col);
+                return;
+            }
+            if let Some(fb) = self.flow_panels.get(pid).cloned() {
+                fb.append(&widget);
+                eprintln!("[WIDGET] {}(id={}) -> flowbox {}", widget_type, id, pid);
                 return;
             }
             if let Some(bx) = self.panels.get(pid) {
@@ -1861,7 +2535,7 @@ impl TerminalState {
 
         // Try each property update
         if let Some(text) = props.get("text") {
-            let text = &text.replace("\\n", "\n");
+            // parse_widget_props already unescaped \n, \r, \;, \\
             if let Some(lbl) = widget.downcast_ref::<gtk::Label>() {
                 lbl.set_text(text);
             } else if let Some(btn) = widget.downcast_ref::<gtk::Button>() {
@@ -1985,17 +2659,40 @@ impl TerminalState {
             }
         }
         // Dynamic colour updates
-        let bg = props.get("bg_color").map(|s| s.as_str());
-        let fg = props.get("fg_color").or(props.get("color")).map(|s| s.as_str());
+        let bg = props.get("bg_color").or(props.get("bg")).map(|s| s.as_str());
+        let fg = props.get("fg_color").or(props.get("fg")).or(props.get("color")).map(|s| s.as_str());
         if bg.is_some() || fg.is_some() {
             let w = widget.clone();
             self.apply_widget_colors(&id, &w, bg, fg);
         }
+        // Font / size
+        {
+            let font = props.get("font").cloned();
+            let fsize: Option<u32> = props.get("size").and_then(|v| v.parse().ok());
+            if font.is_some() || fsize.is_some() {
+                let w = widget.clone();
+                self.apply_widget_font(&id, &w, font.as_deref(), fsize);
+            }
+        }
+        // Tooltip
+        if let Some(tip) = props.get("tooltip") {
+            widget.set_tooltip_text(Some(tip));
+        }
         if let Some(sensitive) = props.get("sensitive") {
             widget.set_sensitive(sensitive == "true" || sensitive == "1");
         }
+        // enabled: is friend to sensitive (enabled:false = disable)
+        if let Some(ena) = props.get("enabled") {
+            widget.set_sensitive(ena != "false" && ena != "0");
+        }
         if let Some(visible) = props.get("visible") {
             widget.set_visible(visible == "true" || visible == "1");
+        }
+        // Spinner control
+        if let Some(spinning) = props.get("spinning") {
+            if let Some(sp) = widget.downcast_ref::<gtk::Spinner>() {
+                if spinning == "true" || spinning == "1" { sp.start(); } else { sp.stop(); }
+            }
         }
         // Update picturebox: path or data (base64)
         if let Some(path) = props.get("path") {
@@ -2086,6 +2783,34 @@ impl TerminalState {
                     }
                 }
                 _ => {}
+            }
+        }
+        // Graph data update
+        if let Some(gd_rc) = self.graph_data.get(&id) {
+            let mut gd = gd_rc.borrow_mut();
+            let mut dirty = false;
+            if let Some(v) = props.get("data") {
+                gd.values = v.split(',')
+                    .map(|s| s.split('|').filter_map(|n| n.parse().ok()).collect())
+                    .collect();
+                if gd.values.is_empty() { gd.values.push(Vec::new()); }
+                dirty = true;
+            }
+            if let Some(v) = props.get("kind")   { gd.kind = v.clone();   dirty = true; }
+            if let Some(v) = props.get("title")  { gd.title = v.clone();  dirty = true; }
+            if let Some(v) = props.get("labels") {
+                gd.labels = v.split('|').map(|s| s.to_string()).collect();
+                dirty = true;
+            }
+            if let Some(v) = props.get("colors") {
+                gd.color_strs = v.split('|').map(|s| s.to_string()).collect();
+                dirty = true;
+            }
+            drop(gd);
+            if dirty {
+                if let Some(da) = widget.downcast_ref::<gtk::DrawingArea>() {
+                    da.queue_draw();
+                }
             }
         }
         eprintln!("[UPDATE] widget '{}' updated", id);
@@ -2188,8 +2913,12 @@ impl TerminalState {
 
         self.panels.insert(id.clone(), root_box);
         self.windows.insert(id.clone(), win.clone());
-        win.present();
-        eprintln!("[WINDOW] created '{}' {}x{} modal={}", id, width, height, modal);
+        // Only present if visible is not explicitly false
+        let visible: bool = props.get("visible").map(|v| v != "false" && v != "0").unwrap_or(true);
+        if visible {
+            win.present();
+        }
+        eprintln!("[WINDOW] created '{}' {}x{} modal={} visible={}", id, width, height, modal, visible);
     }
 
     /// Update a named floating window.
@@ -2731,6 +3460,9 @@ impl Perform for TerminalState {
                     if let Err(e) = gio::AppInfo::launch_default_for_uri(&url, None::<&gio::AppLaunchContext>) {
                         eprintln!("[URL] launch_default_for_uri error: {}", e);
                     }
+                } else if let Some(spec) = payload.strip_prefix("FileDialog=") {
+                    eprintln!("[FILE] FileDialog spec: {}", spec);
+                    self.show_file_dialog(spec);
                 } else if let Some(spec) = payload.strip_prefix("Notify=") {
                     let props = Self::parse_widget_props(spec);
                     let title = props.get("title").cloned().unwrap_or_else(|| "Notification".into());
@@ -2769,6 +3501,9 @@ impl Perform for TerminalState {
                 } else if let Some(spec) = payload.strip_prefix("WidgetUpdate=") {
                     eprintln!("[UPDATE] OSC 1337 WidgetUpdate spec: {}", spec);
                     self.update_widget(spec);
+                } else if let Some(spec) = payload.strip_prefix("GetWidgetValue=") {
+                    eprintln!("[GET] OSC 1337 GetWidgetValue spec: {}", spec);
+                    self.get_widget_value(spec);
                 } else if payload.starts_with("File=") {
                     eprintln!("[IMG] OSC 1337 received, payload len={}", payload.len());
                     if let Some(colon_pos) = payload.find(':') {
