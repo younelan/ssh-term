@@ -311,6 +311,7 @@ impl CssProperties {
         if let Some(v) = self.padding_left { parts.push(format!("padding-left: {}px", v)); }
         if let Some(v) = self.padding_right { parts.push(format!("padding-right: {}px", v)); }
         if let Some(v) = self.text_indent { parts.push(format!("text-indent: {}px", v)); }
+        if let Some(v) = self.line_height { if v > 0.0 { parts.push(format!("line-height: {}px", v as i32)); } }
         if let Some(ref v) = self.paragraph_background { parts.push(format!("background-color: {}", v)); }
         if let Some(TextDirection::Rtl) = self.direction { parts.push("direction: rtl".to_string()); }
         if let Some(v) = self.letter_spacing { parts.push(format!("letter-spacing: {}px", v / 1024)); }
@@ -1087,6 +1088,14 @@ pub fn apply_to_text_tag(props: &CssProperties, tag: &gtk::TextTag, is_block: bo
     }
     if let Some(v) = props.line_height
         && v > 0.0 {
+            // line-height translates to spacing between lines:
+            // distribute half above and half below, plus inside wrap
+            let extra = (v - 16.0).max(0.0) as i32; // excess over ~default line height
+            let half = extra / 2;
+            if half > 0 {
+                tag.set_pixels_above_lines(half);
+                tag.set_pixels_below_lines(half);
+            }
             tag.set_pixels_inside_wrap(v as i32);
         }
     if is_block

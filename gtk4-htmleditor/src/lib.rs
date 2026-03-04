@@ -758,26 +758,56 @@ pub fn setup_tags(buffer: &gtk::TextBuffer) {
     let mark_tag = gtk::TextTag::builder().name("mark").background("yellow").foreground("black").build();
     buffer.tag_table().add(&mark_tag);
 
-    let pre_tag = gtk::TextTag::builder().name("pre").family("monospace").build();
+    let pre_tag = gtk::TextTag::builder()
+        .name("pre")
+        .family("monospace")
+        .paragraph_background("#f6f8fa")
+        .left_margin(12)
+        .right_margin(12)
+        .pixels_above_lines(4)
+        .pixels_below_lines(4)
+        .wrap_mode(gtk::WrapMode::None)
+        .build();
     buffer.tag_table().add(&pre_tag);
-    let code_tag = gtk::TextTag::builder().name("code").family("monospace").build();
+    let code_tag = gtk::TextTag::builder()
+        .name("code")
+        .family("monospace")
+        .background("#f0f0f0")
+        .build();
     buffer.tag_table().add(&code_tag);
 
-    let bq_tag = gtk::TextTag::builder().name("blockquote").left_margin(40).right_margin(40).build();
+    // Blockquote: left border effect via indent + paragraph background
+    let bq_tag = gtk::TextTag::builder()
+        .name("blockquote")
+        .left_margin(20)
+        .indent(-4)
+        .right_margin(20)
+        .pixels_above_lines(4)
+        .pixels_below_lines(4)
+        .paragraph_background("#f9f9f9")
+        .build();
     buffer.tag_table().add(&bq_tag);
 
     // Depth-level blockquote tags for nested email reply chains
-    let bq_colors = ["#f0f4ff", "#f4fff0", "#fff4f0", "#f8f0ff", "#fff8f0"];
+    let bq_colors = ["#4a90d9", "#6ab04c", "#e67e22", "#9b59b6", "#e74c3c"];
+    let bq_bg = ["#f0f4ff", "#f4fff0", "#fff4f0", "#f8f0ff", "#fff8f0"];
     for depth in 1..=5usize {
-        let margin = depth as i32 * 20;
+        let margin = 8 + depth as i32 * 16;
         let tag = gtk::TextTag::builder()
             .name(format!("blockquote_{}", depth))
             .left_margin(margin)
-            .paragraph_background(bq_colors[depth - 1])
+            .indent(-4)
+            .paragraph_background(bq_bg[depth - 1])
             .pixels_above_lines(2)
             .pixels_below_lines(2)
             .build();
         buffer.tag_table().add(&tag);
+        // Left-border color tag applied separately for the border visual
+        let border_tag = gtk::TextTag::builder()
+            .name(format!("bq_border_{}", depth))
+            .foreground(bq_colors[depth - 1])
+            .build();
+        buffer.tag_table().add(&border_tag);
     }
 
     let align_center = gtk::TextTag::builder().name("align_center").justification(gtk::Justification::Center).build();
