@@ -1051,40 +1051,136 @@ fn handle_flex(
 ) {
     let is_column = css_props.flex_direction.as_deref() == Some("column")
         || css_props.flex_direction.as_deref() == Some("column-reverse");
-    let orientation = if is_column {
-        gtk::Orientation::Vertical
-    } else {
-        gtk::Orientation::Horizontal
-    };
-
+    let is_wrap = css_props.flex_wrap.as_deref() == Some("wrap")
+        || css_props.flex_wrap.as_deref() == Some("wrap-reverse");
     let gap = css_props.gap.unwrap_or(0);
-    let gbox = gtk::Box::new(orientation, gap);
-    gbox.set_focusable(false);
-    gbox.set_can_target(true);
 
-    // Store original element + style in widget_name for round-trip serialization
     let tag_name = if let NodeData::Element { ref name, .. } = node.data {
         name.local.to_string()
     } else {
         "div".to_string()
     };
-    // Collect all raw attributes from the element
     let raw_attrs = collect_raw_attrs(node, css_props);
-    gbox.set_widget_name(&format!("flex:{}|{}", tag_name, raw_attrs));
-
-    // Determine child alignment from justify-content and align-items
     let justify = css_props.justify_content.as_deref().unwrap_or("flex-start");
     let align = css_props.align_items.as_deref().unwrap_or("stretch");
 
+    let available_width = {
+        let vw = view.allocated_width();
+        if vw > 100 { vw } else { 700 }
+    };
+
+    // ── Pre-scan: content widths + explicit CSS widths ──
+    let mut child_infos: Vec<(i32, Option<i32>)> = Vec::new(); // (content_w, explicit_px)
     for child in node.children.borrow().iter() {
-        // Skip text-only whitespace nodes between child elements
+        if let NodeData::Text { ref contents } = child.data {
+            if contents.borrow().trim().is_empty() {
+                continue;
+            }
+        }
+        let (explicit_w, pad_h) = if let NodeData::Element { ref name, ref attrs, .. } = child.data {
+            let child_tag = name.local.to_string().to_lowercase();
+            let child_attrs = attrs.borrow();
+            let mut child_style = None;
+            let mut child_class = None;
+            let mut child_id = None;
+            for attr in child_attrs.iter() {
+                match attr.name.local.to_string().as_str() {
+                    "class" => child_class = Some(attr.value.to_string()),
+                    "id" => child_id = Some(attr.value.to_string()),
+                    "style" => child_style = Some(attr.value.to_string()),
+                    _ => {}
+                }
+            }
+            drop(child_attrs);
+            let ccss = apply_css_cascade(
+                &child_tag, child_class.as_deref(), child_id.as_deref(),
+                child_style.as_deref(), &ctx.css_rules,
+            );
+            let ew = ccss.width.as_ref().and_then(|w| w.replace("px", "").trim().parse::<i32>().ok());
+            let ph = ccss.padding_left.unwrap_or(0) + ccss.padding_right.unwrap_or(0);
+            (ew, ph)
+        } else {
+            (None, 0)
+        };
+        let mut text_len = 0i32;
+        if let NodeData::Element { .. } = child.data {
+            for content in child.children.borrow().iter() {
+                count_text_length(content, &mut text_len);
+            }
+        } else if let NodeData::Text { ref contents } = child.data {
+            text_len = contents.borrow().trim().len() as i32;
+        }
+        let content_w = std::cmp::max(20, text_len * 8 + pad_h);
+        child_infos.push((content_w, explicit_w));
+    }
+
+    // Scale factor for no-wrap mode: shrink children proportionally to fit view
+    let num_children = child_infos.len() as i32;
+    let scale = if !is_wrap && !is_column && num_children > 0 {
+        let total_gaps = gap * (num_children - 1).max(0);
+        let available_for_children = available_width - total_gaps;
+        let total_content: i32 = child_infos.iter()
+            .map(|(cw, ew)| ew.unwrap_or(*cw))
+            .sum();
+        if total_content > available_for_children && total_content > 0 {
+            available_for_children as f64 / total_content as f64
+        } else {
+            1.0
+        }
+    } else {
+        1.0
+    };
+
+    // ── Build container: FlowBox for wrap, Box for no-wrap ──
+    let container: gtk::Widget = if is_wrap {
+        let fb = gtk::FlowBox::new();
+        fb.set_orientation(if is_column {
+            gtk::Orientation::Vertical
+        } else {
+            gtk::Orientation::Horizontal
+        });
+        fb.set_column_spacing(gap as u32);
+        fb.set_row_spacing(gap as u32);
+        fb.set_homogeneous(false);
+        fb.set_selection_mode(gtk::SelectionMode::None);
+        fb.set_hexpand(true);
+        fb.set_halign(gtk::Align::Fill);
+        fb.set_focusable(false);
+        fb.set_can_target(true);
+        fb.set_max_children_per_line(if is_column { 1 } else { 100 });
+        fb.set_min_children_per_line(0);
+        fb.set_widget_name(&format!("flex:{}|{}", tag_name, raw_attrs));
+        // FlowBox always needs a width constraint to know when to wrap
+        fb.set_size_request(available_width, -1);
+        fb.upcast::<gtk::Widget>()
+    } else {
+        let orientation = if is_column {
+            gtk::Orientation::Vertical
+        } else {
+            gtk::Orientation::Horizontal
+        };
+        let gbox = gtk::Box::new(orientation, gap);
+        gbox.set_hexpand(true);
+        gbox.set_halign(gtk::Align::Fill);
+        gbox.set_focusable(false);
+        gbox.set_can_target(true);
+        gbox.set_widget_name(&format!("flex:{}|{}", tag_name, raw_attrs));
+        // Only force 100% width if content needed to be scaled down
+        if scale < 1.0 {
+            gbox.set_size_request(available_width, -1);
+        }
+        gbox.upcast::<gtk::Widget>()
+    };
+
+    // ── Create child widgets ──
+    let mut child_idx = 0usize;
+    for child in node.children.borrow().iter() {
         if let NodeData::Text { ref contents } = child.data {
             if contents.borrow().trim().is_empty() {
                 continue;
             }
         }
 
-        // Resolve child CSS
         let child_css = if let NodeData::Element { ref name, ref attrs, .. } = child.data {
             let child_tag = name.local.to_string().to_lowercase();
             let child_attrs = attrs.borrow();
@@ -1101,11 +1197,8 @@ fn handle_flex(
             }
             drop(child_attrs);
             apply_css_cascade(
-                &child_tag,
-                child_class.as_deref(),
-                child_id.as_deref(),
-                child_style.as_deref(),
-                &ctx.css_rules,
+                &child_tag, child_class.as_deref(), child_id.as_deref(),
+                child_style.as_deref(), &ctx.css_rules,
             )
         } else {
             CssProperties::default()
@@ -1113,7 +1206,6 @@ fn handle_flex(
 
         let child_view = gtk::TextView::new();
         child_view.set_wrap_mode(gtk::WrapMode::WordChar);
-        child_view.set_hexpand(true);
         child_view.set_vexpand(false);
         child_view.set_focusable(true);
         child_view.set_can_focus(true);
@@ -1136,7 +1228,6 @@ fn handle_flex(
             match justify {
                 "center" => child_view.set_halign(gtk::Align::Center),
                 "flex-end" | "end" => child_view.set_halign(gtk::Align::End),
-                "space-between" | "space-around" | "space-evenly" => child_view.set_hexpand(true),
                 _ => {}
             }
             match align {
@@ -1147,26 +1238,6 @@ fn handle_flex(
             }
         }
 
-        // Apply child CSS via provider (bg, border, color, font, padding)
-        apply_child_css_provider(&child_view, &child_css);
-
-        // Apply child width: explicit CSS width, or estimate from content
-        if let Some(ref w) = child_css.width {
-            if let Ok(px) = w.replace("px", "").trim().parse::<i32>() {
-                child_view.set_size_request(px, -1);
-                child_view.set_hexpand(false);
-            }
-        } else {
-            // Estimate minimum width from text content
-            let mut text_len = 0i32;
-            for content in child.children.borrow().iter() {
-                count_text_length(content, &mut text_len);
-            }
-            let min_w = (text_len * 8).max(40).min(600);
-            child_view.set_size_request(min_w, -1);
-        }
-
-        // Store child's raw attrs for round-trip
         let child_raw = collect_raw_attrs(child, &child_css);
         let child_tag = if let NodeData::Element { ref name, .. } = child.data {
             name.local.to_string()
@@ -1175,7 +1246,6 @@ fn handle_flex(
         };
         child_view.set_widget_name(&format!("flexchild:{}|{}", child_tag, child_raw));
 
-        // Focus on click
         let cv = child_view.clone();
         let click = gtk::GestureClick::new();
         click.connect_pressed(move |gesture, _n, _x, _y| {
@@ -1187,29 +1257,52 @@ fn handle_flex(
         let child_buffer = child_view.buffer();
         crate::setup_tags(&child_buffer);
 
-        // Walk child content
         if let NodeData::Element { .. } = child.data {
             for content in child.children.borrow().iter() {
                 walk_dom(&child_view, content, &child_buffer, ctx);
             }
-        } else {
-            // Text node — insert directly
-            if let NodeData::Text { ref contents } = child.data {
-                let text = contents.borrow().to_string();
-                if !text.trim().is_empty() {
-                    let mut end_iter = child_buffer.end_iter();
-                    child_buffer.insert(&mut end_iter, text.trim());
-                }
+        } else if let NodeData::Text { ref contents } = child.data {
+            let text = contents.borrow().to_string();
+            if !text.trim().is_empty() {
+                let mut end_iter = child_buffer.end_iter();
+                child_buffer.insert(&mut end_iter, text.trim());
             }
         }
 
-        gbox.append(&child_view);
+        // Apply child width
+        if let Some((content_w, explicit_w)) = child_infos.get(child_idx) {
+            let raw_w = explicit_w.unwrap_or(*content_w);
+            if is_wrap {
+                // Wrap mode: use content width as-is, FlowBox handles overflow
+                child_view.set_size_request(raw_w, -1);
+            } else if is_column {
+                child_view.set_size_request(raw_w, -1);
+            } else {
+                let final_w = ((raw_w as f64 * scale) as i32).max(20);
+                child_view.set_size_request(final_w, -1);
+            }
+            if explicit_w.is_some() {
+                child_view.set_hexpand(false);
+            }
+        }
+
+        apply_child_css_provider(&child_view, &child_css);
+
+        // Append to container
+        if is_wrap {
+            if let Some(fb) = container.downcast_ref::<gtk::FlowBox>() {
+                fb.insert(&child_view, -1);
+            }
+        } else if let Some(gbox) = container.downcast_ref::<gtk::Box>() {
+            gbox.append(&child_view);
+        }
+        child_idx += 1;
     }
 
     ensure_newline(buffer);
     let mut end_iter = buffer.end_iter();
     let anchor = buffer.create_child_anchor(&mut end_iter);
-    view.add_child_at_anchor(&gbox, &anchor);
+    view.add_child_at_anchor(&container, &anchor);
     buffer.insert(&mut end_iter, "\n");
 }
 
@@ -1234,6 +1327,7 @@ fn handle_css_grid(
     grid.set_focusable(false);
     grid.set_can_target(true);
     grid.set_hexpand(true);
+    grid.set_halign(gtk::Align::Fill);
 
     // Store original element + style for round-trip serialization
     let tag_name = if let NodeData::Element { ref name, .. } = node.data {
@@ -1244,6 +1338,104 @@ fn handle_css_grid(
     let raw_attrs = collect_raw_attrs(node, css_props);
     grid.set_widget_name(&format!("cssgrid:{}|{}", tag_name, raw_attrs));
 
+    // ── Pass 1: pre-calculate column widths (like table cells) ──
+    let mut col_max_chars: HashMap<i32, i32> = HashMap::new();
+    let mut col_explicit_px: HashMap<i32, i32> = HashMap::new();
+    {
+        let mut col = 0i32;
+        for child in node.children.borrow().iter() {
+            if let NodeData::Text { ref contents } = child.data {
+                if contents.borrow().trim().is_empty() {
+                    continue;
+                }
+            }
+
+            // Resolve child CSS to get grid-column span
+            let child_css = if let NodeData::Element { ref name, ref attrs, .. } = child.data {
+                let child_tag = name.local.to_string().to_lowercase();
+                let child_attrs = attrs.borrow();
+                let mut child_style = None;
+                let mut child_class = None;
+                let mut child_id = None;
+                for attr in child_attrs.iter() {
+                    match attr.name.local.to_string().as_str() {
+                        "class" => child_class = Some(attr.value.to_string()),
+                        "id" => child_id = Some(attr.value.to_string()),
+                        "style" => child_style = Some(attr.value.to_string()),
+                        _ => {}
+                    }
+                }
+                drop(child_attrs);
+                apply_css_cascade(
+                    &child_tag,
+                    child_class.as_deref(),
+                    child_id.as_deref(),
+                    child_style.as_deref(),
+                    &ctx.css_rules,
+                )
+            } else {
+                CssProperties::default()
+            };
+
+            let colspan = child_css.grid_column.as_ref()
+                .map(|gc| parse_grid_span(gc, num_cols))
+                .unwrap_or(1);
+
+            // Count text in this child + padding
+            let mut text_len = 0i32;
+            if let NodeData::Element { .. } = child.data {
+                for content in child.children.borrow().iter() {
+                    count_text_length(content, &mut text_len);
+                }
+            } else if let NodeData::Text { ref contents } = child.data {
+                text_len = contents.borrow().trim().len() as i32;
+            }
+            let pad_h = child_css.padding_left.unwrap_or(0) + child_css.padding_right.unwrap_or(0);
+
+            // Store as chars + padding (padding added once, not per-column)
+            let per_col = text_len / colspan.max(1);
+            let pad_per_col = pad_h / colspan.max(1);
+            for c in 0..colspan {
+                let column = col + c;
+                let current_max = *col_max_chars.get(&column).unwrap_or(&0);
+                col_max_chars.insert(column, std::cmp::max(current_max, per_col * 8 + pad_per_col));
+            }
+
+            col += colspan;
+            if col >= num_cols {
+                col = 0;
+            }
+        }
+
+        // Store explicit px widths from grid-template-columns
+        for (i, spec) in col_specs.iter().enumerate() {
+            if let Ok(px) = spec.replace("px", "").trim().parse::<i32>() {
+                col_explicit_px.insert(i as i32, px);
+            }
+        }
+    }
+
+    // Calculate available width and scale factor
+    let grid_available_width = {
+        let vw = view.allocated_width();
+        if vw > 100 { vw } else { 700 }
+    };
+    let total_col_gaps = gap * (num_cols - 1).max(0);
+    let available_for_cols = grid_available_width - total_col_gaps;
+
+    // Sum up column widths (explicit px or content-based)
+    let total_col_content: i32 = (0..num_cols).map(|c| {
+        col_explicit_px.get(&c).copied()
+            .unwrap_or_else(|| std::cmp::max(20, col_max_chars.get(&c).copied().unwrap_or(0)))
+    }).sum();
+
+    let grid_scale = if total_col_content > available_for_cols && total_col_content > 0 {
+        available_for_cols as f64 / total_col_content as f64
+    } else {
+        1.0
+    };
+
+    // ── Pass 2: create child widgets ──
     let mut col = 0i32;
     let mut row = 0i32;
 
@@ -1301,28 +1493,6 @@ fn handle_css_grid(
             rowspan = parse_grid_span(gr, 100);
         }
 
-        // Apply column width from grid-template-columns spec, or estimate from content
-        let mut explicit_width = false;
-        if let Some(spec) = col_specs.get(col as usize) {
-            if let Ok(px) = spec.replace("px", "").trim().parse::<i32>() {
-                child_view.set_size_request(px * colspan, -1);
-                child_view.set_hexpand(false);
-                explicit_width = true;
-            }
-        }
-        if !explicit_width {
-            // Estimate minimum width from text content
-            let mut text_len = 0i32;
-            for content in child.children.borrow().iter() {
-                count_text_length(content, &mut text_len);
-            }
-            let min_w = (text_len * 8).max(40).min(600);
-            child_view.set_size_request(min_w, -1);
-        }
-
-        // Apply child CSS via provider
-        apply_child_css_provider(&child_view, &child_css);
-
         // Store child's raw attrs for round-trip
         let child_raw = collect_raw_attrs(child, &child_css);
         let child_tag = if let NodeData::Element { ref name, .. } = child.data {
@@ -1357,6 +1527,24 @@ fn handle_css_grid(
             }
         }
 
+        // Apply cell width: explicit px from grid-template-columns, or
+        // content-based scaled to fit view width (like flex)
+        if let Some(&px) = col_explicit_px.get(&col) {
+            child_view.set_size_request(px * colspan, -1);
+            child_view.set_hexpand(false);
+        } else {
+            let mut max_chars_in_cols = 0;
+            for c in 0..colspan {
+                max_chars_in_cols += *col_max_chars.get(&(col + c)).unwrap_or(&0);
+            }
+            let raw_w = std::cmp::max(20, max_chars_in_cols);
+            let final_w = ((raw_w as f64 * grid_scale) as i32).max(20);
+            child_view.set_size_request(final_w, -1);
+        }
+
+        // Apply child CSS via provider
+        apply_child_css_provider(&child_view, &child_css);
+
         grid.attach(&child_view, col, row, colspan, rowspan);
 
         col += colspan;
@@ -1364,6 +1552,11 @@ fn handle_css_grid(
             col = 0;
             row += 1;
         }
+    }
+
+    // Only force 100% width if content needed to be scaled down
+    if grid_scale < 1.0 {
+        grid.set_size_request(grid_available_width, -1);
     }
 
     ensure_newline(buffer);

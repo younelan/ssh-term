@@ -237,11 +237,19 @@ fn serialize_widget_anchor(iter: &gtk::TextIter, html: &mut String, css_rules_st
     if let Some(anchor) = iter.child_anchor() {
         let widgets = anchor.widgets();
         for widget in widgets.iter() {
-            // Check for Box (flex container)
+            // Check for Box (flex container, no-wrap)
             if let Some(gbox) = widget.downcast_ref::<gtk::Box>() {
                 let name = gbox.widget_name().to_string();
                 if name.starts_with("flex:") {
                     serialize_flex(gbox, html, css_rules_store);
+                    return;
+                }
+            }
+            // Check for FlowBox (flex container, wrap)
+            if let Some(fb) = widget.downcast_ref::<gtk::FlowBox>() {
+                let name = fb.widget_name().to_string();
+                if name.starts_with("flex:") {
+                    serialize_flex_flowbox(fb, html, css_rules_store);
                     return;
                 }
             }
@@ -391,6 +399,43 @@ fn serialize_flex(gbox: &gtk::Box, html: &mut String, css_rules_store: &HashMap<
             html.push_str(&format!("</{}>\n", child_tag));
         }
         child_opt = child_widget.next_sibling();
+    }
+
+    html.push_str(&format!("</{}>\n", tag));
+}
+
+fn serialize_flex_flowbox(fb: &gtk::FlowBox, html: &mut String, css_rules_store: &HashMap<String, String>) {
+    let name = fb.widget_name().to_string();
+    let (tag, attrs) = parse_layout_widget_name(&name, "flex:");
+
+    if attrs.is_empty() {
+        html.push_str(&format!("<{}>\n", tag));
+    } else {
+        html.push_str(&format!("<{} {}>\n", tag, attrs));
+    }
+
+    // FlowBox children are wrapped in FlowBoxChild — unwrap to get the TextView
+    let mut child_opt = fb.first_child();
+    while let Some(fb_child_widget) = child_opt {
+        // FlowBoxChild contains our TextView as its child
+        if let Some(fb_child) = fb_child_widget.downcast_ref::<gtk::FlowBoxChild>() {
+            if let Some(inner) = fb_child.child() {
+                if let Some(child_view) = inner.downcast_ref::<gtk::TextView>() {
+                    let child_name = inner.widget_name().to_string();
+                    let (child_tag, child_attrs) = parse_layout_widget_name(&child_name, "flexchild:");
+
+                    if child_attrs.is_empty() {
+                        html.push_str(&format!("  <{}>", child_tag));
+                    } else {
+                        html.push_str(&format!("  <{} {}>", child_tag, child_attrs));
+                    }
+                    let child_html = serialize_buffer(&child_view.buffer(), css_rules_store);
+                    html.push_str(child_html.trim());
+                    html.push_str(&format!("</{}>\n", child_tag));
+                }
+            }
+        }
+        child_opt = fb_child_widget.next_sibling();
     }
 
     html.push_str(&format!("</{}>\n", tag));
