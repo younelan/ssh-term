@@ -1,6 +1,7 @@
 use gtk4 as gtk;
 use gtk::prelude::*;
 use markup5ever_rcdom::{Handle, NodeData};
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::css::{
@@ -8,6 +9,17 @@ use crate::css::{
     format_list_marker, html_font_size_to_points, BorderStyle, CssProperties,
     ListStyleType, TextDirection, TextTransform, WhiteSpaceMode,
 };
+
+// ── Thread-local for table cell → editor communication ────────────────────
+
+thread_local! {
+    static TABLE_EDITOR_WEAK: RefCell<Option<std::rc::Weak<crate::NativeHtmlEditor>>> =
+        const { RefCell::new(None) };
+}
+
+pub(crate) fn set_table_editor(editor: Option<std::rc::Weak<crate::NativeHtmlEditor>>) {
+    TABLE_EDITOR_WEAK.with(|e| *e.borrow_mut() = editor);
+}
 
 // ── Parse Context ──────────────────────────────────────────────────────────
 
@@ -35,6 +47,18 @@ pub struct ParseContext {
     pub element_meta: HashMap<String, ElementMeta>,
     pub element_providers: HashMap<String, gtk::CssProvider>,
     pub cid_resolver: Option<std::rc::Rc<dyn Fn(&str) -> Option<Vec<u8>>>>,
+    /// Captured `<body>` attributes for round-trip serialization.
+    pub body_attrs: BodyAttrs,
+}
+
+/// Stores `<body>` element attributes for round-trip serialization.
+#[derive(Default, Clone, Debug)]
+pub struct BodyAttrs {
+    pub bgcolor: Option<String>,
+    pub text_color: Option<String>,
+    pub class: Option<String>,
+    pub style: Option<String>,
+    pub link_color: Option<String>,
 }
 
 impl ParseContext {
@@ -60,6 +84,7 @@ impl ParseContext {
             element_meta: HashMap::new(),
             element_providers: HashMap::new(),
             cid_resolver,
+            body_attrs: BodyAttrs::default(),
         }
     }
 }
@@ -73,6 +98,7 @@ pub struct ParseResult {
     pub hover_rules: HashMap<String, String>,
     pub element_meta: HashMap<String, ElementMeta>,
     pub element_providers: HashMap<String, gtk::CssProvider>,
+    pub body_attrs: BodyAttrs,
 }
 
 // ── Public Entry Point ─────────────────────────────────────────────────────
@@ -97,6 +123,7 @@ pub fn parse_html_to_buffer(
         hover_rules,
         element_meta: ctx.element_meta,
         element_providers: ctx.element_providers,
+        body_attrs: ctx.body_attrs,
     }
 }
 
@@ -263,7 +290,8 @@ fn walk_dom(
                     return;
                 }
                 "hr" => {
-                    insert_hr_widget(view, buffer);
+                    let hr_attrs = attrs.borrow();
+                    insert_hr_widget(view, buffer, &hr_attrs);
                     return;
                 }
                 _ => {}
@@ -765,6 +793,22 @@ fn handle_body(
     ctx: &mut ParseContext,
     css_props: &CssProperties,
 ) {
+    // Capture body attributes for round-trip serialization
+    if let NodeData::Element { ref attrs, .. } = node.data {
+        for attr in attrs.borrow().iter() {
+            let aname = attr.name.local.as_ref();
+            let val = attr.value.to_string();
+            match aname {
+                "bgcolor" => ctx.body_attrs.bgcolor = Some(val),
+                "text" => ctx.body_attrs.text_color = Some(val),
+                "link" => ctx.body_attrs.link_color = Some(val),
+                "class" => ctx.body_attrs.class = Some(val),
+                "style" => ctx.body_attrs.style = Some(val),
+                _ => {}
+            }
+        }
+    }
+
     // Apply body-level direction for BiDi support
     if let Some(TextDirection::Rtl) = css_props.direction {
         view.set_direction(gtk::TextDirection::Rtl);
@@ -795,23 +839,92 @@ fn handle_body(
 
 // ── <hr> Handling ──────────────────────────────────────────────────────────
 
-fn insert_hr_widget(view: &gtk::TextView, buffer: &gtk::TextBuffer) {
+fn insert_hr_widget(view: &gtk::TextView, buffer: &gtk::TextBuffer, attrs: &[html5ever::Attribute]) {
     ensure_newline(buffer);
     let mut end_iter = buffer.end_iter();
     let anchor = buffer.create_child_anchor(&mut end_iter);
 
+    // Parse classic HTML attributes: width, align, size, color
+    let mut height = 2;
+    let mut color = "#888888".to_string();
+    let mut widget_name = "hr_rule".to_string();
+    let mut fixed_width: Option<i32> = None;
+    let mut halign = gtk::Align::Fill;
+
+    for attr in attrs {
+        let name = attr.name.local.as_ref();
+        let val = attr.value.trim();
+        match name {
+            "width" => {
+                widget_name = format!("hr_rule:width={}", val);
+                if !val.ends_with('%') {
+                    if let Ok(px) = val.parse::<i32>() {
+                        fixed_width = Some(px);
+                    }
+                }
+            }
+            "align" => {
+                halign = match val.to_lowercase().as_str() {
+                    "left" => gtk::Align::Start,
+                    "right" => gtk::Align::End,
+                    _ => gtk::Align::Fill,
+                };
+                if !widget_name.contains(':') {
+                    widget_name = format!("hr_rule:align={}", val.to_lowercase());
+                } else {
+                    widget_name = format!("{};align={}", widget_name, val.to_lowercase());
+                }
+            }
+            "size" => {
+                if let Ok(sz) = val.parse::<i32>() {
+                    height = sz.max(1);
+                }
+            }
+            "color" => {
+                color = val.to_string();
+            }
+            _ => {}
+        }
+    }
+
+    // Store size/color in widget_name for serialization
+    if height != 2 {
+        if widget_name.contains(':') {
+            widget_name = format!("{};size={}", widget_name, height);
+        } else {
+            widget_name = format!("hr_rule:size={}", height);
+        }
+    }
+    if color != "#888888" {
+        if widget_name.contains(':') {
+            widget_name = format!("{};color={}", widget_name, color);
+        } else {
+            widget_name = format!("hr_rule:color={}", color);
+        }
+    }
+
     let hr_line = gtk::Separator::new(gtk::Orientation::Horizontal);
-    hr_line.set_margin_top(8);
-    hr_line.set_margin_bottom(8);
-    hr_line.set_hexpand(true);
-    hr_line.set_halign(gtk::Align::Fill);
-    hr_line.set_size_request(400, -1);
-    hr_line.set_widget_name("hr_rule");
+    hr_line.set_margin_top(4);
+    hr_line.set_margin_bottom(4);
+    hr_line.set_halign(halign);
+    hr_line.set_widget_name(&widget_name);
+
+    if let Some(px) = fixed_width {
+        hr_line.set_size_request(px, -1);
+    } else {
+        // Child anchors don't honor hexpand — use a large width that the
+        // TextView will clip to its own allocation.
+        let w = view.allocated_width();
+        hr_line.set_size_request(if w > 50 { w } else { 4096 }, -1);
+    }
 
     #[allow(deprecated)]
     {
         let provider = gtk::CssProvider::new();
-        provider.load_from_data("separator#hr_rule { min-height: 2px; background-color: black; }");
+        provider.load_from_data(&format!(
+            "separator {{ min-height: {}px; background-color: {}; }}",
+            height, color,
+        ));
         hr_line.style_context().add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
     }
 
@@ -1318,7 +1431,7 @@ fn apply_image_justification(pic: &gtk::Picture, justification: gtk::Justificati
     }
 }
 
-fn show_resize_dialog(pic: &gtk::Picture) {
+pub(crate) fn show_resize_dialog(pic: &gtk::Picture) {
     let cur_w = pic.width();
     let cur_h = pic.height();
 
@@ -2843,6 +2956,23 @@ fn handle_table(
                 gesture.set_state(gtk::EventSequenceState::Claimed);
             });
             cell_view.add_controller(click);
+
+            // Right-click context menu for table cell editing
+            let cv_right = cell_view.clone();
+            let grid_ref = grid.clone();
+            let right_click = gtk::GestureClick::new();
+            right_click.set_button(3);
+            right_click.connect_released(move |_gesture, _n, x, y| {
+                TABLE_EDITOR_WEAK.with(|weak_ref| {
+                    if let Some(ref weak) = *weak_ref.borrow() {
+                        if let Some(ed) = weak.upgrade() {
+                            ed.show_table_context_menu(&grid_ref, &cv_right, x, y);
+                        }
+                    }
+                });
+            });
+            cell_view.add_controller(right_click);
+
             // Store tag name + ALL raw HTML attributes for generic round-trip
             let cell_type = if is_header { "th" } else { "td" };
             {

@@ -1,0 +1,16 @@
+[package]
+name = "gtk4-htmleditor"
+version = "0.1.0"
+edition = "2024"
+authors=["Youness El Andaloussi"]
+description="Simple Rust HTML Editor"
+license="Dual license GPL/Proprietary"
+
+[dependencies]
+glib = "0.21.5"
+gtk4 = { version = "0.9", features = ["v4_10"] }
+html5ever = "0.27"
+markup5ever_rcdom = "0.3"
+regex = "1.12.3"
+resvg = "0.44"
+ureq = "3"

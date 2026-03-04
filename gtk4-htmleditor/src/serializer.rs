@@ -324,9 +324,17 @@ fn serialize_widget_anchor(iter: &gtk::TextIter, html: &mut String, css_rules_st
     if let Some(anchor) = iter.child_anchor() {
         let widgets = anchor.widgets();
         for widget in widgets.iter() {
-            // Check for Box (flex container, no-wrap)
+            // Check for Box (link preview or flex container)
             if let Some(gbox) = widget.downcast_ref::<gtk::Box>() {
                 let name = gbox.widget_name().to_string();
+                if let Some(url) = name.strip_prefix("link_preview:") {
+                    html.push_str(&format!(
+                        "<a href=\"{}\">{}</a>",
+                        url.replace('"', "&quot;"),
+                        url.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;"),
+                    ));
+                    return;
+                }
                 if name.starts_with("flex:") {
                     serialize_flex(gbox, html, css_rules_store);
                     return;
@@ -376,15 +384,36 @@ fn serialize_widget_anchor(iter: &gtk::TextIter, html: &mut String, css_rules_st
                 return;
             }
             // Check for Separator (hr)
-            if widget.downcast_ref::<gtk::Separator>().is_some() {
-                html.push_str("<hr>\n");
+            if let Some(sep) = widget.downcast_ref::<gtk::Separator>() {
+                let name = sep.widget_name().to_string();
+                if name == "hr_rule" {
+                    // Default: 100% centered
+                    html.push_str("<hr width=\"100%\" align=\"center\">\n");
+                } else if let Some(params) = name.strip_prefix("hr_rule:") {
+                    // Reconstruct attributes from widget_name
+                    html.push_str("<hr");
+                    let mut has_width = false;
+                    let mut has_align = false;
+                    for part in params.split(';') {
+                        if let Some((k, v)) = part.split_once('=') {
+                            html.push_str(&format!(" {}=\"{}\"", k, v));
+                            if k == "width" { has_width = true; }
+                            if k == "align" { has_align = true; }
+                        }
+                    }
+                    if !has_width { html.push_str(" width=\"100%\""); }
+                    if !has_align { html.push_str(" align=\"center\""); }
+                    html.push_str(">\n");
+                } else {
+                    html.push_str("<hr width=\"100%\" align=\"center\">\n");
+                }
                 return;
             }
         }
     }
 }
 
-fn serialize_grid_as_table(grid: &gtk::Grid, html: &mut String, css_rules_store: &HashMap<String, String>) {
+pub fn serialize_grid_as_table(grid: &gtk::Grid, html: &mut String, css_rules_store: &HashMap<String, String>) {
     // Grid widget_name stores raw HTML attributes verbatim
     let grid_name = grid.widget_name().to_string();
     if grid_name.is_empty() {
