@@ -516,7 +516,15 @@ impl NativeHtmlEditor {
     pub fn increase_indent(&self) {
         let buffer = self.view.buffer();
         let (start, end) = get_target_bounds(&buffer);
-        if let Some(tag) = buffer.tag_table().lookup("blockquote") {
+        let current = self.current_indent_level(&buffer, &start);
+        let new_level = (current + 1).min(10);
+        // Remove old indent tag if any
+        if current > 0 {
+            if let Some(old) = buffer.tag_table().lookup(&format!("indent_{}", current)) {
+                buffer.remove_tag(&old, &start, &end);
+            }
+        }
+        if let Some(tag) = buffer.tag_table().lookup(&format!("indent_{}", new_level)) {
             buffer.apply_tag(&tag, &start, &end);
             self.capture_undo_snapshot();
         }
@@ -525,10 +533,31 @@ impl NativeHtmlEditor {
     pub fn decrease_indent(&self) {
         let buffer = self.view.buffer();
         let (start, end) = get_target_bounds(&buffer);
-        if let Some(tag) = buffer.tag_table().lookup("blockquote") {
-            buffer.remove_tag(&tag, &start, &end);
+        let current = self.current_indent_level(&buffer, &start);
+        if current > 0 {
+            if let Some(old) = buffer.tag_table().lookup(&format!("indent_{}", current)) {
+                buffer.remove_tag(&old, &start, &end);
+            }
+            if current > 1 {
+                if let Some(tag) = buffer.tag_table().lookup(&format!("indent_{}", current - 1)) {
+                    buffer.apply_tag(&tag, &start, &end);
+                }
+            }
             self.capture_undo_snapshot();
         }
+    }
+
+    fn current_indent_level(&self, _buffer: &gtk::TextBuffer, iter: &gtk::TextIter) -> i32 {
+        for tag in &iter.tags() {
+            if let Some(name) = tag.name() {
+                if let Some(level) = name.strip_prefix("indent_") {
+                    if let Ok(n) = level.parse::<i32>() {
+                        return n;
+                    }
+                }
+            }
+        }
+        0
     }
 
     // ── Undo/Redo (snapshot-based) ──────────────────────────────────────────
@@ -808,6 +837,15 @@ pub fn setup_tags(buffer: &gtk::TextBuffer) {
             .foreground(bq_colors[depth - 1])
             .build();
         buffer.tag_table().add(&border_tag);
+    }
+
+    // Indent levels (margin-left: 40px per level)
+    for level in 1..=10 {
+        let tag = gtk::TextTag::builder()
+            .name(format!("indent_{}", level))
+            .left_margin(level * 40)
+            .build();
+        buffer.tag_table().add(&tag);
     }
 
     let align_center = gtk::TextTag::builder().name("align_center").justification(gtk::Justification::Center).build();

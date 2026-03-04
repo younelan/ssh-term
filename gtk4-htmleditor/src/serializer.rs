@@ -150,6 +150,7 @@ fn is_recognized_tag(name: &str) -> bool {
         || name.starts_with("css_")
         || name.starts_with("link:")
         || name.starts_with("blockquote_")
+        || name.starts_with("indent_")
         || name.starts_with("abbr_title:")
     {
         return true;
@@ -195,6 +196,12 @@ fn open_tag_markup(tag: &str, css_rules_store: &HashMap<String, String>) -> Stri
         "<div style=\"text-align: justify;\">".to_string()
     } else if tag.starts_with("blockquote_") {
         "<blockquote>".to_string()
+    } else if let Some(level) = tag.strip_prefix("indent_") {
+        if let Ok(n) = level.parse::<i32>() {
+            format!("<div style=\"margin-left: {}px\">", n * 40)
+        } else {
+            "<div>".to_string()
+        }
     } else if tag == "abbr_style" {
         // No abbr_title: present — emit plain <abbr>
         "<abbr>".to_string()
@@ -222,6 +229,8 @@ fn close_tag_name(tag: &str) -> String {
         "span".to_string()
     } else if tag.starts_with("blockquote_") {
         "blockquote".to_string()
+    } else if tag.starts_with("indent_") {
+        "div".to_string()
     } else if tag == "abbr_style" {
         "abbr".to_string()
     } else if tag.starts_with("abbr_title:") {
