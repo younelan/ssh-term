@@ -201,6 +201,21 @@ fn walk_dom(
                 return;
             }
 
+            // ── Flex / Grid layouts ──
+            if let Some(ref d) = css_props.display {
+                match d.as_str() {
+                    "flex" | "inline-flex" => {
+                        handle_flex(view, node, buffer, ctx, &css_props);
+                        return;
+                    }
+                    "grid" | "inline-grid" => {
+                        handle_css_grid(view, node, buffer, ctx, &css_props);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+
             // ── Self-closing / special elements ──
             match tag_name.as_str() {
                 "img" => {
@@ -1023,6 +1038,445 @@ fn resolve_li_style(node: &Handle, css_props: &CssProperties, ctx: &ParseContext
     } else {
         ListStyleType::Disc
     })
+}
+
+// ── Flex Layout Handling ───────────────────────────────────────────────────
+
+fn handle_flex(
+    view: &gtk::TextView,
+    node: &Handle,
+    buffer: &gtk::TextBuffer,
+    ctx: &mut ParseContext,
+    css_props: &CssProperties,
+) {
+    let is_column = css_props.flex_direction.as_deref() == Some("column")
+        || css_props.flex_direction.as_deref() == Some("column-reverse");
+    let orientation = if is_column {
+        gtk::Orientation::Vertical
+    } else {
+        gtk::Orientation::Horizontal
+    };
+
+    let gap = css_props.gap.unwrap_or(0);
+    let gbox = gtk::Box::new(orientation, gap);
+    gbox.set_focusable(false);
+    gbox.set_can_target(true);
+
+    // Store original element + style in widget_name for round-trip serialization
+    let tag_name = if let NodeData::Element { ref name, .. } = node.data {
+        name.local.to_string()
+    } else {
+        "div".to_string()
+    };
+    // Collect all raw attributes from the element
+    let raw_attrs = collect_raw_attrs(node, css_props);
+    gbox.set_widget_name(&format!("flex:{}|{}", tag_name, raw_attrs));
+
+    // Determine child alignment from justify-content and align-items
+    let justify = css_props.justify_content.as_deref().unwrap_or("flex-start");
+    let align = css_props.align_items.as_deref().unwrap_or("stretch");
+
+    for child in node.children.borrow().iter() {
+        // Skip text-only whitespace nodes between child elements
+        if let NodeData::Text { ref contents } = child.data {
+            if contents.borrow().trim().is_empty() {
+                continue;
+            }
+        }
+
+        // Resolve child CSS
+        let child_css = if let NodeData::Element { ref name, ref attrs, .. } = child.data {
+            let child_tag = name.local.to_string().to_lowercase();
+            let child_attrs = attrs.borrow();
+            let mut child_class = None;
+            let mut child_id = None;
+            let mut child_style = None;
+            for attr in child_attrs.iter() {
+                match attr.name.local.to_string().as_str() {
+                    "class" => child_class = Some(attr.value.to_string()),
+                    "id" => child_id = Some(attr.value.to_string()),
+                    "style" => child_style = Some(attr.value.to_string()),
+                    _ => {}
+                }
+            }
+            drop(child_attrs);
+            apply_css_cascade(
+                &child_tag,
+                child_class.as_deref(),
+                child_id.as_deref(),
+                child_style.as_deref(),
+                &ctx.css_rules,
+            )
+        } else {
+            CssProperties::default()
+        };
+
+        let child_view = gtk::TextView::new();
+        child_view.set_wrap_mode(gtk::WrapMode::WordChar);
+        child_view.set_hexpand(true);
+        child_view.set_vexpand(false);
+        child_view.set_focusable(true);
+        child_view.set_can_focus(true);
+        child_view.set_editable(true);
+
+        // Apply alignment from parent's justify-content / align-items
+        if is_column {
+            match align {
+                "center" => child_view.set_halign(gtk::Align::Center),
+                "flex-end" | "end" => child_view.set_halign(gtk::Align::End),
+                _ => child_view.set_halign(gtk::Align::Fill),
+            }
+            match justify {
+                "center" => child_view.set_valign(gtk::Align::Center),
+                "flex-end" | "end" => child_view.set_valign(gtk::Align::End),
+                "space-between" | "space-around" | "space-evenly" => child_view.set_vexpand(true),
+                _ => {}
+            }
+        } else {
+            match justify {
+                "center" => child_view.set_halign(gtk::Align::Center),
+                "flex-end" | "end" => child_view.set_halign(gtk::Align::End),
+                "space-between" | "space-around" | "space-evenly" => child_view.set_hexpand(true),
+                _ => {}
+            }
+            match align {
+                "center" => child_view.set_valign(gtk::Align::Center),
+                "flex-start" | "start" => child_view.set_valign(gtk::Align::Start),
+                "flex-end" | "end" => child_view.set_valign(gtk::Align::End),
+                _ => child_view.set_valign(gtk::Align::Fill),
+            }
+        }
+
+        // Apply child CSS via provider (bg, border, color, font, padding)
+        apply_child_css_provider(&child_view, &child_css);
+
+        // Apply child width: explicit CSS width, or estimate from content
+        if let Some(ref w) = child_css.width {
+            if let Ok(px) = w.replace("px", "").trim().parse::<i32>() {
+                child_view.set_size_request(px, -1);
+                child_view.set_hexpand(false);
+            }
+        } else {
+            // Estimate minimum width from text content
+            let mut text_len = 0i32;
+            for content in child.children.borrow().iter() {
+                count_text_length(content, &mut text_len);
+            }
+            let min_w = (text_len * 8).max(40).min(600);
+            child_view.set_size_request(min_w, -1);
+        }
+
+        // Store child's raw attrs for round-trip
+        let child_raw = collect_raw_attrs(child, &child_css);
+        let child_tag = if let NodeData::Element { ref name, .. } = child.data {
+            name.local.to_string()
+        } else {
+            "div".to_string()
+        };
+        child_view.set_widget_name(&format!("flexchild:{}|{}", child_tag, child_raw));
+
+        // Focus on click
+        let cv = child_view.clone();
+        let click = gtk::GestureClick::new();
+        click.connect_pressed(move |gesture, _n, _x, _y| {
+            cv.grab_focus();
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+        });
+        child_view.add_controller(click);
+
+        let child_buffer = child_view.buffer();
+        crate::setup_tags(&child_buffer);
+
+        // Walk child content
+        if let NodeData::Element { .. } = child.data {
+            for content in child.children.borrow().iter() {
+                walk_dom(&child_view, content, &child_buffer, ctx);
+            }
+        } else {
+            // Text node — insert directly
+            if let NodeData::Text { ref contents } = child.data {
+                let text = contents.borrow().to_string();
+                if !text.trim().is_empty() {
+                    let mut end_iter = child_buffer.end_iter();
+                    child_buffer.insert(&mut end_iter, text.trim());
+                }
+            }
+        }
+
+        gbox.append(&child_view);
+    }
+
+    ensure_newline(buffer);
+    let mut end_iter = buffer.end_iter();
+    let anchor = buffer.create_child_anchor(&mut end_iter);
+    view.add_child_at_anchor(&gbox, &anchor);
+    buffer.insert(&mut end_iter, "\n");
+}
+
+// ── CSS Grid Layout Handling ──────────────────────────────────────────────
+
+fn handle_css_grid(
+    view: &gtk::TextView,
+    node: &Handle,
+    buffer: &gtk::TextBuffer,
+    ctx: &mut ParseContext,
+    css_props: &CssProperties,
+) {
+    // Parse grid-template-columns to determine column count and widths
+    let template = css_props.grid_template_columns.as_deref().unwrap_or("1fr");
+    let col_specs: Vec<&str> = template.split_whitespace().collect();
+    let num_cols = col_specs.len().max(1) as i32;
+
+    let gap = css_props.gap.unwrap_or(0);
+    let grid = gtk::Grid::new();
+    grid.set_column_spacing(gap as u32);
+    grid.set_row_spacing(gap as u32);
+    grid.set_focusable(false);
+    grid.set_can_target(true);
+    grid.set_hexpand(true);
+
+    // Store original element + style for round-trip serialization
+    let tag_name = if let NodeData::Element { ref name, .. } = node.data {
+        name.local.to_string()
+    } else {
+        "div".to_string()
+    };
+    let raw_attrs = collect_raw_attrs(node, css_props);
+    grid.set_widget_name(&format!("cssgrid:{}|{}", tag_name, raw_attrs));
+
+    let mut col = 0i32;
+    let mut row = 0i32;
+
+    for child in node.children.borrow().iter() {
+        // Skip whitespace text nodes
+        if let NodeData::Text { ref contents } = child.data {
+            if contents.borrow().trim().is_empty() {
+                continue;
+            }
+        }
+
+        // Resolve child CSS
+        let child_css = if let NodeData::Element { ref name, ref attrs, .. } = child.data {
+            let child_tag = name.local.to_string().to_lowercase();
+            let child_attrs = attrs.borrow();
+            let mut child_class = None;
+            let mut child_id = None;
+            let mut child_style = None;
+            for attr in child_attrs.iter() {
+                match attr.name.local.to_string().as_str() {
+                    "class" => child_class = Some(attr.value.to_string()),
+                    "id" => child_id = Some(attr.value.to_string()),
+                    "style" => child_style = Some(attr.value.to_string()),
+                    _ => {}
+                }
+            }
+            drop(child_attrs);
+            apply_css_cascade(
+                &child_tag,
+                child_class.as_deref(),
+                child_id.as_deref(),
+                child_style.as_deref(),
+                &ctx.css_rules,
+            )
+        } else {
+            CssProperties::default()
+        };
+
+        let child_view = gtk::TextView::new();
+        child_view.set_wrap_mode(gtk::WrapMode::WordChar);
+        child_view.set_hexpand(true);
+        child_view.set_vexpand(false);
+        child_view.set_halign(gtk::Align::Fill);
+        child_view.set_focusable(true);
+        child_view.set_can_focus(true);
+        child_view.set_editable(true);
+
+        // Parse grid-column span (e.g. "span 2", "1 / 3", "1 / span 2")
+        let mut colspan = 1i32;
+        let mut rowspan = 1i32;
+        if let Some(ref gc) = child_css.grid_column {
+            colspan = parse_grid_span(gc, num_cols);
+        }
+        if let Some(ref gr) = child_css.grid_row {
+            rowspan = parse_grid_span(gr, 100);
+        }
+
+        // Apply column width from grid-template-columns spec, or estimate from content
+        let mut explicit_width = false;
+        if let Some(spec) = col_specs.get(col as usize) {
+            if let Ok(px) = spec.replace("px", "").trim().parse::<i32>() {
+                child_view.set_size_request(px * colspan, -1);
+                child_view.set_hexpand(false);
+                explicit_width = true;
+            }
+        }
+        if !explicit_width {
+            // Estimate minimum width from text content
+            let mut text_len = 0i32;
+            for content in child.children.borrow().iter() {
+                count_text_length(content, &mut text_len);
+            }
+            let min_w = (text_len * 8).max(40).min(600);
+            child_view.set_size_request(min_w, -1);
+        }
+
+        // Apply child CSS via provider
+        apply_child_css_provider(&child_view, &child_css);
+
+        // Store child's raw attrs for round-trip
+        let child_raw = collect_raw_attrs(child, &child_css);
+        let child_tag = if let NodeData::Element { ref name, .. } = child.data {
+            name.local.to_string()
+        } else {
+            "div".to_string()
+        };
+        child_view.set_widget_name(&format!("gridchild:{}|{}", child_tag, child_raw));
+
+        // Focus on click
+        let cv = child_view.clone();
+        let click = gtk::GestureClick::new();
+        click.connect_pressed(move |gesture, _n, _x, _y| {
+            cv.grab_focus();
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+        });
+        child_view.add_controller(click);
+
+        let child_buffer = child_view.buffer();
+        crate::setup_tags(&child_buffer);
+
+        // Walk child content
+        if let NodeData::Element { .. } = child.data {
+            for content in child.children.borrow().iter() {
+                walk_dom(&child_view, content, &child_buffer, ctx);
+            }
+        } else if let NodeData::Text { ref contents } = child.data {
+            let text = contents.borrow().to_string();
+            if !text.trim().is_empty() {
+                let mut end_iter = child_buffer.end_iter();
+                child_buffer.insert(&mut end_iter, text.trim());
+            }
+        }
+
+        grid.attach(&child_view, col, row, colspan, rowspan);
+
+        col += colspan;
+        if col >= num_cols {
+            col = 0;
+            row += 1;
+        }
+    }
+
+    ensure_newline(buffer);
+    let mut end_iter = buffer.end_iter();
+    let anchor = buffer.create_child_anchor(&mut end_iter);
+    view.add_child_at_anchor(&grid, &anchor);
+    buffer.insert(&mut end_iter, "\n");
+}
+
+// ── Shared helpers for flex/grid ──────────────────────────────────────────
+
+/// Parse a CSS grid-column/grid-row value into a span count.
+/// Supports: "span 2", "1 / 3" (=> span 2), "1 / span 2", "1 / -1" (full row).
+fn parse_grid_span(val: &str, max_cols: i32) -> i32 {
+    let val = val.trim();
+    // "span N"
+    if let Some(rest) = val.strip_prefix("span") {
+        return rest.trim().parse::<i32>().unwrap_or(1).max(1);
+    }
+    // "start / end" or "start / span N"
+    if let Some((start_s, end_s)) = val.split_once('/') {
+        let end_s = end_s.trim();
+        if let Some(rest) = end_s.strip_prefix("span") {
+            return rest.trim().parse::<i32>().unwrap_or(1).max(1);
+        }
+        let start: i32 = start_s.trim().parse().unwrap_or(1);
+        let end: i32 = end_s.parse().unwrap_or(start + 1);
+        if end == -1 {
+            return (max_cols - start + 1).max(1);
+        }
+        return (end - start).max(1);
+    }
+    1
+}
+
+/// Collect raw HTML attributes from a DOM node, merging in cascade-resolved
+/// styles that aren't already present in the raw style attribute.
+fn collect_raw_attrs(node: &Handle, css_props: &CssProperties) -> String {
+    let mut raw_attrs: Vec<(String, String)> = Vec::new();
+    if let NodeData::Element { ref attrs, .. } = node.data {
+        for attr in attrs.borrow().iter() {
+            raw_attrs.push((attr.name.local.to_string(), attr.value.to_string()));
+        }
+    }
+    // If no inline style but cascade resolved properties, add them
+    let has_style = raw_attrs.iter().any(|(k, _)| k == "style");
+    if !has_style {
+        let css_str = css_props.to_css_string();
+        if !css_str.is_empty() {
+            raw_attrs.push(("style".to_string(), css_str));
+        }
+    }
+    raw_attrs
+        .iter()
+        .map(|(k, v)| format!("{}=\"{}\"", k, v.replace('"', "&quot;")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Apply CSS properties (background, border, color, font, padding) to a child
+/// TextView via a GTK CssProvider.
+#[allow(deprecated)]
+fn apply_child_css_provider(child_view: &gtk::TextView, css: &CssProperties) {
+    let mut css_parts = Vec::new();
+    if let Some(ref bg) = css.background_color {
+        css_parts.push(format!("background-color: {};", bg));
+    }
+    if let Some(ref c) = css.color {
+        css_parts.push(format!("color: {};", c));
+    }
+    if let Some(ref ff) = css.font_family {
+        css_parts.push(format!("font-family: {};", ff));
+    }
+    if let Some(fs) = css.font_size {
+        css_parts.push(format!("font-size: {}pt;", fs));
+    }
+    if css.has_border() {
+        let w = css.border_top_width.unwrap_or(1);
+        let s = match css.border_style {
+            Some(BorderStyle::Dashed) => "dashed",
+            Some(BorderStyle::Dotted) => "dotted",
+            Some(BorderStyle::Double) => "double",
+            _ => "solid",
+        };
+        let c = css.border_color.as_deref().unwrap_or("alpha(currentColor, 0.3)");
+        css_parts.push(format!("border: {}px {} {};", w, s, c));
+    }
+    if let Some(ref br) = css.border_radius {
+        css_parts.push(format!("border-radius: {};", br));
+    }
+    // Apply padding via widget margins
+    if let Some(p) = css.padding_top { child_view.set_top_margin(p); }
+    if let Some(p) = css.padding_bottom { child_view.set_bottom_margin(p); }
+    if let Some(p) = css.padding_left { child_view.set_left_margin(p); }
+    if let Some(p) = css.padding_right { child_view.set_right_margin(p); }
+    // Shorthand: if all padding sides are same, set all
+    if css.padding_top.is_some() && css.padding_top == css.padding_bottom
+        && css.padding_top == css.padding_left && css.padding_top == css.padding_right
+    {
+        let p = css.padding_top.unwrap();
+        child_view.set_top_margin(p);
+        child_view.set_bottom_margin(p);
+        child_view.set_left_margin(p);
+        child_view.set_right_margin(p);
+    }
+
+    if !css_parts.is_empty() {
+        let provider = gtk::CssProvider::new();
+        provider.load_from_data(&format!("textview {{ {} }}", css_parts.join(" ")));
+        child_view
+            .style_context()
+            .add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+    }
 }
 
 // ── Table Handling ─────────────────────────────────────────────────────────

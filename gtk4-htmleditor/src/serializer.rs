@@ -237,9 +237,22 @@ fn serialize_widget_anchor(iter: &gtk::TextIter, html: &mut String, css_rules_st
     if let Some(anchor) = iter.child_anchor() {
         let widgets = anchor.widgets();
         for widget in widgets.iter() {
-            // Check for Grid (table)
+            // Check for Box (flex container)
+            if let Some(gbox) = widget.downcast_ref::<gtk::Box>() {
+                let name = gbox.widget_name().to_string();
+                if name.starts_with("flex:") {
+                    serialize_flex(gbox, html, css_rules_store);
+                    return;
+                }
+            }
+            // Check for Grid (table or CSS grid)
             if let Some(grid) = widget.downcast_ref::<gtk::Grid>() {
-                serialize_grid_as_table(grid, html, css_rules_store);
+                let name = grid.widget_name().to_string();
+                if name.starts_with("cssgrid:") {
+                    serialize_css_grid(grid, html, css_rules_store);
+                } else {
+                    serialize_grid_as_table(grid, html, css_rules_store);
+                }
                 return;
             }
             // Check for Picture (img)
@@ -339,4 +352,92 @@ fn serialize_grid_as_table(grid: &gtk::Grid, html: &mut String, css_rules_store:
         }
     }
     html.push_str("</table>\n");
+}
+
+/// Parse a "prefix:tag|attrs" widget_name into (tag, attrs).
+fn parse_layout_widget_name(name: &str, prefix: &str) -> (String, String) {
+    let rest = name.strip_prefix(prefix).unwrap_or(name);
+    if let Some((tag, attrs)) = rest.split_once('|') {
+        (tag.to_string(), attrs.replace("&quot;", "\""))
+    } else {
+        (rest.to_string(), String::new())
+    }
+}
+
+fn serialize_flex(gbox: &gtk::Box, html: &mut String, css_rules_store: &HashMap<String, String>) {
+    let name = gbox.widget_name().to_string();
+    let (tag, attrs) = parse_layout_widget_name(&name, "flex:");
+
+    if attrs.is_empty() {
+        html.push_str(&format!("<{}>\n", tag));
+    } else {
+        html.push_str(&format!("<{} {}>\n", tag, attrs));
+    }
+
+    // Iterate over children (gtk::Box children)
+    let mut child_opt = gbox.first_child();
+    while let Some(child_widget) = child_opt {
+        if let Some(child_view) = child_widget.downcast_ref::<gtk::TextView>() {
+            let child_name = child_widget.widget_name().to_string();
+            let (child_tag, child_attrs) = parse_layout_widget_name(&child_name, "flexchild:");
+
+            if child_attrs.is_empty() {
+                html.push_str(&format!("  <{}>", child_tag));
+            } else {
+                html.push_str(&format!("  <{} {}>", child_tag, child_attrs));
+            }
+            let child_html = serialize_buffer(&child_view.buffer(), css_rules_store);
+            html.push_str(child_html.trim());
+            html.push_str(&format!("</{}>\n", child_tag));
+        }
+        child_opt = child_widget.next_sibling();
+    }
+
+    html.push_str(&format!("</{}>\n", tag));
+}
+
+fn serialize_css_grid(grid: &gtk::Grid, html: &mut String, css_rules_store: &HashMap<String, String>) {
+    let name = grid.widget_name().to_string();
+    let (tag, attrs) = parse_layout_widget_name(&name, "cssgrid:");
+
+    if attrs.is_empty() {
+        html.push_str(&format!("<{}>\n", tag));
+    } else {
+        html.push_str(&format!("<{} {}>\n", tag, attrs));
+    }
+
+    let mut serialized_cells: std::collections::HashSet<*const std::ffi::c_void> = std::collections::HashSet::new();
+
+    for row in 0..100 {
+        let mut found_any = false;
+        for col in 0..100 {
+            if let Some(w) = grid.child_at(col, row) {
+                let ptr = w.as_ptr() as *const std::ffi::c_void;
+                if serialized_cells.contains(&ptr) {
+                    continue;
+                }
+                serialized_cells.insert(ptr);
+                found_any = true;
+
+                if let Some(child_view) = w.downcast_ref::<gtk::TextView>() {
+                    let child_name = w.widget_name().to_string();
+                    let (child_tag, child_attrs) = parse_layout_widget_name(&child_name, "gridchild:");
+
+                    if child_attrs.is_empty() {
+                        html.push_str(&format!("  <{}>", child_tag));
+                    } else {
+                        html.push_str(&format!("  <{} {}>", child_tag, child_attrs));
+                    }
+                    let child_html = serialize_buffer(&child_view.buffer(), css_rules_store);
+                    html.push_str(child_html.trim());
+                    html.push_str(&format!("</{}>\n", child_tag));
+                }
+            }
+        }
+        if !found_any && row > 0 {
+            break;
+        }
+    }
+
+    html.push_str(&format!("</{}>\n", tag));
 }

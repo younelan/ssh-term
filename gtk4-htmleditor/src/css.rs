@@ -142,6 +142,16 @@ pub struct CssProperties {
     pub left_pos: Option<String>,
     pub z_index: Option<String>,
     pub display: Option<String>,
+
+    // Flex/Grid layout (rendered via embedded widgets)
+    pub flex_direction: Option<String>,
+    pub flex_wrap: Option<String>,
+    pub justify_content: Option<String>,
+    pub align_items: Option<String>,
+    pub gap: Option<i32>,
+    pub grid_template_columns: Option<String>,
+    pub grid_column: Option<String>,
+    pub grid_row: Option<String>,
 }
 
 impl CssProperties {
@@ -207,6 +217,14 @@ impl CssProperties {
         merge_field!(left_pos);
         merge_field!(z_index);
         merge_field!(display);
+        merge_field!(flex_direction);
+        merge_field!(flex_wrap);
+        merge_field!(justify_content);
+        merge_field!(align_items);
+        merge_field!(gap);
+        merge_field!(grid_template_columns);
+        merge_field!(grid_column);
+        merge_field!(grid_row);
         if other.display_none {
             self.display_none = true;
         }
@@ -338,6 +356,14 @@ impl CssProperties {
         if let Some(ref v) = self.left_pos { parts.push(format!("left: {}", v)); }
         if let Some(ref v) = self.z_index { parts.push(format!("z-index: {}", v)); }
         if let Some(ref v) = self.display { parts.push(format!("display: {}", v)); }
+        if let Some(ref v) = self.flex_direction { parts.push(format!("flex-direction: {}", v)); }
+        if let Some(ref v) = self.flex_wrap { parts.push(format!("flex-wrap: {}", v)); }
+        if let Some(ref v) = self.justify_content { parts.push(format!("justify-content: {}", v)); }
+        if let Some(ref v) = self.align_items { parts.push(format!("align-items: {}", v)); }
+        if let Some(v) = self.gap { parts.push(format!("gap: {}px", v)); }
+        if let Some(ref v) = self.grid_template_columns { parts.push(format!("grid-template-columns: {}", v)); }
+        if let Some(ref v) = self.grid_column { parts.push(format!("grid-column: {}", v)); }
+        if let Some(ref v) = self.grid_row { parts.push(format!("grid-row: {}", v)); }
         parts.join("; ")
     }
 }
@@ -700,6 +726,16 @@ pub fn parse_declarations(decls: &str) -> CssProperties {
                     props.display = Some(v);
                 }
             }
+
+            // ── Flex / Grid layout ──
+            "flex-direction" => { props.flex_direction = Some(val.to_lowercase()); }
+            "flex-wrap" => { props.flex_wrap = Some(val.to_lowercase()); }
+            "justify-content" => { props.justify_content = Some(val.to_lowercase()); }
+            "align-items" => { props.align_items = Some(val.to_lowercase()); }
+            "gap" | "grid-gap" => { props.gap = parse_px(val); }
+            "grid-template-columns" => { props.grid_template_columns = Some(val.to_string()); }
+            "grid-column" => { props.grid_column = Some(val.to_string()); }
+            "grid-row" => { props.grid_row = Some(val.to_string()); }
 
             // ── List ──
             "list-style-type" => {
