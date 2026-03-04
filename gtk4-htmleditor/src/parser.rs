@@ -1663,6 +1663,25 @@ fn apply_child_css_provider(child_view: &gtk::TextView, css: &CssProperties) {
         child_view.set_right_margin(p);
     }
 
+    // Apply min-width / max-width as widget size constraints
+    if let Some(ref mw) = css.min_width {
+        if let Ok(px) = mw.replace("px", "").trim().parse::<i32>() {
+            let (cur_w, cur_h) = child_view.size_request();
+            child_view.set_size_request(px.max(cur_w), cur_h);
+        }
+    }
+    if let Some(ref mw) = css.max_width {
+        if let Ok(px) = mw.replace("px", "").trim().parse::<i32>() {
+            css_parts.push(format!("max-width: {}px;", px));
+        }
+    }
+    // Apply opacity via GTK CSS
+    if let Some(v) = css.opacity {
+        if v < 1.0 {
+            css_parts.push(format!("opacity: {};", v));
+        }
+    }
+
     if !css_parts.is_empty() {
         let provider = gtk::CssProvider::new();
         provider.load_from_data(&format!("textview {{ {} }}", css_parts.join(" ")));

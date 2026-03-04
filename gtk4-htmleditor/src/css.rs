@@ -1033,12 +1033,30 @@ pub fn heading_size_to_points(level: i32) -> f64 {
 
 /// Apply resolved CssProperties to a GTK TextTag.
 pub fn apply_to_text_tag(props: &CssProperties, tag: &gtk::TextTag, is_block: bool) {
+    let alpha = props.opacity.unwrap_or(1.0) as f32;
+
     if let Some(ref v) = props.color {
-        tag.set_foreground(Some(v));
+        if alpha < 1.0 {
+            let rgba = gtk::gdk::RGBA::parse(v).unwrap_or(gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 1.0));
+            tag.set_foreground_rgba(Some(&gtk::gdk::RGBA::new(rgba.red(), rgba.green(), rgba.blue(), alpha)));
+        } else {
+            tag.set_foreground(Some(v));
+        }
+    } else if alpha < 1.0 {
+        // No explicit color but opacity set — apply alpha to default black foreground
+        tag.set_foreground_rgba(Some(&gtk::gdk::RGBA::new(0.0, 0.0, 0.0, alpha)));
     }
     if let Some(ref v) = props.background_color {
         if is_block {
-            tag.set_paragraph_background(Some(v));
+            if alpha < 1.0 {
+                let rgba = gtk::gdk::RGBA::parse(v).unwrap_or(gtk::gdk::RGBA::new(1.0, 1.0, 1.0, 1.0));
+                tag.set_paragraph_background_rgba(Some(&gtk::gdk::RGBA::new(rgba.red(), rgba.green(), rgba.blue(), alpha)));
+            } else {
+                tag.set_paragraph_background(Some(v));
+            }
+        } else if alpha < 1.0 {
+            let rgba = gtk::gdk::RGBA::parse(v).unwrap_or(gtk::gdk::RGBA::new(1.0, 1.0, 1.0, 1.0));
+            tag.set_background_rgba(Some(&gtk::gdk::RGBA::new(rgba.red(), rgba.green(), rgba.blue(), alpha)));
         } else {
             tag.set_background(Some(v));
         }
@@ -1116,7 +1134,24 @@ pub fn apply_to_text_tag(props: &CssProperties, tag: &gtk::TextTag, is_block: bo
         }
     }
     if let Some(v) = props.letter_spacing {
-        tag.set_letter_spacing(v);
+        if v >= 0 {
+            tag.set_letter_spacing(v);
+        }
+    }
+    // white-space: nowrap → prevent text wrapping
+    if let Some(ref ws) = props.white_space {
+        match ws {
+            WhiteSpaceMode::Nowrap => {
+                tag.set_wrap_mode(gtk::WrapMode::None);
+            }
+            WhiteSpaceMode::Pre => {
+                tag.set_wrap_mode(gtk::WrapMode::None);
+            }
+            WhiteSpaceMode::PreWrap => {
+                tag.set_wrap_mode(gtk::WrapMode::WordChar);
+            }
+            _ => {}
+        }
     }
     // vertical-align: super/sub
     if let Some(ref va) = props.vertical_align {
