@@ -166,6 +166,8 @@ fn is_recognized_tag(name: &str) -> bool {
         || name.starts_with("blockquote_")
         || name.starts_with("indent_")
         || name.starts_with("comment:")
+        || name.starts_with("font:")
+        || name.starts_with("size:")
         || name.starts_with("abbr_title:")
     {
         return true;
@@ -203,6 +205,12 @@ fn open_tag_markup(tag: &str, css_rules_store: &HashMap<String, String>) -> Stri
     } else if tag.starts_with("color: ") {
         let color = tag.strip_prefix("color: ").unwrap_or("");
         format!("<span style=\"color: {}\">", color)
+    } else if tag.starts_with("font:") {
+        let family = tag.strip_prefix("font:").unwrap_or("");
+        format!("<span style=\"font-family: {}\">", family)
+    } else if tag.starts_with("size:") {
+        let size = tag.strip_prefix("size:").unwrap_or("12");
+        format!("<span style=\"font-size: {}pt\">", size)
     } else if tag == "align_center" {
         "<div style=\"text-align: center;\">".to_string()
     } else if tag == "align_right" {
@@ -234,7 +242,7 @@ fn close_tag_name(tag: &str) -> String {
         "ul".to_string()
     } else if tag.starts_with("ol_") {
         "ol".to_string()
-    } else if tag.starts_with("color: ") {
+    } else if tag.starts_with("color: ") || tag.starts_with("font:") || tag.starts_with("size:") {
         "span".to_string()
     } else if tag.starts_with("link:") {
         "a".to_string()

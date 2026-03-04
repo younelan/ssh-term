@@ -689,6 +689,135 @@ impl NativeHtmlEditor {
         }
     }
 
+    pub fn apply_font_family(&self, family: &str) {
+        let buffer = self.view.buffer();
+        let (start, end) = get_target_bounds(&buffer);
+        // Remove any existing font: tags in this range
+        let tags = start.tags();
+        for tag in tags.iter() {
+            if let Some(name) = tag.name() {
+                if name.starts_with("font:") {
+                    buffer.remove_tag(tag, &start, &end);
+                }
+            }
+        }
+        if !family.is_empty() {
+            let tag_name = format!("font:{}", family);
+            let tag = if let Some(t) = buffer.tag_table().lookup(&tag_name) {
+                t
+            } else {
+                let new_tag = gtk::TextTag::builder().name(&tag_name).family(family).build();
+                buffer.tag_table().add(&new_tag);
+                new_tag
+            };
+            buffer.apply_tag(&tag, &start, &end);
+        }
+        self.capture_undo_snapshot();
+    }
+
+    pub fn apply_font_size(&self, size_pt: f64) {
+        let buffer = self.view.buffer();
+        let (start, end) = get_target_bounds(&buffer);
+        // Remove any existing size: tags in this range
+        let tags = start.tags();
+        for tag in tags.iter() {
+            if let Some(name) = tag.name() {
+                if name.starts_with("size:") {
+                    buffer.remove_tag(tag, &start, &end);
+                }
+            }
+        }
+        if size_pt > 0.0 {
+            let tag_name = format!("size:{}", size_pt);
+            let tag = if let Some(t) = buffer.tag_table().lookup(&tag_name) {
+                t
+            } else {
+                let new_tag = gtk::TextTag::builder()
+                    .name(&tag_name)
+                    .size_points(size_pt)
+                    .build();
+                buffer.tag_table().add(&new_tag);
+                new_tag
+            };
+            buffer.apply_tag(&tag, &start, &end);
+        }
+        self.capture_undo_snapshot();
+    }
+
+    /// Returns the font family at the current cursor position, or None for default.
+    pub fn current_font_family(&self) -> Option<String> {
+        let buffer = self.view.buffer();
+        let iter = buffer.iter_at_offset(buffer.cursor_position());
+        for tag in &iter.tags() {
+            if let Some(name) = tag.name() {
+                if let Some(family) = name.strip_prefix("font:") {
+                    return Some(family.to_string());
+                }
+                // Also check css_ tags that may carry font-family
+                if name.starts_with("css_") {
+                    if tag.family().is_some() {
+                        return tag.family().map(|f| f.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Returns the font size (in pt) at the current cursor position, or None for default.
+    pub fn current_font_size(&self) -> Option<f64> {
+        let buffer = self.view.buffer();
+        let iter = buffer.iter_at_offset(buffer.cursor_position());
+        for tag in &iter.tags() {
+            if let Some(name) = tag.name() {
+                if let Some(size_str) = name.strip_prefix("size:") {
+                    if let Ok(sz) = size_str.parse::<f64>() {
+                        return Some(sz);
+                    }
+                }
+                // Also check css_ tags that may carry font-size
+                if name.starts_with("css_") {
+                    let pts = tag.size_points();
+                    if pts > 0.0 {
+                        return Some(pts);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Returns the foreground color at the current cursor position, or None for default.
+    pub fn current_color(&self) -> Option<gtk::gdk::RGBA> {
+        let buffer = self.view.buffer();
+        let iter = buffer.iter_at_offset(buffer.cursor_position());
+        for tag in &iter.tags() {
+            if let Some(name) = tag.name() {
+                if name.starts_with("color: ") {
+                    let color_str = name.strip_prefix("color: ").unwrap_or("");
+                    if let Ok(rgba) = gtk::gdk::RGBA::parse(color_str) {
+                        return Some(rgba);
+                    }
+                }
+                // Also check css_ tags with foreground set
+                if name.starts_with("css_") {
+                    if let Some(rgba) = tag.foreground_rgba() {
+                        return Some(rgba);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Connect a callback that fires whenever the cursor moves (for toolbar updates).
+    pub fn connect_cursor_changed<F: Fn() + 'static>(&self, f: F) {
+        let buffer = self.view.buffer();
+        buffer.connect_cursor_position_notify(move |_| {
+            f();
+        });
+    }
+
     // ── Bullet List ────────────────────────────────────────────────────────
 
     pub fn insert_bullet(&self) {
