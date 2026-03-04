@@ -1181,28 +1181,39 @@ fn handle_flex(
             }
         }
 
-        let child_css = if let NodeData::Element { ref name, ref attrs, .. } = child.data {
-            let child_tag = name.local.to_string().to_lowercase();
-            let child_attrs = attrs.borrow();
-            let mut child_class = None;
-            let mut child_id = None;
-            let mut child_style = None;
-            for attr in child_attrs.iter() {
-                match attr.name.local.to_string().as_str() {
-                    "class" => child_class = Some(attr.value.to_string()),
-                    "id" => child_id = Some(attr.value.to_string()),
-                    "style" => child_style = Some(attr.value.to_string()),
-                    _ => {}
+        let (child_tag_str, child_class, child_id, child_style) =
+            if let NodeData::Element { ref name, ref attrs, .. } = child.data {
+                let tag = name.local.to_string().to_lowercase();
+                let child_attrs = attrs.borrow();
+                let mut cls = None;
+                let mut id = None;
+                let mut sty = None;
+                for attr in child_attrs.iter() {
+                    match attr.name.local.to_string().as_str() {
+                        "class" => cls = Some(attr.value.to_string()),
+                        "id" => id = Some(attr.value.to_string()),
+                        "style" => sty = Some(attr.value.to_string()),
+                        _ => {}
+                    }
                 }
-            }
-            drop(child_attrs);
-            apply_css_cascade(
-                &child_tag, child_class.as_deref(), child_id.as_deref(),
-                child_style.as_deref(), &ctx.css_rules,
-            )
-        } else {
-            CssProperties::default()
-        };
+                (tag, cls, id, sty)
+            } else {
+                ("div".to_string(), None, None, None)
+            };
+
+        let child_css = apply_css_cascade(
+            &child_tag_str, child_class.as_deref(), child_id.as_deref(),
+            child_style.as_deref(), &ctx.css_rules,
+        );
+
+        // Resolve :hover CSS for this child
+        let child_hover_css = if !ctx.hover_rules.is_empty() {
+            let delta = apply_css_cascade(
+                &child_tag_str, child_class.as_deref(), child_id.as_deref(),
+                child_style.as_deref(), &ctx.hover_rules,
+            );
+            if has_meaningful_css(&delta) { Some(delta) } else { None }
+        } else { None };
 
         let child_view = gtk::TextView::new();
         child_view.set_wrap_mode(gtk::WrapMode::WordChar);
@@ -1286,7 +1297,7 @@ fn handle_flex(
             }
         }
 
-        apply_child_css_provider(&child_view, &child_css);
+        apply_child_css_provider_with_hover(&child_view, &child_css, child_hover_css.as_ref());
 
         // Append to container
         if is_wrap {
@@ -1448,31 +1459,39 @@ fn handle_css_grid(
         }
 
         // Resolve child CSS
-        let child_css = if let NodeData::Element { ref name, ref attrs, .. } = child.data {
-            let child_tag = name.local.to_string().to_lowercase();
-            let child_attrs = attrs.borrow();
-            let mut child_class = None;
-            let mut child_id = None;
-            let mut child_style = None;
-            for attr in child_attrs.iter() {
-                match attr.name.local.to_string().as_str() {
-                    "class" => child_class = Some(attr.value.to_string()),
-                    "id" => child_id = Some(attr.value.to_string()),
-                    "style" => child_style = Some(attr.value.to_string()),
-                    _ => {}
+        let (child_tag_str, child_class, child_id, child_style) =
+            if let NodeData::Element { ref name, ref attrs, .. } = child.data {
+                let tag = name.local.to_string().to_lowercase();
+                let child_attrs = attrs.borrow();
+                let mut cls = None;
+                let mut id = None;
+                let mut sty = None;
+                for attr in child_attrs.iter() {
+                    match attr.name.local.to_string().as_str() {
+                        "class" => cls = Some(attr.value.to_string()),
+                        "id" => id = Some(attr.value.to_string()),
+                        "style" => sty = Some(attr.value.to_string()),
+                        _ => {}
+                    }
                 }
-            }
-            drop(child_attrs);
-            apply_css_cascade(
-                &child_tag,
-                child_class.as_deref(),
-                child_id.as_deref(),
-                child_style.as_deref(),
-                &ctx.css_rules,
-            )
-        } else {
-            CssProperties::default()
-        };
+                (tag, cls, id, sty)
+            } else {
+                ("div".to_string(), None, None, None)
+            };
+
+        let child_css = apply_css_cascade(
+            &child_tag_str, child_class.as_deref(), child_id.as_deref(),
+            child_style.as_deref(), &ctx.css_rules,
+        );
+
+        // Resolve :hover CSS for this grid child
+        let child_hover_css = if !ctx.hover_rules.is_empty() {
+            let delta = apply_css_cascade(
+                &child_tag_str, child_class.as_deref(), child_id.as_deref(),
+                child_style.as_deref(), &ctx.hover_rules,
+            );
+            if has_meaningful_css(&delta) { Some(delta) } else { None }
+        } else { None };
 
         let child_view = gtk::TextView::new();
         child_view.set_wrap_mode(gtk::WrapMode::WordChar);
@@ -1542,8 +1561,8 @@ fn handle_css_grid(
             child_view.set_size_request(final_w, -1);
         }
 
-        // Apply child CSS via provider
-        apply_child_css_provider(&child_view, &child_css);
+        // Apply child CSS via provider (with hover if available)
+        apply_child_css_provider_with_hover(&child_view, &child_css, child_hover_css.as_ref());
 
         grid.attach(&child_view, col, row, colspan, rowspan);
 
@@ -1619,7 +1638,7 @@ fn collect_raw_attrs(node: &Handle, css_props: &CssProperties) -> String {
 /// Apply CSS properties (background, border, color, font, padding) to a child
 /// TextView via a GTK CssProvider.
 #[allow(deprecated)]
-fn apply_child_css_provider(child_view: &gtk::TextView, css: &CssProperties) {
+fn apply_child_css_provider_with_hover(child_view: &gtk::TextView, css: &CssProperties, hover_css: Option<&CssProperties>) {
     let mut css_parts = Vec::new();
     if let Some(ref bg) = css.background_color {
         css_parts.push(format!("background-color: {};", bg));
@@ -1746,9 +1765,50 @@ fn apply_child_css_provider(child_view: &gtk::TextView, css: &CssProperties) {
         }
     }
 
-    if !css_parts.is_empty() {
+    // Build hover CSS parts
+    let mut hover_parts = Vec::new();
+    if let Some(hcss) = hover_css {
+        if let Some(ref bg) = hcss.background_color {
+            hover_parts.push(format!("background-color: {};", bg));
+        }
+        if let Some(ref c) = hcss.color {
+            hover_parts.push(format!("color: {};", c));
+        }
+        if let Some(ref bs) = hcss.box_shadow {
+            hover_parts.push(format!("box-shadow: {};", bs));
+        }
+        if let Some(ref ts) = hcss.text_shadow {
+            hover_parts.push(format!("text-shadow: {};", ts));
+        }
+        if let Some(v) = hcss.opacity {
+            hover_parts.push(format!("opacity: {};", v));
+        }
+        if hcss.has_border() {
+            let w = hcss.border_top_width.unwrap_or(1);
+            let s = match hcss.border_style {
+                Some(BorderStyle::Dashed) => "dashed",
+                Some(BorderStyle::Dotted) => "dotted",
+                Some(BorderStyle::Double) => "double",
+                _ => "solid",
+            };
+            let c = hcss.border_color.as_deref().unwrap_or("currentColor");
+            hover_parts.push(format!("border: {}px {} {};", w, s, c));
+        }
+        if let Some(ref br) = hcss.border_radius {
+            hover_parts.push(format!("border-radius: {};", br));
+        }
+    }
+
+    if !css_parts.is_empty() || !hover_parts.is_empty() {
         let provider = gtk::CssProvider::new();
-        provider.load_from_data(&format!("textview {{ {} }}", css_parts.join(" ")));
+        let mut css_str = String::new();
+        if !css_parts.is_empty() {
+            css_str.push_str(&format!("textview {{ {} }}", css_parts.join(" ")));
+        }
+        if !hover_parts.is_empty() {
+            css_str.push_str(&format!(" textview:hover {{ {} }}", hover_parts.join(" ")));
+        }
+        provider.load_from_data(&css_str);
         child_view
             .style_context()
             .add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
