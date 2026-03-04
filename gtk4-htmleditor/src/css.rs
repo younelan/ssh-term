@@ -24,6 +24,10 @@ pub enum VerticalAlign {
     Baseline,
     Super,
     Sub,
+    Top,
+    Middle,
+    Bottom,
+    Length(i32), // px value as Pango units
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -127,8 +131,12 @@ pub struct CssProperties {
     pub min_height: Option<String>,
     pub max_height: Option<String>,
 
-    // Background image (round-trip only — GTK TextTag cannot render)
+    // Background image (applied via GTK CSS on embedded widgets)
     pub background_image: Option<String>,
+
+    // Shadows (applied via GTK CSS on embedded widgets)
+    pub box_shadow: Option<String>,
+    pub text_shadow: Option<String>,
 
     // Round-trip only (not rendered in TextBuffer, preserved for serialization)
     pub float: Option<String>,
@@ -205,6 +213,8 @@ impl CssProperties {
         merge_field!(min_height);
         merge_field!(max_height);
         merge_field!(background_image);
+        merge_field!(box_shadow);
+        merge_field!(text_shadow);
         merge_field!(opacity);
         merge_field!(float);
         merge_field!(clear);
@@ -343,6 +353,20 @@ impl CssProperties {
         if let Some(ref v) = self.min_height { parts.push(format!("min-height: {}", v)); }
         if let Some(ref v) = self.max_height { parts.push(format!("max-height: {}", v)); }
         if let Some(ref v) = self.background_image { parts.push(format!("background-image: {}", v)); }
+        if let Some(ref v) = self.box_shadow { parts.push(format!("box-shadow: {}", v)); }
+        if let Some(ref v) = self.text_shadow { parts.push(format!("text-shadow: {}", v)); }
+        if let Some(ref va) = self.vertical_align {
+            let s = match va {
+                VerticalAlign::Super => "super".to_string(),
+                VerticalAlign::Sub => "sub".to_string(),
+                VerticalAlign::Top => "top".to_string(),
+                VerticalAlign::Middle => "middle".to_string(),
+                VerticalAlign::Bottom => "bottom".to_string(),
+                VerticalAlign::Baseline => "baseline".to_string(),
+                VerticalAlign::Length(px) => format!("{}px", px / 1024),
+            };
+            parts.push(format!("vertical-align: {}", s));
+        }
         if self.visibility_hidden { parts.push("visibility: hidden".to_string()); }
         if let Some(v) = self.opacity { if v < 1.0 { parts.push(format!("opacity: {}", v)); } }
         // Round-trip properties (not rendered but preserved)
@@ -636,7 +660,18 @@ pub fn parse_declarations(decls: &str) -> CssProperties {
                 match val.to_lowercase().as_str() {
                     "super" | "text-top" => props.vertical_align = Some(VerticalAlign::Super),
                     "sub" | "text-bottom" => props.vertical_align = Some(VerticalAlign::Sub),
-                    _ => props.vertical_align = Some(VerticalAlign::Baseline),
+                    "top" => props.vertical_align = Some(VerticalAlign::Top),
+                    "middle" => props.vertical_align = Some(VerticalAlign::Middle),
+                    "bottom" => props.vertical_align = Some(VerticalAlign::Bottom),
+                    "baseline" => props.vertical_align = Some(VerticalAlign::Baseline),
+                    other => {
+                        // Try px/em value
+                        if let Some(px) = parse_px(other) {
+                            props.vertical_align = Some(VerticalAlign::Length(px.saturating_mul(1024)));
+                        } else {
+                            props.vertical_align = Some(VerticalAlign::Baseline);
+                        }
+                    }
                 }
             }
 
@@ -821,8 +856,12 @@ pub fn parse_declarations(decls: &str) -> CssProperties {
             "visibility" => { props.visibility_hidden = val == "hidden"; }
             "opacity" => { props.opacity = val.parse().ok(); }
 
-            // ── Background image (round-trip only) ──
+            // ── Background image ──
             "background-image" => { props.background_image = Some(val.to_string()); }
+
+            // ── Shadows (applied via GTK CSS on embedded widgets) ──
+            "box-shadow" => { props.box_shadow = Some(val.to_string()); }
+            "text-shadow" => { props.text_shadow = Some(val.to_string()); }
 
             // ── Round-trip only (not rendered in TextBuffer) ──
             "float" => { props.float = Some(val.to_string()); }
@@ -1153,7 +1192,7 @@ pub fn apply_to_text_tag(props: &CssProperties, tag: &gtk::TextTag, is_block: bo
             _ => {}
         }
     }
-    // vertical-align: super/sub
+    // vertical-align
     if let Some(ref va) = props.vertical_align {
         match va {
             VerticalAlign::Super => {
@@ -1163,6 +1202,18 @@ pub fn apply_to_text_tag(props: &CssProperties, tag: &gtk::TextTag, is_block: bo
             VerticalAlign::Sub => {
                 tag.set_rise(-3000);
                 tag.set_scale(0.75);
+            }
+            VerticalAlign::Top => {
+                tag.set_rise(4000);
+            }
+            VerticalAlign::Middle => {
+                tag.set_rise(2000);
+            }
+            VerticalAlign::Bottom => {
+                tag.set_rise(-2000);
+            }
+            VerticalAlign::Length(pango_units) => {
+                tag.set_rise(*pango_units);
             }
             VerticalAlign::Baseline => {}
         }

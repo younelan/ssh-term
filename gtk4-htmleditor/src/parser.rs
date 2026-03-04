@@ -1681,6 +1681,70 @@ fn apply_child_css_provider(child_view: &gtk::TextView, css: &CssProperties) {
             css_parts.push(format!("opacity: {};", v));
         }
     }
+    // Apply box-shadow via GTK CSS
+    if let Some(ref bs) = css.box_shadow {
+        css_parts.push(format!("box-shadow: {};", bs));
+    }
+    // Apply text-shadow via GTK CSS (on the textview text node)
+    // Note: GTK CSS text-shadow is not on textview directly but on text nodes;
+    // we'll add it to the widget CSS
+    if let Some(ref ts) = css.text_shadow {
+        css_parts.push(format!("text-shadow: {};", ts));
+    }
+    // Apply background-image (linear-gradient) via GTK CSS
+    if let Some(ref bg) = css.background_image {
+        css_parts.push(format!("background-image: {};", bg));
+    }
+
+    // Apply vertical-align as widget valign within container
+    if let Some(ref va) = css.vertical_align {
+        use crate::css::VerticalAlign;
+        match va {
+            VerticalAlign::Top | VerticalAlign::Super => child_view.set_valign(gtk::Align::Start),
+            VerticalAlign::Middle => child_view.set_valign(gtk::Align::Center),
+            VerticalAlign::Bottom | VerticalAlign::Sub => child_view.set_valign(gtk::Align::End),
+            VerticalAlign::Length(pango_units) => {
+                // Convert Pango units to px (1024 per px), apply as top margin offset
+                let px = *pango_units / 1024;
+                if px > 0 {
+                    child_view.set_valign(gtk::Align::Start);
+                    let cur = child_view.top_margin();
+                    child_view.set_top_margin(cur + px);
+                } else if px < 0 {
+                    child_view.set_valign(gtk::Align::End);
+                    let cur = child_view.bottom_margin();
+                    child_view.set_bottom_margin(cur + px.abs());
+                }
+            }
+            VerticalAlign::Baseline => {}
+        }
+    }
+
+    // Apply position offsets (top/bottom/left/right) as widget margins
+    if let Some(ref t) = css.top {
+        if let Some(px) = crate::css::parse_px(t) {
+            let cur = child_view.margin_top();
+            child_view.set_margin_top(cur + px);
+        }
+    }
+    if let Some(ref b) = css.bottom_pos {
+        if let Some(px) = crate::css::parse_px(b) {
+            let cur = child_view.margin_bottom();
+            child_view.set_margin_bottom(cur + px);
+        }
+    }
+    if let Some(ref l) = css.left_pos {
+        if let Some(px) = crate::css::parse_px(l) {
+            let cur = child_view.margin_start();
+            child_view.set_margin_start(cur + px);
+        }
+    }
+    if let Some(ref r) = css.right_pos {
+        if let Some(px) = crate::css::parse_px(r) {
+            let cur = child_view.margin_end();
+            child_view.set_margin_end(cur + px);
+        }
+    }
 
     if !css_parts.is_empty() {
         let provider = gtk::CssProvider::new();
