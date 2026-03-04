@@ -20,11 +20,13 @@ pub fn serialize_range(
 
     let mut text_acc = String::new();
     let mut active_tags: Vec<String> = Vec::new();
+    let mut active_ids: Vec<String> = Vec::new();
 
     while iter < end {
         let tags = iter.tags();
         let mut is_marker = false;
         let mut current_pos_tags: Vec<String> = Vec::new();
+        let mut current_ids: Vec<String> = Vec::new();
 
         let mut comment_text: Option<String> = None;
         for tag in tags.iter() {
@@ -34,6 +36,10 @@ pub fn serialize_range(
                     is_marker = true;
                 } else if let Some(text) = name_str.strip_prefix("comment:") {
                     comment_text = Some(text.to_string());
+                } else if let Some(id) = name_str.strip_prefix("editable_id:") {
+                    current_ids.push(id.to_string());
+                } else if name_str == "_readonly" || name_str == "_editable" {
+                    // Internal readonly markers — skip silently
                 } else if is_recognized_tag(&name_str) {
                     current_pos_tags.push(name_str);
                 }
@@ -50,6 +56,12 @@ pub fn serialize_range(
             current_pos_tags.retain(|t| t != "abbr_style");
         }
         current_pos_tags.sort();
+        current_ids.sort();
+
+        // Determine newly started IDs at this position
+        let new_ids: Vec<&String> = current_ids.iter()
+            .filter(|id| !active_ids.contains(id))
+            .collect();
 
         if current_pos_tags != active_tags {
             if !text_acc.is_empty() {
@@ -64,15 +76,26 @@ pub fn serialize_range(
                 }
             }
 
-            // Open new tags
+            // Open new tags, injecting id= into the first new tag if we have new IDs
+            let mut id_injected = new_ids.is_empty();
             for tag in current_pos_tags.iter() {
                 if !active_tags.contains(tag) {
-                    html.push_str(&open_tag_markup(tag, css_rules_store));
+                    if !id_injected {
+                        html.push_str(&open_tag_markup_with_id(tag, css_rules_store, &new_ids));
+                        id_injected = true;
+                    } else {
+                        html.push_str(&open_tag_markup(tag, css_rules_store));
+                    }
                 }
             }
 
             active_tags = current_pos_tags.clone();
+        } else if !new_ids.is_empty() {
+            // Tags didn't change but new IDs started — no new HTML tag to attach to.
+            // This shouldn't happen in practice since the id tag should start with the element tag.
         }
+
+        active_ids = current_ids;
 
         let c = iter.char();
 
@@ -159,6 +182,7 @@ fn is_recognized_tag(name: &str) -> bool {
     }
     // Dynamic tags
     if name.starts_with("color: ")
+        || name.starts_with("bgcolor:")
         || name.starts_with("ul_")
         || name.starts_with("ol_")
         || name.starts_with("css_")
@@ -205,6 +229,9 @@ fn open_tag_markup(tag: &str, css_rules_store: &HashMap<String, String>) -> Stri
     } else if tag.starts_with("color: ") {
         let color = tag.strip_prefix("color: ").unwrap_or("");
         format!("<span style=\"color: {}\">", color)
+    } else if tag.starts_with("bgcolor:") {
+        let color = tag.strip_prefix("bgcolor:").unwrap_or("");
+        format!("<span style=\"background-color: {}\">", color)
     } else if tag.starts_with("font:") {
         let family = tag.strip_prefix("font:").unwrap_or("");
         format!("<span style=\"font-family: {}\">", family)
@@ -237,12 +264,32 @@ fn open_tag_markup(tag: &str, css_rules_store: &HashMap<String, String>) -> Stri
     }
 }
 
+/// Like `open_tag_markup` but injects `id="..."` into the opening tag.
+fn open_tag_markup_with_id(tag: &str, css_rules_store: &HashMap<String, String>, ids: &[&String]) -> String {
+    let markup = open_tag_markup(tag, css_rules_store);
+    if ids.is_empty() {
+        return markup;
+    }
+    // Use the first ID (elements should only have one id)
+    let id_attr = format!(" id=\"{}\"", ids[0]);
+    // Inject before the first '>'
+    if let Some(pos) = markup.find('>') {
+        let mut result = String::with_capacity(markup.len() + id_attr.len());
+        result.push_str(&markup[..pos]);
+        result.push_str(&id_attr);
+        result.push_str(&markup[pos..]);
+        result
+    } else {
+        markup
+    }
+}
+
 fn close_tag_name(tag: &str) -> String {
     if tag.starts_with("ul_") {
         "ul".to_string()
     } else if tag.starts_with("ol_") {
         "ol".to_string()
-    } else if tag.starts_with("color: ") || tag.starts_with("font:") || tag.starts_with("size:") {
+    } else if tag.starts_with("color: ") || tag.starts_with("bgcolor:") || tag.starts_with("font:") || tag.starts_with("size:") {
         "span".to_string()
     } else if tag.starts_with("link:") {
         "a".to_string()

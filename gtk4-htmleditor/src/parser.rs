@@ -521,6 +521,21 @@ fn walk_dom(
                 }
             }
 
+            // ── Apply editable_id: marker for readonly-except support ──
+            if let Some(ref id) = id_attr {
+                if !id.is_empty() && start_iter != end_iter {
+                    let id_tag_name = format!("editable_id:{}", id);
+                    let id_tag = if let Some(existing) = buffer.tag_table().lookup(&id_tag_name) {
+                        existing
+                    } else {
+                        let new_tag = gtk::TextTag::new(Some(&id_tag_name));
+                        buffer.tag_table().add(&new_tag);
+                        new_tag
+                    };
+                    buffer.apply_tag(&id_tag, &start_iter, &end_iter);
+                }
+            }
+
             buffer.delete_mark(&start_mark);
 
             // ── Block elements — ensure newline after ──

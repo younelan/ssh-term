@@ -110,6 +110,8 @@ pub struct NativeHtmlEditor {
     link_hover_tag: RefCell<Option<String>>,
     /// Currently applied hover tags with their ranges (for removal on motion/leave).
     active_hovers: RefCell<Vec<(String, gtk::TextMark, gtk::TextMark)>>,
+    /// Readonly mode: None = fully editable, Some(vec) = readonly except these IDs.
+    readonly_ids: RefCell<Option<Vec<String>>>,
 }
 
 impl NativeHtmlEditor {
@@ -141,6 +143,7 @@ impl NativeHtmlEditor {
             hover_variants: RefCell::new(HashMap::new()),
             link_hover_tag: RefCell::new(None),
             active_hovers: RefCell::new(Vec::new()),
+            readonly_ids: RefCell::new(None),
         }
     }
 
@@ -389,6 +392,126 @@ impl NativeHtmlEditor {
 
     pub fn get_html(&self) -> String {
         serializer::serialize_buffer(&self.view.buffer(), &self.css_rules_store.borrow())
+    }
+
+    /// Get the inner HTML content of an element by its `id` attribute.
+    /// Returns `None` if no element with that ID exists in the buffer.
+    pub fn get_html_by_id(&self, id: &str) -> Option<String> {
+        let buffer = self.view.buffer();
+        let tag_name = format!("editable_id:{}", id);
+        let id_tag = buffer.tag_table().lookup(&tag_name)?;
+
+        // Find the first region tagged with this ID
+        let mut iter = buffer.start_iter();
+        loop {
+            if iter.starts_tag(Some(&id_tag)) {
+                let start = iter;
+                if iter.forward_to_tag_toggle(Some(&id_tag)) {
+                    return Some(serializer::serialize_range(
+                        &buffer, &start, &iter, &self.css_rules_store.borrow(),
+                    ));
+                }
+                break;
+            }
+            if !iter.forward_to_tag_toggle(Some(&id_tag)) { break; }
+        }
+        None
+    }
+
+    /// Replace the inner HTML content of an element by its `id` attribute.
+    /// Returns `true` if the element was found and replaced, `false` otherwise.
+    pub fn set_html_by_id(&self, id: &str, new_inner_html: &str) -> bool {
+        // Get the full HTML, find the element, replace its content, re-render
+        let full_html = self.get_html();
+
+        // Find the element with this id in the serialized HTML
+        // Look for id="..." in an opening tag, then replace inner content
+        let search_patterns = [
+            format!("id=\"{}\"", id),
+            format!("id='{}'", id),
+        ];
+
+        let mut found_pos = None;
+        for pat in &search_patterns {
+            if let Some(pos) = full_html.find(pat.as_str()) {
+                found_pos = Some(pos);
+                break;
+            }
+        }
+        let Some(attr_pos) = found_pos else { return false; };
+
+        // Find the opening tag's '>'
+        let after_attr = &full_html[attr_pos..];
+        let Some(gt_offset) = after_attr.find('>') else { return false; };
+        let content_start = attr_pos + gt_offset + 1;
+
+        // Find the tag name by scanning backwards to '<'
+        let before_attr = &full_html[..attr_pos];
+        let Some(lt_pos) = before_attr.rfind('<') else { return false; };
+        let tag_fragment = &full_html[lt_pos + 1..attr_pos];
+        let tag_name = tag_fragment.split_whitespace().next().unwrap_or("div");
+
+        // Find the matching closing tag
+        let closing_tag = format!("</{}>", tag_name);
+        let rest = &full_html[content_start..];
+
+        // Handle nested same-name tags by counting depth
+        let opening_prefix = format!("<{}", tag_name);
+        let mut depth = 1;
+        let mut search_pos = 0;
+        let mut close_pos = None;
+
+        while depth > 0 && search_pos < rest.len() {
+            let next_open = rest[search_pos..].find(opening_prefix.as_str())
+                .map(|p| p + search_pos);
+            let next_close = rest[search_pos..].find(closing_tag.as_str())
+                .map(|p| p + search_pos);
+
+            match (next_open, next_close) {
+                (Some(o), Some(c)) if o < c => {
+                    // Check it's actually an opening tag (followed by space or >)
+                    let after = rest.as_bytes().get(o + opening_prefix.len());
+                    if after == Some(&b' ') || after == Some(&b'>') || after == Some(&b'/') {
+                        depth += 1;
+                    }
+                    search_pos = o + 1;
+                }
+                (_, Some(c)) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_pos = Some(c);
+                    } else {
+                        search_pos = c + closing_tag.len();
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        let Some(inner_end_offset) = close_pos else { return false; };
+        let content_end = content_start + inner_end_offset;
+
+        // Build new HTML with replaced inner content
+        let mut new_html = String::with_capacity(full_html.len());
+        new_html.push_str(&full_html[..content_start]);
+        new_html.push_str(new_inner_html);
+        new_html.push_str(&full_html[content_end..]);
+
+        // Re-render
+        self.load_html_internal(&new_html);
+
+        // Re-apply readonly if active
+        if self.readonly_ids.borrow().is_some() {
+            self.apply_readonly();
+        }
+
+        // Record undo snapshot
+        let snapshot = serializer::serialize_buffer(
+            &self.view.buffer(), &self.css_rules_store.borrow(),
+        );
+        self.undo_mgr.borrow_mut().push(snapshot);
+
+        true
     }
 
     // ── Clipboard (HTML-aware copy/cut/paste) ───────────────────────────────
@@ -689,6 +812,25 @@ impl NativeHtmlEditor {
         }
     }
 
+    pub fn apply_background_color(&self, color: &str) {
+        let buffer = self.view.buffer();
+        if let Some((start, end)) = buffer.selection_bounds() {
+            let tag_name = format!("bgcolor:{}", color);
+            let tag = if let Some(t) = buffer.tag_table().lookup(&tag_name) {
+                t
+            } else {
+                let new_tag = gtk::TextTag::builder()
+                    .name(&tag_name)
+                    .background(color)
+                    .build();
+                buffer.tag_table().add(&new_tag);
+                new_tag
+            };
+            buffer.apply_tag(&tag, &start, &end);
+            self.capture_undo_snapshot();
+        }
+    }
+
     pub fn apply_font_family(&self, family: &str) {
         let buffer = self.view.buffer();
         let (start, end) = get_target_bounds(&buffer);
@@ -810,12 +952,183 @@ impl NativeHtmlEditor {
         None
     }
 
+    /// Returns the background color at the current cursor position, or None for default.
+    pub fn current_background_color(&self) -> Option<gtk::gdk::RGBA> {
+        let buffer = self.view.buffer();
+        let iter = buffer.iter_at_offset(buffer.cursor_position());
+        for tag in &iter.tags() {
+            if let Some(name) = tag.name() {
+                if let Some(color_str) = name.strip_prefix("bgcolor:") {
+                    if let Ok(rgba) = gtk::gdk::RGBA::parse(color_str) {
+                        return Some(rgba);
+                    }
+                }
+                if name.starts_with("css_") {
+                    if let Some(rgba) = tag.background_rgba() {
+                        return Some(rgba);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Connect a callback that fires whenever the cursor moves (for toolbar updates).
     pub fn connect_cursor_changed<F: Fn() + 'static>(&self, f: F) {
         let buffer = self.view.buffer();
         buffer.connect_cursor_position_notify(move |_| {
             f();
         });
+    }
+
+    // ── Readonly Mode ──────────────────────────────────────────────────────
+
+    /// Make the entire document readonly.
+    pub fn set_readonly(&self, readonly: bool) {
+        if readonly {
+            *self.readonly_ids.borrow_mut() = Some(Vec::new());
+        } else {
+            *self.readonly_ids.borrow_mut() = None;
+        }
+        self.apply_readonly();
+    }
+
+    /// Make the document readonly except for elements with the given IDs.
+    /// Pass an empty slice to make everything readonly.
+    pub fn set_readonly_except(&self, editable_ids: &[&str]) {
+        *self.readonly_ids.borrow_mut() = Some(editable_ids.iter().map(|s| s.to_string()).collect());
+        self.apply_readonly();
+    }
+
+    /// Make the document fully editable (exit readonly mode).
+    pub fn set_editable(&self) {
+        *self.readonly_ids.borrow_mut() = None;
+        self.apply_readonly();
+    }
+
+    fn apply_readonly(&self) {
+        let readonly_ids = self.readonly_ids.borrow();
+        let buffer = self.view.buffer();
+
+        match readonly_ids.as_ref() {
+            None => {
+                // Fully editable
+                self.view.set_editable(true);
+                // Remove any readonly/editable tags
+                if let Some(tag) = buffer.tag_table().lookup("_readonly") {
+                    buffer.remove_tag(&tag, &buffer.start_iter(), &buffer.end_iter());
+                }
+                if let Some(tag) = buffer.tag_table().lookup("_editable") {
+                    buffer.remove_tag(&tag, &buffer.start_iter(), &buffer.end_iter());
+                }
+                // Make all child widgets editable
+                self.set_child_widgets_editable(true, &[]);
+            }
+            Some(ids) => {
+                // Readonly mode
+                self.view.set_editable(false);
+
+                // Ensure tags exist
+                if buffer.tag_table().lookup("_readonly").is_none() {
+                    let tag = gtk::TextTag::builder()
+                        .name("_readonly")
+                        .editable(false)
+                        .build();
+                    buffer.tag_table().add(&tag);
+                }
+                if buffer.tag_table().lookup("_editable").is_none() {
+                    let tag = gtk::TextTag::builder()
+                        .name("_editable")
+                        .editable(true)
+                        .build();
+                    buffer.tag_table().add(&tag);
+                }
+
+                // Apply readonly to entire buffer
+                let readonly_tag = buffer.tag_table().lookup("_readonly").unwrap();
+                buffer.apply_tag(&readonly_tag, &buffer.start_iter(), &buffer.end_iter());
+
+                if !ids.is_empty() {
+                    // Find regions with matching editable_id: tags and make them editable
+                    let editable_tag = buffer.tag_table().lookup("_editable").unwrap();
+                    for eid in ids.iter() {
+                        let tag_name = format!("editable_id:{}", eid);
+                        if let Some(id_tag) = buffer.tag_table().lookup(&tag_name) {
+                            // Walk tag toggles to find all regions with this tag
+                            let mut iter = buffer.start_iter();
+                            loop {
+                                if !iter.starts_tag(Some(&id_tag)) {
+                                    if !iter.forward_to_tag_toggle(Some(&id_tag)) { break; }
+                                    if !iter.starts_tag(Some(&id_tag)) { continue; }
+                                }
+                                let region_start = iter;
+                                if !iter.forward_to_tag_toggle(Some(&id_tag)) { break; }
+                                buffer.apply_tag(&editable_tag, &region_start, &iter);
+                            }
+                        }
+                    }
+                }
+
+                // Set child widget editability
+                self.set_child_widgets_editable(false, ids);
+            }
+        }
+    }
+
+    fn set_child_widgets_editable(&self, default_editable: bool, editable_ids: &[String]) {
+        let buffer = self.view.buffer();
+        let mut iter = buffer.start_iter();
+        loop {
+            if iter.child_anchor().is_some() {
+                // Get widgets at this anchor
+                let anchor = iter.child_anchor().unwrap();
+                for widget in anchor.widgets() {
+                    self.set_widget_tree_editable(&widget, default_editable, editable_ids);
+                }
+            }
+            if !iter.forward_char() { break; }
+        }
+    }
+
+    fn set_widget_tree_editable(&self, widget: &gtk::Widget, default_editable: bool, editable_ids: &[String]) {
+        let name = widget.widget_name().to_string();
+
+        // Check if this widget or any ancestor has an editable ID
+        let is_editable = if !editable_ids.is_empty() {
+            // Extract ID from widget name patterns like "cssgrid:div|id=\"myid\" ..."
+            editable_ids.iter().any(|id| name.contains(&format!("id=\"{}\"", id)))
+        } else {
+            default_editable
+        };
+
+        // If it's a TextView, set editable
+        if let Some(tv) = widget.downcast_ref::<gtk::TextView>() {
+            tv.set_editable(if is_editable { true } else { default_editable });
+        }
+
+        // Recurse into container children
+        if let Some(container) = widget.downcast_ref::<gtk::Box>() {
+            let mut child = container.first_child();
+            while let Some(c) = child {
+                self.set_widget_tree_editable(&c, if is_editable { true } else { default_editable }, editable_ids);
+                child = c.next_sibling();
+            }
+        } else if let Some(grid) = widget.downcast_ref::<gtk::Grid>() {
+            let mut child = grid.first_child();
+            while let Some(c) = child {
+                self.set_widget_tree_editable(&c, if is_editable { true } else { default_editable }, editable_ids);
+                child = c.next_sibling();
+            }
+        } else if let Some(fb) = widget.downcast_ref::<gtk::FlowBox>() {
+            let mut child = fb.first_child();
+            while let Some(c) = child {
+                // FlowBox wraps children in FlowBoxChild
+                if let Some(inner) = c.first_child() {
+                    self.set_widget_tree_editable(&inner, if is_editable { true } else { default_editable }, editable_ids);
+                }
+                child = c.next_sibling();
+            }
+        }
     }
 
     // ── Bullet List ────────────────────────────────────────────────────────
