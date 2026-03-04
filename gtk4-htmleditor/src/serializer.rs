@@ -271,12 +271,20 @@ fn open_tag_markup_with_id(tag: &str, css_rules_store: &HashMap<String, String>,
         return markup;
     }
     // Use the first ID (elements should only have one id)
-    let id_attr = format!(" id=\"{}\"", ids[0]);
+    let id = ids[0];
+    let mut attrs = format!(" id=\"{}\"", id);
+    // Also emit class= if stored
+    let class_key = format!("classattr:{}", id);
+    if let Some(classes) = css_rules_store.get(&class_key) {
+        if !classes.is_empty() {
+            attrs.push_str(&format!(" class=\"{}\"", classes));
+        }
+    }
     // Inject before the first '>'
     if let Some(pos) = markup.find('>') {
-        let mut result = String::with_capacity(markup.len() + id_attr.len());
+        let mut result = String::with_capacity(markup.len() + attrs.len());
         result.push_str(&markup[..pos]);
-        result.push_str(&id_attr);
+        result.push_str(&attrs);
         result.push_str(&markup[pos..]);
         result
     } else {
@@ -342,10 +350,15 @@ fn serialize_widget_anchor(iter: &gtk::TextIter, html: &mut String, css_rules_st
                 }
                 return;
             }
-            // Check for Picture (img)
+            // Check for Picture (img or svg)
             if let Some(pic) = widget.downcast_ref::<gtk::Picture>() {
                 let name = pic.widget_name().to_string();
-                if let Some(rest) = name.strip_prefix("img:") {
+                if name.starts_with("svg:") {
+                    // Inline SVG — retrieve original source from css_rules_store
+                    if let Some(svg_source) = css_rules_store.get(&name) {
+                        html.push_str(svg_source);
+                    }
+                } else if let Some(rest) = name.strip_prefix("img:") {
                     // Format: img:src or img:src|alt:text
                     if let Some(pipe_pos) = rest.find("|alt:") {
                         let src = &rest[..pipe_pos];

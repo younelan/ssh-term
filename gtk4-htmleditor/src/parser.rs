@@ -11,6 +11,13 @@ use crate::css::{
 
 // ── Parse Context ──────────────────────────────────────────────────────────
 
+/// Metadata for an HTML element with an `id`, used for class manipulation.
+pub struct ElementMeta {
+    pub tag_name: String,
+    pub classes: Vec<String>,
+    pub inline_style: Option<String>,
+}
+
 pub struct ParseContext {
     pub css_rules: HashMap<String, String>,
     pub hover_rules: HashMap<String, String>,
@@ -25,6 +32,8 @@ pub struct ParseContext {
     pub hover_variants: HashMap<String, String>,
     pub link_hover_tag: Option<String>,
     pub blockquote_depth: i32,
+    pub element_meta: HashMap<String, ElementMeta>,
+    pub element_providers: HashMap<String, gtk::CssProvider>,
 }
 
 impl ParseContext {
@@ -43,6 +52,8 @@ impl ParseContext {
             hover_variants: HashMap::new(),
             link_hover_tag: None,
             blockquote_depth: 0,
+            element_meta: HashMap::new(),
+            element_providers: HashMap::new(),
         }
     }
 }
@@ -52,6 +63,10 @@ pub struct ParseResult {
     pub css_rules_store: HashMap<String, String>,
     pub hover_variants: HashMap<String, String>,
     pub link_hover_tag: Option<String>,
+    pub style_rules: HashMap<String, String>,
+    pub hover_rules: HashMap<String, String>,
+    pub element_meta: HashMap<String, ElementMeta>,
+    pub element_providers: HashMap<String, gtk::CssProvider>,
 }
 
 // ── Public Entry Point ─────────────────────────────────────────────────────
@@ -65,12 +80,16 @@ pub fn parse_html_to_buffer(
     let mut hover_rules = HashMap::new();
     collect_style_rules(&dom.document, &mut css_rules, &mut hover_rules);
 
-    let mut ctx = ParseContext::new(css_rules, hover_rules);
+    let mut ctx = ParseContext::new(css_rules.clone(), hover_rules.clone());
     walk_dom(view, &dom.document, buffer, &mut ctx);
     ParseResult {
         css_rules_store: ctx.css_rules_store,
         hover_variants: ctx.hover_variants,
         link_hover_tag: ctx.link_hover_tag,
+        style_rules: css_rules,
+        hover_rules,
+        element_meta: ctx.element_meta,
+        element_providers: ctx.element_providers,
     }
 }
 
@@ -219,7 +238,11 @@ fn walk_dom(
             // ── Self-closing / special elements ──
             match tag_name.as_str() {
                 "img" => {
-                    insert_img_widget(view, node, buffer);
+                    insert_img_widget(view, node, buffer, ctx);
+                    return;
+                }
+                "svg" => {
+                    insert_svg_widget(view, node, buffer, ctx);
                     return;
                 }
                 "wbr" => {
@@ -533,6 +556,23 @@ fn walk_dom(
                         new_tag
                     };
                     buffer.apply_tag(&id_tag, &start_iter, &end_iter);
+
+                    // Record element metadata for class manipulation
+                    let classes = class_attr.as_deref().unwrap_or("")
+                        .split_whitespace().map(|s| s.to_string()).collect();
+                    ctx.element_meta.insert(id.clone(), ElementMeta {
+                        tag_name: tag_name.clone(),
+                        classes,
+                        inline_style: style_attr.clone(),
+                    });
+                    // Store class attr in css_rules_store for serialization
+                    if let Some(ref cls) = class_attr {
+                        if !cls.is_empty() {
+                            ctx.css_rules_store.insert(
+                                format!("classattr:{}", id), cls.clone(),
+                            );
+                        }
+                    }
                 }
             }
 
@@ -583,7 +623,7 @@ fn walk_dom(
 
 // ── Element Classification ─────────────────────────────────────────────────
 
-fn is_block_element(tag: &str) -> bool {
+pub fn is_block_element(tag: &str) -> bool {
     matches!(
         tag,
         "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
@@ -651,7 +691,7 @@ fn build_extra_css_from_attrs(node: &Handle, tag_name: &str, extra_css: &mut Str
 
 // ── CSS Tag Creation ───────────────────────────────────────────────────────
 
-fn has_meaningful_css(props: &CssProperties) -> bool {
+pub fn has_meaningful_css(props: &CssProperties) -> bool {
     props.color.is_some()
         || props.background_color.is_some()
         || props.font_family.is_some()
@@ -680,7 +720,7 @@ fn has_meaningful_css(props: &CssProperties) -> bool {
 
 /// Create or reuse a GTK TextTag for a given set of CSS properties.
 /// Uses deterministic naming via hash for deduplication.
-fn create_or_get_css_tag(
+pub fn create_or_get_css_tag(
     buffer: &gtk::TextBuffer,
     props: &CssProperties,
     is_block: bool,
@@ -773,6 +813,152 @@ fn insert_hr_widget(view: &gtk::TextView, buffer: &gtk::TextBuffer) {
     buffer.insert(&mut end_iter, "\n");
 }
 
+// ── SVG Handling ──────────────────────────────────────────────────────
+
+/// Walk a markup5ever DOM subtree and reconstruct XML text.
+fn serialize_dom_to_xml(node: &Handle) -> String {
+    let mut xml = String::new();
+    match &node.data {
+        NodeData::Element { name, attrs, .. } => {
+            let tag = &name.local;
+            xml.push_str(&format!("<{}", tag));
+            for attr in attrs.borrow().iter() {
+                xml.push_str(&format!(" {}=\"{}\"", attr.name.local, attr.value));
+            }
+            let children = node.children.borrow();
+            if children.is_empty() {
+                xml.push_str("/>");
+            } else {
+                xml.push('>');
+                for child in children.iter() {
+                    xml.push_str(&serialize_dom_to_xml(child));
+                }
+                xml.push_str(&format!("</{}>", tag));
+            }
+        }
+        NodeData::Text { contents } => {
+            xml.push_str(&contents.borrow().to_string());
+        }
+        _ => {
+            for child in node.children.borrow().iter() {
+                xml.push_str(&serialize_dom_to_xml(child));
+            }
+        }
+    }
+    xml
+}
+
+/// Decode percent-encoded strings (e.g. URL-encoded SVG in data URIs).
+fn urlish_decode(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.bytes();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let hi = chars.next().unwrap_or(b'0');
+            let lo = chars.next().unwrap_or(b'0');
+            let val = u8::from_str_radix(&format!("{}{}", hi as char, lo as char), 16).unwrap_or(b'?');
+            result.push(val as char);
+        } else if b == b'+' {
+            result.push(' ');
+        } else {
+            result.push(b as char);
+        }
+    }
+    result
+}
+
+/// FNV-1a hash for content-addressable SVG storage.
+fn simple_hash(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Render SVG bytes to a GDK texture via resvg.
+fn render_svg_to_texture(svg_data: &[u8]) -> Option<(gtk::gdk::Texture, i32, i32)> {
+    let tree = resvg::usvg::Tree::from_data(svg_data, &resvg::usvg::Options::default()).ok()?;
+    let size = tree.size();
+    let w = size.width().ceil() as u32;
+    let h = size.height().ceil() as u32;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(w, h)?;
+    resvg::render(&tree, resvg::tiny_skia::Transform::default(), &mut pixmap.as_mut());
+    let bytes = gtk::glib::Bytes::from(pixmap.data());
+    let texture = gtk::gdk::MemoryTexture::new(
+        w as i32,
+        h as i32,
+        gtk::gdk::MemoryFormat::R8g8b8a8Premultiplied,
+        &bytes,
+        (w * 4) as usize,
+    );
+    Some((texture.upcast(), w as i32, h as i32))
+}
+
+/// Handle an inline `<svg>` element: render to texture and embed as Picture.
+fn insert_svg_widget(
+    view: &gtk::TextView,
+    node: &Handle,
+    buffer: &gtk::TextBuffer,
+    ctx: &mut ParseContext,
+) {
+    let svg_source = serialize_dom_to_xml(node);
+    // html5ever stores SVG namespace internally but doesn't emit xmlns as an attribute.
+    // resvg needs xmlns="http://www.w3.org/2000/svg" to parse correctly.
+    let svg_source = if !svg_source.contains("xmlns") {
+        svg_source.replacen("<svg", "<svg xmlns=\"http://www.w3.org/2000/svg\"", 1)
+    } else {
+        svg_source
+    };
+    let svg_bytes = svg_source.as_bytes();
+
+    // Check for explicit width/height attributes
+    let mut attr_width: Option<i32> = None;
+    let mut attr_height: Option<i32> = None;
+    if let NodeData::Element { ref attrs, .. } = node.data {
+        for attr in attrs.borrow().iter() {
+            match attr.name.local.to_string().as_str() {
+                "width" => attr_width = attr.value.to_string().replace("px", "").trim().parse().ok(),
+                "height" => attr_height = attr.value.to_string().replace("px", "").trim().parse().ok(),
+                _ => {}
+            }
+        }
+    }
+
+    match render_svg_to_texture(svg_bytes) {
+        Some((texture, natural_w, natural_h)) => {
+            let picture = gtk::Picture::for_paintable(&texture);
+            let display_w = attr_width.unwrap_or(natural_w);
+            let display_h = attr_height.unwrap_or(natural_h);
+            picture.set_size_request(display_w, display_h);
+            picture.set_can_shrink(true);
+            picture.set_halign(gtk::Align::Start);
+
+            // Store SVG source by hash for round-trip serialization
+            let hash = simple_hash(svg_bytes);
+            let key = format!("svg:{:x}", hash);
+            ctx.css_rules_store.insert(key.clone(), svg_source);
+            picture.set_widget_name(&key);
+
+            ensure_newline(buffer);
+            let mut end_iter = buffer.end_iter();
+            let anchor = buffer.create_child_anchor(&mut end_iter);
+            view.add_child_at_anchor(&picture, &anchor);
+            let mut end_iter = buffer.end_iter();
+            buffer.insert(&mut end_iter, "\n");
+        }
+        None => {
+            // SVG rendering failed — insert placeholder
+            let mut end_iter = buffer.end_iter();
+            buffer.insert(&mut end_iter, "[SVG]");
+        }
+    }
+}
+
 // ── <img> Handling ─────────────────────────────────────────────────────
 
 /// Decode a `data:[mime];base64,[payload]` URI into a GDK Texture.
@@ -794,7 +980,7 @@ fn decode_data_uri_to_texture(data_uri: &str) -> Option<gtk::gdk::Texture> {
     gtk::gdk::Texture::from_bytes(&bytes).ok()
 }
 
-fn insert_img_widget(view: &gtk::TextView, node: &Handle, buffer: &gtk::TextBuffer) {
+fn insert_img_widget(view: &gtk::TextView, node: &Handle, buffer: &gtk::TextBuffer, _ctx: &mut ParseContext) {
     let mut src = String::new();
     let mut alt = String::new();
     let mut width: Option<i32> = None;
@@ -823,28 +1009,70 @@ fn insert_img_widget(view: &gtk::TextView, node: &Handle, buffer: &gtk::TextBuff
         return;
     }
 
+    // Helper to size a picture from a texture
+    fn size_picture(pic: &gtk::Picture, natural_w: i32, natural_h: i32, width: Option<i32>, height: Option<i32>) {
+        let (display_w, display_h) = if let Some(w) = width {
+            (w, height.unwrap_or((natural_h as f64 * w as f64 / natural_w as f64) as i32))
+        } else {
+            let max_w = 600;
+            if natural_w > max_w {
+                let scale = max_w as f64 / natural_w as f64;
+                (max_w, (natural_h as f64 * scale) as i32)
+            } else {
+                (natural_w, natural_h)
+            }
+        };
+        pic.set_size_request(display_w, display_h);
+    }
+
     let mut end_iter = buffer.end_iter();
     let anchor = buffer.create_child_anchor(&mut end_iter);
 
-    let picture = if src.starts_with("data:") {
+    let picture = if src.starts_with("data:image/svg+xml") {
+        // SVG data URI — decode and render via resvg
+        let rest = match src.strip_prefix("data:") {
+            Some(r) => r,
+            None => {
+                let mut ei = buffer.end_iter();
+                buffer.insert(&mut ei, "[image: invalid SVG data URI]");
+                return;
+            }
+        };
+        let svg_bytes = if let Some(comma_pos) = rest.find(',') {
+            let meta = &rest[..comma_pos];
+            let payload = &rest[comma_pos + 1..];
+            if meta.contains("base64") {
+                gtk::glib::base64_decode(payload)
+            } else {
+                // URL-encoded SVG
+                urlish_decode(payload).into_bytes()
+            }
+        } else {
+            Vec::new()
+        };
+        if svg_bytes.is_empty() {
+            let mut ei = buffer.end_iter();
+            buffer.insert(&mut ei, &format!("[image: {}]", if !alt.is_empty() { &alt } else { "SVG data URI" }));
+            return;
+        }
+        match render_svg_to_texture(&svg_bytes) {
+            Some((texture, natural_w, natural_h)) => {
+                let pic = gtk::Picture::for_paintable(&texture);
+                size_picture(&pic, natural_w, natural_h, width, height);
+                pic
+            }
+            None => {
+                let mut ei = buffer.end_iter();
+                buffer.insert(&mut ei, &format!("[image: {}]", if !alt.is_empty() { &alt } else { "SVG" }));
+                return;
+            }
+        }
+    } else if src.starts_with("data:") {
         // data: URI — decode base64 payload into a texture
         match decode_data_uri_to_texture(&src) {
             Some(texture) => {
                 let pic = gtk::Picture::for_paintable(&texture);
-                let natural_w = texture.width();
-                let natural_h = texture.height();
-                let (display_w, display_h) = if let Some(w) = width {
-                    (w, height.unwrap_or((natural_h as f64 * w as f64 / natural_w as f64) as i32))
-                } else {
-                    let max_w = 600;
-                    if natural_w > max_w {
-                        let scale = max_w as f64 / natural_w as f64;
-                        (max_w, (natural_h as f64 * scale) as i32)
-                    } else {
-                        (natural_w, natural_h)
-                    }
-                };
-                pic.set_size_request(display_w, display_h);
+                size_picture(&pic, texture.width(), texture.height(), width, height);
                 pic
             }
             None => {
@@ -865,26 +1093,35 @@ fn insert_img_widget(view: &gtk::TextView, node: &Handle, buffer: &gtk::TextBuff
         };
         buffer.insert(&mut ei, &label_text);
         return;
+    } else if src.to_lowercase().ends_with(".svg") {
+        // .svg file — render via resvg
+        match std::fs::read(&src) {
+            Ok(svg_bytes) => {
+                match render_svg_to_texture(&svg_bytes) {
+                    Some((texture, natural_w, natural_h)) => {
+                        let pic = gtk::Picture::for_paintable(&texture);
+                        size_picture(&pic, natural_w, natural_h, width, height);
+                        pic
+                    }
+                    None => {
+                        let pic = gtk::Picture::for_file(&gtk::gio::File::for_path(&src));
+                        pic.set_size_request(width.unwrap_or(400), height.unwrap_or(-1));
+                        pic
+                    }
+                }
+            }
+            Err(_) => {
+                let pic = gtk::Picture::for_file(&gtk::gio::File::for_path(&src));
+                pic.set_size_request(width.unwrap_or(400), height.unwrap_or(-1));
+                pic
+            }
+        }
     } else {
         let file = gtk::gio::File::for_path(&src);
         match gtk::gdk::Texture::from_file(&file) {
             Ok(texture) => {
                 let pic = gtk::Picture::for_paintable(&texture);
-                let natural_w = texture.width();
-                let natural_h = texture.height();
-                // Apply explicit dimensions or constrain to max width
-                let (display_w, display_h) = if let Some(w) = width {
-                    (w, height.unwrap_or((natural_h as f64 * w as f64 / natural_w as f64) as i32))
-                } else {
-                    let max_w = 600;
-                    if natural_w > max_w {
-                        let scale = max_w as f64 / natural_w as f64;
-                        (max_w, (natural_h as f64 * scale) as i32)
-                    } else {
-                        (natural_w, natural_h)
-                    }
-                };
-                pic.set_size_request(display_w, display_h);
+                size_picture(&pic, texture.width(), texture.height(), width, height);
                 pic
             }
             Err(_) => {
@@ -1332,7 +1569,27 @@ fn handle_flex(
             }
         }
 
-        apply_child_css_provider_with_hover(&child_view, &child_css, child_hover_css.as_ref());
+        let provider = apply_child_css_provider_with_hover(&child_view, &child_css, child_hover_css.as_ref());
+
+        // Store CssProvider per element ID for live class manipulation
+        if let Some(ref id) = child_id {
+            if let Some(prov) = provider {
+                ctx.element_providers.insert(id.clone(), prov);
+            }
+            // Record element metadata
+            let classes = child_class.as_deref().unwrap_or("")
+                .split_whitespace().map(|s| s.to_string()).collect();
+            ctx.element_meta.insert(id.clone(), ElementMeta {
+                tag_name: child_tag_str.clone(),
+                classes,
+                inline_style: child_style.clone(),
+            });
+            if let Some(ref cls) = child_class {
+                if !cls.is_empty() {
+                    ctx.css_rules_store.insert(format!("classattr:{}", id), cls.clone());
+                }
+            }
+        }
 
         // Append to container
         if is_wrap {
@@ -1597,7 +1854,26 @@ fn handle_css_grid(
         }
 
         // Apply child CSS via provider (with hover if available)
-        apply_child_css_provider_with_hover(&child_view, &child_css, child_hover_css.as_ref());
+        let provider = apply_child_css_provider_with_hover(&child_view, &child_css, child_hover_css.as_ref());
+
+        // Store CssProvider per element ID for live class manipulation
+        if let Some(ref id) = child_id {
+            if let Some(prov) = provider {
+                ctx.element_providers.insert(id.clone(), prov);
+            }
+            let classes = child_class.as_deref().unwrap_or("")
+                .split_whitespace().map(|s| s.to_string()).collect();
+            ctx.element_meta.insert(id.clone(), ElementMeta {
+                tag_name: child_tag_str.clone(),
+                classes,
+                inline_style: child_style.clone(),
+            });
+            if let Some(ref cls) = child_class {
+                if !cls.is_empty() {
+                    ctx.css_rules_store.insert(format!("classattr:{}", id), cls.clone());
+                }
+            }
+        }
 
         grid.attach(&child_view, col, row, colspan, rowspan);
 
@@ -1670,10 +1946,8 @@ fn collect_raw_attrs(node: &Handle, css_props: &CssProperties) -> String {
         .join(" ")
 }
 
-/// Apply CSS properties (background, border, color, font, padding) to a child
-/// TextView via a GTK CssProvider.
-#[allow(deprecated)]
-fn apply_child_css_provider_with_hover(child_view: &gtk::TextView, css: &CssProperties, hover_css: Option<&CssProperties>) {
+/// Build a GTK CSS string from CssProperties (and optional hover variant).
+pub fn build_widget_css_string(css: &CssProperties, hover_css: Option<&CssProperties>) -> String {
     let mut css_parts = Vec::new();
     if let Some(ref bg) = css.background_color {
         css_parts.push(format!("background-color: {};", bg));
@@ -1688,7 +1962,6 @@ fn apply_child_css_provider_with_hover(child_view: &gtk::TextView, css: &CssProp
         css_parts.push(format!("font-size: {}pt;", fs));
     }
     if css.has_border() {
-        // Generate per-side border CSS for GTK
         for (side, has, w, st, c) in [
             ("top", css.has_border_top(), css.border_top_width, css.border_top_style, &css.border_top_color),
             ("right", css.has_border_right(), css.border_right_width, css.border_right_style, &css.border_right_color),
@@ -1706,106 +1979,26 @@ fn apply_child_css_provider_with_hover(child_view: &gtk::TextView, css: &CssProp
     if let Some(ref br) = css.border_radius {
         css_parts.push(format!("border-radius: {};", br));
     }
-    // Apply padding via widget margins
-    if let Some(p) = css.padding_top { child_view.set_top_margin(p); }
-    if let Some(p) = css.padding_bottom { child_view.set_bottom_margin(p); }
-    if let Some(p) = css.padding_left { child_view.set_left_margin(p); }
-    if let Some(p) = css.padding_right { child_view.set_right_margin(p); }
-    // Shorthand: if all padding sides are same, set all
-    if css.padding_top.is_some() && css.padding_top == css.padding_bottom
-        && css.padding_top == css.padding_left && css.padding_top == css.padding_right
-    {
-        let p = css.padding_top.unwrap();
-        child_view.set_top_margin(p);
-        child_view.set_bottom_margin(p);
-        child_view.set_left_margin(p);
-        child_view.set_right_margin(p);
-    }
-
-    // Apply min-width / max-width as widget size constraints
-    if let Some(ref mw) = css.min_width {
-        if let Ok(px) = mw.replace("px", "").trim().parse::<i32>() {
-            let (cur_w, cur_h) = child_view.size_request();
-            child_view.set_size_request(px.max(cur_w), cur_h);
-        }
-    }
     if let Some(ref mw) = css.max_width {
         if let Ok(px) = mw.replace("px", "").trim().parse::<i32>() {
             css_parts.push(format!("max-width: {}px;", px));
         }
     }
-    // Apply opacity via GTK CSS
     if let Some(v) = css.opacity {
         if v < 1.0 {
             css_parts.push(format!("opacity: {};", v));
         }
     }
-    // Apply box-shadow via GTK CSS
     if let Some(ref bs) = css.box_shadow {
         css_parts.push(format!("box-shadow: {};", bs));
     }
-    // Apply text-shadow via GTK CSS (on the textview text node)
-    // Note: GTK CSS text-shadow is not on textview directly but on text nodes;
-    // we'll add it to the widget CSS
     if let Some(ref ts) = css.text_shadow {
         css_parts.push(format!("text-shadow: {};", ts));
     }
-    // Apply background-image (linear-gradient) via GTK CSS
     if let Some(ref bg) = css.background_image {
         css_parts.push(format!("background-image: {};", bg));
     }
 
-    // Apply vertical-align as widget valign within container
-    if let Some(ref va) = css.vertical_align {
-        use crate::css::VerticalAlign;
-        match va {
-            VerticalAlign::Top | VerticalAlign::Super => child_view.set_valign(gtk::Align::Start),
-            VerticalAlign::Middle => child_view.set_valign(gtk::Align::Center),
-            VerticalAlign::Bottom | VerticalAlign::Sub => child_view.set_valign(gtk::Align::End),
-            VerticalAlign::Length(pango_units) => {
-                // Convert Pango units to px (1024 per px), apply as top margin offset
-                let px = *pango_units / 1024;
-                if px > 0 {
-                    child_view.set_valign(gtk::Align::Start);
-                    let cur = child_view.top_margin();
-                    child_view.set_top_margin(cur + px);
-                } else if px < 0 {
-                    child_view.set_valign(gtk::Align::End);
-                    let cur = child_view.bottom_margin();
-                    child_view.set_bottom_margin(cur + px.abs());
-                }
-            }
-            VerticalAlign::Baseline => {}
-        }
-    }
-
-    // Apply position offsets (top/bottom/left/right) as widget margins
-    if let Some(ref t) = css.top {
-        if let Some(px) = crate::css::parse_px(t) {
-            let cur = child_view.margin_top();
-            child_view.set_margin_top(cur + px);
-        }
-    }
-    if let Some(ref b) = css.bottom_pos {
-        if let Some(px) = crate::css::parse_px(b) {
-            let cur = child_view.margin_bottom();
-            child_view.set_margin_bottom(cur + px);
-        }
-    }
-    if let Some(ref l) = css.left_pos {
-        if let Some(px) = crate::css::parse_px(l) {
-            let cur = child_view.margin_start();
-            child_view.set_margin_start(cur + px);
-        }
-    }
-    if let Some(ref r) = css.right_pos {
-        if let Some(px) = crate::css::parse_px(r) {
-            let cur = child_view.margin_end();
-            child_view.set_margin_end(cur + px);
-        }
-    }
-
-    // Build hover CSS parts
     let mut hover_parts = Vec::new();
     if let Some(hcss) = hover_css {
         if let Some(ref bg) = hcss.background_color {
@@ -1843,19 +2036,98 @@ fn apply_child_css_provider_with_hover(child_view: &gtk::TextView, css: &CssProp
         }
     }
 
-    if !css_parts.is_empty() || !hover_parts.is_empty() {
+    let mut result = String::new();
+    if !css_parts.is_empty() {
+        result.push_str(&format!("textview {{ {} }}", css_parts.join(" ")));
+    }
+    if !hover_parts.is_empty() {
+        result.push_str(&format!(" textview:hover {{ {} }}", hover_parts.join(" ")));
+    }
+    result
+}
+
+/// Apply CSS properties (background, border, color, font, padding) to a child
+/// TextView via a GTK CssProvider. Returns the provider if one was created.
+#[allow(deprecated)]
+fn apply_child_css_provider_with_hover(child_view: &gtk::TextView, css: &CssProperties, hover_css: Option<&CssProperties>) -> Option<gtk::CssProvider> {
+    // Apply padding via widget margins
+    if let Some(p) = css.padding_top { child_view.set_top_margin(p); }
+    if let Some(p) = css.padding_bottom { child_view.set_bottom_margin(p); }
+    if let Some(p) = css.padding_left { child_view.set_left_margin(p); }
+    if let Some(p) = css.padding_right { child_view.set_right_margin(p); }
+    if css.padding_top.is_some() && css.padding_top == css.padding_bottom
+        && css.padding_top == css.padding_left && css.padding_top == css.padding_right
+    {
+        let p = css.padding_top.unwrap();
+        child_view.set_top_margin(p);
+        child_view.set_bottom_margin(p);
+        child_view.set_left_margin(p);
+        child_view.set_right_margin(p);
+    }
+
+    // Apply min-width as widget size constraint
+    if let Some(ref mw) = css.min_width {
+        if let Ok(px) = mw.replace("px", "").trim().parse::<i32>() {
+            let (cur_w, cur_h) = child_view.size_request();
+            child_view.set_size_request(px.max(cur_w), cur_h);
+        }
+    }
+
+    // Apply vertical-align as widget valign within container
+    if let Some(ref va) = css.vertical_align {
+        use crate::css::VerticalAlign;
+        match va {
+            VerticalAlign::Top | VerticalAlign::Super => child_view.set_valign(gtk::Align::Start),
+            VerticalAlign::Middle => child_view.set_valign(gtk::Align::Center),
+            VerticalAlign::Bottom | VerticalAlign::Sub => child_view.set_valign(gtk::Align::End),
+            VerticalAlign::Length(pango_units) => {
+                let px = *pango_units / 1024;
+                if px > 0 {
+                    child_view.set_valign(gtk::Align::Start);
+                    let cur = child_view.top_margin();
+                    child_view.set_top_margin(cur + px);
+                } else if px < 0 {
+                    child_view.set_valign(gtk::Align::End);
+                    let cur = child_view.bottom_margin();
+                    child_view.set_bottom_margin(cur + px.abs());
+                }
+            }
+            VerticalAlign::Baseline => {}
+        }
+    }
+
+    // Apply position offsets (top/bottom/left/right) as widget margins
+    if let Some(ref t) = css.top {
+        if let Some(px) = crate::css::parse_px(t) {
+            child_view.set_margin_top(child_view.margin_top() + px);
+        }
+    }
+    if let Some(ref b) = css.bottom_pos {
+        if let Some(px) = crate::css::parse_px(b) {
+            child_view.set_margin_bottom(child_view.margin_bottom() + px);
+        }
+    }
+    if let Some(ref l) = css.left_pos {
+        if let Some(px) = crate::css::parse_px(l) {
+            child_view.set_margin_start(child_view.margin_start() + px);
+        }
+    }
+    if let Some(ref r) = css.right_pos {
+        if let Some(px) = crate::css::parse_px(r) {
+            child_view.set_margin_end(child_view.margin_end() + px);
+        }
+    }
+
+    let css_str = build_widget_css_string(css, hover_css);
+    if !css_str.is_empty() {
         let provider = gtk::CssProvider::new();
-        let mut css_str = String::new();
-        if !css_parts.is_empty() {
-            css_str.push_str(&format!("textview {{ {} }}", css_parts.join(" ")));
-        }
-        if !hover_parts.is_empty() {
-            css_str.push_str(&format!(" textview:hover {{ {} }}", hover_parts.join(" ")));
-        }
         provider.load_from_data(&css_str);
         child_view
             .style_context()
             .add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        Some(provider)
+    } else {
+        None
     }
 }
 

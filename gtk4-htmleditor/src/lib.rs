@@ -112,6 +112,14 @@ pub struct NativeHtmlEditor {
     active_hovers: RefCell<Vec<(String, gtk::TextMark, gtk::TextMark)>>,
     /// Readonly mode: None = fully editable, Some(vec) = readonly except these IDs.
     readonly_ids: RefCell<Option<Vec<String>>>,
+    /// CSS rules from <style> blocks (selector → declarations), for class manipulation.
+    style_rules: RefCell<HashMap<String, String>>,
+    /// Hover CSS rules from <style> blocks.
+    hover_style_rules: RefCell<HashMap<String, String>>,
+    /// Per-ID element metadata (tag, classes, inline_style) for class manipulation.
+    element_meta: RefCell<HashMap<String, parser::ElementMeta>>,
+    /// Per-ID CssProvider references for live widget restyling.
+    element_providers: RefCell<HashMap<String, gtk::CssProvider>>,
 }
 
 impl NativeHtmlEditor {
@@ -144,6 +152,10 @@ impl NativeHtmlEditor {
             link_hover_tag: RefCell::new(None),
             active_hovers: RefCell::new(Vec::new()),
             readonly_ids: RefCell::new(None),
+            style_rules: RefCell::new(HashMap::new()),
+            hover_style_rules: RefCell::new(HashMap::new()),
+            element_meta: RefCell::new(HashMap::new()),
+            element_providers: RefCell::new(HashMap::new()),
         }
     }
 
@@ -377,6 +389,10 @@ impl NativeHtmlEditor {
         *self.css_rules_store.borrow_mut() = result.css_rules_store;
         *self.hover_variants.borrow_mut() = result.hover_variants;
         *self.link_hover_tag.borrow_mut() = result.link_hover_tag;
+        *self.style_rules.borrow_mut() = result.style_rules;
+        *self.hover_style_rules.borrow_mut() = result.hover_rules;
+        *self.element_meta.borrow_mut() = result.element_meta;
+        *self.element_providers.borrow_mut() = result.element_providers;
     }
 
     pub fn set_html(&self, html: &str) {
@@ -1128,6 +1144,153 @@ impl NativeHtmlEditor {
                 }
                 child = c.next_sibling();
             }
+        }
+    }
+
+    // ── Class Manipulation (like classList API) ─────────────────────────────
+
+    /// Check if an element with the given ID has a specific CSS class.
+    pub fn has_class(&self, id: &str, class: &str) -> bool {
+        let meta = self.element_meta.borrow();
+        meta.get(id).map_or(false, |m| m.classes.iter().any(|c| c == class))
+    }
+
+    /// Add a CSS class to an element by ID. Returns true if the class was added
+    /// (false if it was already present or element not found).
+    pub fn add_class(&self, id: &str, class: &str) -> bool {
+        {
+            let mut meta = self.element_meta.borrow_mut();
+            let Some(m) = meta.get_mut(id) else { return false; };
+            if m.classes.iter().any(|c| c == class) { return false; }
+            m.classes.push(class.to_string());
+        }
+        self.update_class_store(id);
+        self.restyle_element(id);
+        true
+    }
+
+    /// Remove a CSS class from an element by ID. Returns true if the class was removed.
+    pub fn remove_class(&self, id: &str, class: &str) -> bool {
+        {
+            let mut meta = self.element_meta.borrow_mut();
+            let Some(m) = meta.get_mut(id) else { return false; };
+            let before = m.classes.len();
+            m.classes.retain(|c| c != class);
+            if m.classes.len() == before { return false; }
+        }
+        self.update_class_store(id);
+        self.restyle_element(id);
+        true
+    }
+
+    /// Toggle a CSS class on an element by ID. Returns true if the class is now
+    /// present, false if it was removed, None if element not found.
+    pub fn toggle_class(&self, id: &str, class: &str) -> Option<bool> {
+        let added;
+        {
+            let mut meta = self.element_meta.borrow_mut();
+            let m = meta.get_mut(id)?;
+            if let Some(pos) = m.classes.iter().position(|c| c == class) {
+                m.classes.remove(pos);
+                added = false;
+            } else {
+                m.classes.push(class.to_string());
+                added = true;
+            }
+        }
+        self.update_class_store(id);
+        self.restyle_element(id);
+        Some(added)
+    }
+
+    /// Update the css_rules_store entry for class serialization.
+    fn update_class_store(&self, id: &str) {
+        let meta = self.element_meta.borrow();
+        let mut store = self.css_rules_store.borrow_mut();
+        let key = format!("classattr:{}", id);
+        if let Some(m) = meta.get(id) {
+            if m.classes.is_empty() {
+                store.remove(&key);
+            } else {
+                store.insert(key, m.classes.join(" "));
+            }
+        }
+    }
+
+    /// Re-resolve CSS cascade for an element and apply new styles.
+    fn restyle_element(&self, id: &str) {
+        let meta = self.element_meta.borrow();
+        let Some(m) = meta.get(id) else { return; };
+
+        let classes_str = if m.classes.is_empty() { None } else { Some(m.classes.join(" ")) };
+        let style_rules = self.style_rules.borrow();
+        let hover_rules = self.hover_style_rules.borrow();
+
+        // Recompute CSS cascade with updated classes
+        let new_css = css::apply_css_cascade(
+            &m.tag_name,
+            classes_str.as_deref(),
+            Some(id),
+            m.inline_style.as_deref(),
+            &style_rules,
+        );
+
+        // Compute hover CSS
+        let hover_css = if !hover_rules.is_empty() {
+            let delta = css::apply_css_cascade(
+                &m.tag_name,
+                classes_str.as_deref(),
+                Some(id),
+                None,
+                &hover_rules,
+            );
+            if parser::has_meaningful_css(&delta) { Some(delta) } else { None }
+        } else {
+            None
+        };
+
+        // Try widget path first (CssProvider update — instant, no re-render)
+        let providers = self.element_providers.borrow();
+        if let Some(provider) = providers.get(id) {
+            let css_str = parser::build_widget_css_string(&new_css, hover_css.as_ref());
+            provider.load_from_data(&css_str);
+            return;
+        }
+        drop(providers);
+
+        // Fallback: inline text path — swap css_ tags on the editable_id region
+        let buffer = self.view.buffer();
+        let tag_name = format!("editable_id:{}", id);
+        let Some(id_tag) = buffer.tag_table().lookup(&tag_name) else { return; };
+
+        let mut iter = buffer.start_iter();
+        loop {
+            if !iter.starts_tag(Some(&id_tag)) {
+                if !iter.forward_to_tag_toggle(Some(&id_tag)) { break; }
+                if !iter.starts_tag(Some(&id_tag)) { continue; }
+            }
+            let region_start = iter;
+            if !iter.forward_to_tag_toggle(Some(&id_tag)) { break; }
+            let region_end = iter;
+
+            // Remove old css_ tags from this region
+            for tag in &region_start.tags() {
+                if let Some(name) = tag.name() {
+                    if name.starts_with("css_") {
+                        buffer.remove_tag(tag, &region_start, &region_end);
+                    }
+                }
+            }
+
+            // Apply new css_ tag
+            if parser::has_meaningful_css(&new_css) {
+                let is_block = parser::is_block_element(&m.tag_name);
+                let css_tag = parser::create_or_get_css_tag(
+                    &buffer, &new_css, is_block, &mut self.css_rules_store.borrow_mut(),
+                );
+                buffer.apply_tag(&css_tag, &region_start, &region_end);
+            }
+            break; // Only first occurrence
         }
     }
 
