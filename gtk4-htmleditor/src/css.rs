@@ -109,13 +109,19 @@ pub struct CssProperties {
     // List
     pub list_style_type: Option<ListStyleType>,
 
-    // Border per side: [top, right, bottom, left]
+    // Border per side
     pub border_top_width: Option<i32>,
     pub border_right_width: Option<i32>,
     pub border_bottom_width: Option<i32>,
     pub border_left_width: Option<i32>,
-    pub border_color: Option<String>,
-    pub border_style: Option<BorderStyle>,
+    pub border_top_style: Option<BorderStyle>,
+    pub border_right_style: Option<BorderStyle>,
+    pub border_bottom_style: Option<BorderStyle>,
+    pub border_left_style: Option<BorderStyle>,
+    pub border_top_color: Option<String>,
+    pub border_right_color: Option<String>,
+    pub border_bottom_color: Option<String>,
+    pub border_left_color: Option<String>,
 
     // Dimensions (stored as original strings for round-trip, e.g. "50%", "200px")
     pub width: Option<String>,
@@ -204,8 +210,14 @@ impl CssProperties {
         merge_field!(border_right_width);
         merge_field!(border_bottom_width);
         merge_field!(border_left_width);
-        merge_field!(border_color);
-        merge_field!(border_style);
+        merge_field!(border_top_style);
+        merge_field!(border_right_style);
+        merge_field!(border_bottom_style);
+        merge_field!(border_left_style);
+        merge_field!(border_top_color);
+        merge_field!(border_right_color);
+        merge_field!(border_bottom_color);
+        merge_field!(border_left_color);
         merge_field!(width);
         merge_field!(max_width);
         merge_field!(min_width);
@@ -281,11 +293,31 @@ impl CssProperties {
 
     /// Whether this has border properties set.
     pub fn has_border(&self) -> bool {
-        let has_width = self.border_top_width.unwrap_or(0) > 0
-            || self.border_right_width.unwrap_or(0) > 0
-            || self.border_bottom_width.unwrap_or(0) > 0
-            || self.border_left_width.unwrap_or(0) > 0;
-        has_width && self.border_style != Some(BorderStyle::None)
+        self.has_border_top() || self.has_border_right() || self.has_border_bottom() || self.has_border_left()
+    }
+
+    pub fn has_border_top(&self) -> bool {
+        self.border_top_width.unwrap_or(0) > 0 && self.border_top_style != Some(BorderStyle::None)
+    }
+    pub fn has_border_right(&self) -> bool {
+        self.border_right_width.unwrap_or(0) > 0 && self.border_right_style != Some(BorderStyle::None)
+    }
+    pub fn has_border_bottom(&self) -> bool {
+        self.border_bottom_width.unwrap_or(0) > 0 && self.border_bottom_style != Some(BorderStyle::None)
+    }
+    pub fn has_border_left(&self) -> bool {
+        self.border_left_width.unwrap_or(0) > 0 && self.border_left_style != Some(BorderStyle::None)
+    }
+
+    /// Helper: get style name string for a BorderStyle
+    pub fn border_style_str(s: Option<BorderStyle>) -> &'static str {
+        match s {
+            Some(BorderStyle::Dashed) => "dashed",
+            Some(BorderStyle::Dotted) => "dotted",
+            Some(BorderStyle::Double) => "double",
+            Some(BorderStyle::None) | Some(BorderStyle::Hidden) => "none",
+            _ => "solid",
+        }
     }
 
     /// Serialize back to CSS declaration string for round-trip.
@@ -336,15 +368,37 @@ impl CssProperties {
         }
         if let Some(true) = self.font_variant_small_caps { parts.push("font-variant: small-caps".to_string()); }
         if self.has_border() {
-            let w = self.border_top_width.unwrap_or(1);
-            let s = match self.border_style {
-                Some(BorderStyle::Dashed) => "dashed",
-                Some(BorderStyle::Dotted) => "dotted",
-                Some(BorderStyle::Double) => "double",
-                _ => "solid",
-            };
-            let c = self.border_color.as_deref().unwrap_or("black");
-            parts.push(format!("border: {}px {} {}", w, s, c));
+            // Check if all sides are the same — use shorthand
+            let all_same = self.border_top_width == self.border_right_width
+                && self.border_top_width == self.border_bottom_width
+                && self.border_top_width == self.border_left_width
+                && self.border_top_style == self.border_right_style
+                && self.border_top_style == self.border_bottom_style
+                && self.border_top_style == self.border_left_style
+                && self.border_top_color == self.border_right_color
+                && self.border_top_color == self.border_bottom_color
+                && self.border_top_color == self.border_left_color;
+            if all_same {
+                let w = self.border_top_width.unwrap_or(1);
+                let s = Self::border_style_str(self.border_top_style);
+                let c = self.border_top_color.as_deref().unwrap_or("black");
+                parts.push(format!("border: {}px {} {}", w, s, c));
+            } else {
+                // Serialize per-side
+                for (side, w, st, c) in [
+                    ("top", self.border_top_width, self.border_top_style, &self.border_top_color),
+                    ("right", self.border_right_width, self.border_right_style, &self.border_right_color),
+                    ("bottom", self.border_bottom_width, self.border_bottom_style, &self.border_bottom_color),
+                    ("left", self.border_left_width, self.border_left_style, &self.border_left_color),
+                ] {
+                    if w.unwrap_or(0) > 0 && st != Some(BorderStyle::None) {
+                        let wv = w.unwrap_or(1);
+                        let sv = Self::border_style_str(st);
+                        let cv = c.as_deref().unwrap_or("black");
+                        parts.push(format!("border-{}: {}px {} {}", side, wv, sv, cv));
+                    }
+                }
+            }
         }
         if let Some(ref v) = self.width { parts.push(format!("width: {}", v)); }
         if let Some(ref v) = self.max_width { parts.push(format!("max-width: {}", v)); }
@@ -474,6 +528,19 @@ pub fn parse_border_shorthand(val: &str) -> (Option<i32>, Option<BorderStyle>, O
         }
     }
     (width, style, color)
+}
+
+/// Parse a single border-style keyword.
+fn parse_border_style_keyword(val: &str) -> Option<BorderStyle> {
+    match val.to_lowercase().as_str() {
+        "solid" => Some(BorderStyle::Solid),
+        "dashed" => Some(BorderStyle::Dashed),
+        "dotted" => Some(BorderStyle::Dotted),
+        "double" => Some(BorderStyle::Double),
+        "none" | "hidden" => Some(BorderStyle::None),
+        "groove" | "ridge" | "inset" | "outset" => Some(BorderStyle::Solid),
+        _ => None,
+    }
 }
 
 /// Parse CSS `font` shorthand.
@@ -792,32 +859,43 @@ pub fn parse_declarations(decls: &str) -> CssProperties {
                     props.border_bottom_width = Some(w);
                     props.border_left_width = Some(w);
                 }
-                if let Some(s) = s { props.border_style = Some(s); }
-                if let Some(c) = c { props.border_color = Some(c); }
+                if let Some(s) = s {
+                    props.border_top_style = Some(s);
+                    props.border_right_style = Some(s);
+                    props.border_bottom_style = Some(s);
+                    props.border_left_style = Some(s);
+                }
+                if let Some(c) = c {
+                    let c = c.clone();
+                    props.border_top_color = Some(c.clone());
+                    props.border_right_color = Some(c.clone());
+                    props.border_bottom_color = Some(c.clone());
+                    props.border_left_color = Some(c);
+                }
             }
             "border-top" => {
                 let (w, s, c) = parse_border_shorthand(val);
                 if let Some(w) = w { props.border_top_width = Some(w); }
-                if let Some(s) = s { props.border_style = Some(s); }
-                if let Some(c) = c { props.border_color = Some(c); }
+                if let Some(s) = s { props.border_top_style = Some(s); }
+                if let Some(c) = c { props.border_top_color = Some(c); }
             }
             "border-bottom" => {
                 let (w, s, c) = parse_border_shorthand(val);
                 if let Some(w) = w { props.border_bottom_width = Some(w); }
-                if let Some(s) = s { props.border_style = Some(s); }
-                if let Some(c) = c { props.border_color = Some(c); }
+                if let Some(s) = s { props.border_bottom_style = Some(s); }
+                if let Some(c) = c { props.border_bottom_color = Some(c); }
             }
             "border-left" | "border-inline-start" => {
                 let (w, s, c) = parse_border_shorthand(val);
                 if let Some(w) = w { props.border_left_width = Some(w); }
-                if let Some(s) = s { props.border_style = Some(s); }
-                if let Some(c) = c { props.border_color = Some(c); }
+                if let Some(s) = s { props.border_left_style = Some(s); }
+                if let Some(c) = c { props.border_left_color = Some(c); }
             }
             "border-right" | "border-inline-end" => {
                 let (w, s, c) = parse_border_shorthand(val);
                 if let Some(w) = w { props.border_right_width = Some(w); }
-                if let Some(s) = s { props.border_style = Some(s); }
-                if let Some(c) = c { props.border_color = Some(c); }
+                if let Some(s) = s { props.border_right_style = Some(s); }
+                if let Some(c) = c { props.border_right_color = Some(c); }
             }
             "border-width" => {
                 let [top, right, bottom, left] = expand_box_shorthand(val);
@@ -826,17 +904,39 @@ pub fn parse_declarations(decls: &str) -> CssProperties {
                 if let Some(v) = bottom { props.border_bottom_width = Some(v); }
                 if let Some(v) = left { props.border_left_width = Some(v); }
             }
-            "border-color" => { props.border_color = Some(val.to_string()); }
-            "border-style" => {
-                match val.to_lowercase().as_str() {
-                    "solid" => props.border_style = Some(BorderStyle::Solid),
-                    "dashed" => props.border_style = Some(BorderStyle::Dashed),
-                    "dotted" => props.border_style = Some(BorderStyle::Dotted),
-                    "double" => props.border_style = Some(BorderStyle::Double),
-                    "none" | "hidden" => props.border_style = Some(BorderStyle::None),
-                    _ => props.border_style = Some(BorderStyle::Solid),
-                }
+            "border-color" => {
+                let c = val.to_string();
+                props.border_top_color = Some(c.clone());
+                props.border_right_color = Some(c.clone());
+                props.border_bottom_color = Some(c.clone());
+                props.border_left_color = Some(c);
             }
+            "border-style" => {
+                let s = match val.to_lowercase().as_str() {
+                    "solid" => BorderStyle::Solid,
+                    "dashed" => BorderStyle::Dashed,
+                    "dotted" => BorderStyle::Dotted,
+                    "double" => BorderStyle::Double,
+                    "none" | "hidden" => BorderStyle::None,
+                    _ => BorderStyle::Solid,
+                };
+                props.border_top_style = Some(s);
+                props.border_right_style = Some(s);
+                props.border_bottom_style = Some(s);
+                props.border_left_style = Some(s);
+            }
+            "border-top-width" => { props.border_top_width = parse_px(val); }
+            "border-right-width" => { props.border_right_width = parse_px(val); }
+            "border-bottom-width" => { props.border_bottom_width = parse_px(val); }
+            "border-left-width" => { props.border_left_width = parse_px(val); }
+            "border-top-style" => { props.border_top_style = parse_border_style_keyword(val); }
+            "border-right-style" => { props.border_right_style = parse_border_style_keyword(val); }
+            "border-bottom-style" => { props.border_bottom_style = parse_border_style_keyword(val); }
+            "border-left-style" => { props.border_left_style = parse_border_style_keyword(val); }
+            "border-top-color" => { props.border_top_color = Some(val.to_string()); }
+            "border-right-color" => { props.border_right_color = Some(val.to_string()); }
+            "border-bottom-color" => { props.border_bottom_color = Some(val.to_string()); }
+            "border-left-color" => { props.border_left_color = Some(val.to_string()); }
             "border-collapse" => {
                 // Handled at table level, not here
             }

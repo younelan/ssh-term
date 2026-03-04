@@ -26,11 +26,14 @@ pub fn serialize_range(
         let mut is_marker = false;
         let mut current_pos_tags: Vec<String> = Vec::new();
 
+        let mut comment_text: Option<String> = None;
         for tag in tags.iter() {
             if let Some(name) = tag.name() {
                 let name_str = name.as_str().to_string();
                 if name_str == "list_marker" {
                     is_marker = true;
+                } else if let Some(text) = name_str.strip_prefix("comment:") {
+                    comment_text = Some(text.to_string());
                 } else if is_recognized_tag(&name_str) {
                     current_pos_tags.push(name_str);
                 }
@@ -75,6 +78,17 @@ pub fn serialize_range(
 
         // Skip list marker characters
         if is_marker {
+            iter.forward_char();
+            continue;
+        }
+
+        // Emit HTML comment and skip the zero-width marker
+        if let Some(ref ct) = comment_text {
+            if !text_acc.is_empty() {
+                html.push_str(&text_acc);
+                text_acc.clear();
+            }
+            html.push_str(&format!("<!--{}-->", ct));
             iter.forward_char();
             continue;
         }
@@ -151,6 +165,7 @@ fn is_recognized_tag(name: &str) -> bool {
         || name.starts_with("link:")
         || name.starts_with("blockquote_")
         || name.starts_with("indent_")
+        || name.starts_with("comment:")
         || name.starts_with("abbr_title:")
     {
         return true;

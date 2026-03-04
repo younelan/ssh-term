@@ -542,7 +542,27 @@ fn walk_dom(
             }
         }
 
-        _ => {} // Comments, processing instructions, etc.
+        NodeData::Comment { ref contents } => {
+            // Preserve HTML comments as zero-width tagged markers for round-trip
+            let comment_text = contents.to_string();
+            let tag_name = format!("comment:{}", comment_text);
+            let tag = if let Some(existing) = buffer.tag_table().lookup(&tag_name) {
+                existing
+            } else {
+                let new_tag = gtk::TextTag::new(Some(&tag_name));
+                new_tag.set_invisible(true);
+                buffer.tag_table().add(&new_tag);
+                new_tag
+            };
+            let mut end_iter = buffer.end_iter();
+            let offset = end_iter.offset();
+            buffer.insert(&mut end_iter, "\u{200B}");
+            let start = buffer.iter_at_offset(offset);
+            let end = buffer.end_iter();
+            buffer.apply_tag(&tag, &start, &end);
+        }
+
+        _ => {} // Processing instructions, etc.
     }
 }
 
@@ -1653,15 +1673,20 @@ fn apply_child_css_provider_with_hover(child_view: &gtk::TextView, css: &CssProp
         css_parts.push(format!("font-size: {}pt;", fs));
     }
     if css.has_border() {
-        let w = css.border_top_width.unwrap_or(1);
-        let s = match css.border_style {
-            Some(BorderStyle::Dashed) => "dashed",
-            Some(BorderStyle::Dotted) => "dotted",
-            Some(BorderStyle::Double) => "double",
-            _ => "solid",
-        };
-        let c = css.border_color.as_deref().unwrap_or("alpha(currentColor, 0.3)");
-        css_parts.push(format!("border: {}px {} {};", w, s, c));
+        // Generate per-side border CSS for GTK
+        for (side, has, w, st, c) in [
+            ("top", css.has_border_top(), css.border_top_width, css.border_top_style, &css.border_top_color),
+            ("right", css.has_border_right(), css.border_right_width, css.border_right_style, &css.border_right_color),
+            ("bottom", css.has_border_bottom(), css.border_bottom_width, css.border_bottom_style, &css.border_bottom_color),
+            ("left", css.has_border_left(), css.border_left_width, css.border_left_style, &css.border_left_color),
+        ] {
+            if has {
+                let wv = w.unwrap_or(1);
+                let sv = CssProperties::border_style_str(st);
+                let cv = c.as_deref().unwrap_or("alpha(currentColor, 0.3)");
+                css_parts.push(format!("border-{}: {}px {} {};", side, wv, sv, cv));
+            }
+        }
     }
     if let Some(ref br) = css.border_radius {
         css_parts.push(format!("border-radius: {};", br));
@@ -1784,15 +1809,19 @@ fn apply_child_css_provider_with_hover(child_view: &gtk::TextView, css: &CssProp
             hover_parts.push(format!("opacity: {};", v));
         }
         if hcss.has_border() {
-            let w = hcss.border_top_width.unwrap_or(1);
-            let s = match hcss.border_style {
-                Some(BorderStyle::Dashed) => "dashed",
-                Some(BorderStyle::Dotted) => "dotted",
-                Some(BorderStyle::Double) => "double",
-                _ => "solid",
-            };
-            let c = hcss.border_color.as_deref().unwrap_or("currentColor");
-            hover_parts.push(format!("border: {}px {} {};", w, s, c));
+            for (side, has, w, st, c) in [
+                ("top", hcss.has_border_top(), hcss.border_top_width, hcss.border_top_style, &hcss.border_top_color),
+                ("right", hcss.has_border_right(), hcss.border_right_width, hcss.border_right_style, &hcss.border_right_color),
+                ("bottom", hcss.has_border_bottom(), hcss.border_bottom_width, hcss.border_bottom_style, &hcss.border_bottom_color),
+                ("left", hcss.has_border_left(), hcss.border_left_width, hcss.border_left_style, &hcss.border_left_color),
+            ] {
+                if has {
+                    let wv = w.unwrap_or(1);
+                    let sv = CssProperties::border_style_str(st);
+                    let cv = c.as_deref().unwrap_or("currentColor");
+                    hover_parts.push(format!("border-{}: {}px {} {};", side, wv, sv, cv));
+                }
+            }
         }
         if let Some(ref br) = hcss.border_radius {
             hover_parts.push(format!("border-radius: {};", br));
@@ -1860,11 +1889,10 @@ fn handle_table(
         }
     }
 
-    // Check for border-collapse in CSS
-    if let Some(ref style) = css_props.border_style
-        && *style == BorderStyle::None {
-            table_border_width = Some(0);
-        }
+    // Check for border-style: none in CSS
+    if css_props.border_top_style == Some(BorderStyle::None) {
+        table_border_width = Some(0);
+    }
     // Scan inline style for border-collapse
     // (already parsed in css_props, but also check for border-collapse specifically)
     if let NodeData::Element { ref attrs, .. } = node.data {
@@ -2167,13 +2195,8 @@ fn handle_table(
                 }
                 if cell_css.has_border() {
                     cell_border_width = cell_css.border_top_width;
-                    cell_border_color = cell_css.border_color.clone();
-                    cell_border_style_str = Some(match cell_css.border_style {
-                        Some(BorderStyle::Dashed) => "dashed".to_string(),
-                        Some(BorderStyle::Dotted) => "dotted".to_string(),
-                        Some(BorderStyle::Double) => "double".to_string(),
-                        _ => "solid".to_string(),
-                    });
+                    cell_border_color = cell_css.border_top_color.clone();
+                    cell_border_style_str = Some(CssProperties::border_style_str(cell_css.border_top_style).to_string());
                 }
                 if cell_css.color.is_some() {
                     cell_color = cell_css.color.clone();
