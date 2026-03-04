@@ -53,6 +53,20 @@ pub enum ListStyleType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WordBreakMode {
+    Normal,
+    BreakAll,
+    KeepAll,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OverflowWrapMode {
+    Normal,
+    BreakWord,
+    Anywhere,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BorderStyle {
     None,
     Solid,
@@ -101,6 +115,8 @@ pub struct CssProperties {
     pub line_height: Option<f64>,
     pub direction: Option<TextDirection>,
     pub white_space: Option<WhiteSpaceMode>,
+    pub word_break: Option<WordBreakMode>,
+    pub overflow_wrap: Option<OverflowWrapMode>,
     pub paragraph_background: Option<String>,
 
     // Block control
@@ -204,6 +220,8 @@ impl CssProperties {
         merge_field!(line_height);
         merge_field!(direction);
         merge_field!(white_space);
+        merge_field!(word_break);
+        merge_field!(overflow_wrap);
         merge_field!(paragraph_background);
         merge_field!(list_style_type);
         merge_field!(border_top_width);
@@ -443,6 +461,22 @@ impl CssProperties {
         if let Some(ref v) = self.grid_template_columns { parts.push(format!("grid-template-columns: {}", v)); }
         if let Some(ref v) = self.grid_column { parts.push(format!("grid-column: {}", v)); }
         if let Some(ref v) = self.grid_row { parts.push(format!("grid-row: {}", v)); }
+        if let Some(ref wb) = self.word_break {
+            let s = match wb {
+                WordBreakMode::BreakAll => "break-all",
+                WordBreakMode::KeepAll => "keep-all",
+                WordBreakMode::Normal => "normal",
+            };
+            parts.push(format!("word-break: {}", s));
+        }
+        if let Some(ref ow) = self.overflow_wrap {
+            let s = match ow {
+                OverflowWrapMode::BreakWord => "break-word",
+                OverflowWrapMode::Anywhere => "anywhere",
+                OverflowWrapMode::Normal => "normal",
+            };
+            parts.push(format!("overflow-wrap: {}", s));
+        }
         parts.join("; ")
     }
 }
@@ -793,6 +827,21 @@ pub fn parse_declarations(decls: &str) -> CssProperties {
                     "nowrap" => props.white_space = Some(WhiteSpaceMode::Nowrap),
                     "pre-line" => props.white_space = Some(WhiteSpaceMode::PreLine),
                     _ => props.white_space = Some(WhiteSpaceMode::Normal),
+                }
+            }
+
+            "word-break" => {
+                match val.to_lowercase().as_str() {
+                    "break-all" => props.word_break = Some(WordBreakMode::BreakAll),
+                    "keep-all" => props.word_break = Some(WordBreakMode::KeepAll),
+                    _ => props.word_break = Some(WordBreakMode::Normal),
+                }
+            }
+            "overflow-wrap" | "word-wrap" => {
+                match val.to_lowercase().as_str() {
+                    "break-word" => props.overflow_wrap = Some(OverflowWrapMode::BreakWord),
+                    "anywhere" => props.overflow_wrap = Some(OverflowWrapMode::Anywhere),
+                    _ => props.overflow_wrap = Some(OverflowWrapMode::Normal),
                 }
             }
 

@@ -120,12 +120,15 @@ pub struct NativeHtmlEditor {
     element_meta: RefCell<HashMap<String, parser::ElementMeta>>,
     /// Per-ID CssProvider references for live widget restyling.
     element_providers: RefCell<HashMap<String, gtk::CssProvider>>,
+    /// Resolver for cid: image references in HTML emails.
+    cid_resolver: RefCell<Option<std::rc::Rc<dyn Fn(&str) -> Option<Vec<u8>>>>>,
 }
 
 impl NativeHtmlEditor {
     pub fn new() -> Self {
         let view = gtk::TextView::new();
         view.set_wrap_mode(gtk::WrapMode::Word);
+        view.set_input_hints(gtk::InputHints::SPELLCHECK | gtk::InputHints::WORD_COMPLETION);
         view.set_left_margin(8);
         view.set_right_margin(8);
         view.set_top_margin(8);
@@ -156,11 +159,22 @@ impl NativeHtmlEditor {
             hover_style_rules: RefCell::new(HashMap::new()),
             element_meta: RefCell::new(HashMap::new()),
             element_providers: RefCell::new(HashMap::new()),
+            cid_resolver: RefCell::new(None),
         }
     }
 
     pub fn widget(&self) -> &gtk::Widget {
         self.view.upcast_ref()
+    }
+
+    /// Set a callback to resolve `cid:` image references in HTML emails.
+    /// The callback receives the content-id (without `cid:` prefix) and should
+    /// return image bytes if available.
+    pub fn set_cid_resolver<F>(&self, resolver: F)
+    where
+        F: Fn(&str) -> Option<Vec<u8>> + 'static,
+    {
+        *self.cid_resolver.borrow_mut() = Some(std::rc::Rc::new(resolver));
     }
 
     /// Connect buffer signals to automatically capture undo snapshots
@@ -192,14 +206,48 @@ impl NativeHtmlEditor {
         key_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
         let ed_weak = std::rc::Rc::downgrade(self);
         key_ctrl.connect_key_pressed(move |_ctrl, key, _code, modifiers| {
-            let primary = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
-                || modifiers.contains(gtk::gdk::ModifierType::META_MASK);
-            if !primary {
-                return gtk::glib::Propagation::Proceed;
-            }
             let Some(ed) = ed_weak.upgrade() else {
                 return gtk::glib::Propagation::Proceed;
             };
+            let primary = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
+                || modifiers.contains(gtk::gdk::ModifierType::META_MASK);
+
+            // Handle Delete/Backspace on selected image (no modifier needed)
+            if matches!(key, gtk::gdk::Key::Delete | gtk::gdk::Key::BackSpace) {
+                if let Some(pic) = parser::selected_image() {
+                    ed.delete_image_widget(&pic);
+                    parser::clear_image_selection();
+                    return gtk::glib::Propagation::Stop;
+                }
+            }
+
+            if !primary {
+                // Only clear image selection on printable/typing keys, not modifiers or nav
+                if parser::selected_image().is_some() {
+                    let dominated_by_modifier = matches!(key,
+                        gtk::gdk::Key::Shift_L | gtk::gdk::Key::Shift_R |
+                        gtk::gdk::Key::Control_L | gtk::gdk::Key::Control_R |
+                        gtk::gdk::Key::Meta_L | gtk::gdk::Key::Meta_R |
+                        gtk::gdk::Key::Alt_L | gtk::gdk::Key::Alt_R |
+                        gtk::gdk::Key::Super_L | gtk::gdk::Key::Super_R |
+                        gtk::gdk::Key::Caps_Lock | gtk::gdk::Key::Escape |
+                        gtk::gdk::Key::Delete | gtk::gdk::Key::BackSpace |
+                        gtk::gdk::Key::Left | gtk::gdk::Key::Right |
+                        gtk::gdk::Key::Up | gtk::gdk::Key::Down |
+                        gtk::gdk::Key::Home | gtk::gdk::Key::End |
+                        gtk::gdk::Key::Page_Up | gtk::gdk::Key::Page_Down |
+                        gtk::gdk::Key::Tab | gtk::gdk::Key::F1 | gtk::gdk::Key::F2 |
+                        gtk::gdk::Key::F3 | gtk::gdk::Key::F4 | gtk::gdk::Key::F5 |
+                        gtk::gdk::Key::F6 | gtk::gdk::Key::F7 | gtk::gdk::Key::F8 |
+                        gtk::gdk::Key::F9 | gtk::gdk::Key::F10 | gtk::gdk::Key::F11 |
+                        gtk::gdk::Key::F12
+                    );
+                    if !dominated_by_modifier {
+                        parser::clear_image_selection();
+                    }
+                }
+                return gtk::glib::Propagation::Proceed;
+            }
             let shift = modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK);
             match key {
                 gtk::gdk::Key::z | gtk::gdk::Key::Z => {
@@ -215,10 +263,22 @@ impl NativeHtmlEditor {
                     gtk::glib::Propagation::Stop
                 }
                 gtk::gdk::Key::c | gtk::gdk::Key::C => {
+                    // Copy selected image as HTML, or fall back to text selection
+                    if let Some(pic) = parser::selected_image() {
+                        ed.copy_image_as_html(&pic);
+                        return gtk::glib::Propagation::Stop;
+                    }
                     ed.copy_selection_as_html();
                     gtk::glib::Propagation::Stop
                 }
                 gtk::gdk::Key::x | gtk::gdk::Key::X => {
+                    // Cut selected image
+                    if let Some(pic) = parser::selected_image() {
+                        ed.copy_image_as_html(&pic);
+                        ed.delete_image_widget(&pic);
+                        parser::clear_image_selection();
+                        return gtk::glib::Propagation::Stop;
+                    }
                     ed.cut_selection_as_html();
                     gtk::glib::Propagation::Stop
                 }
@@ -226,20 +286,41 @@ impl NativeHtmlEditor {
                     if ed.paste_html_from_internal() {
                         gtk::glib::Propagation::Stop
                     } else {
-                        gtk::glib::Propagation::Proceed
+                        ed.paste_from_system_clipboard();
+                        gtk::glib::Propagation::Stop
                     }
+                }
+                gtk::gdk::Key::b | gtk::gdk::Key::B => {
+                    ed.toggle_bold();
+                    gtk::glib::Propagation::Stop
+                }
+                gtk::gdk::Key::i | gtk::gdk::Key::I => {
+                    ed.toggle_italic();
+                    gtk::glib::Propagation::Stop
+                }
+                gtk::gdk::Key::u | gtk::gdk::Key::U => {
+                    ed.toggle_underline();
+                    gtk::glib::Propagation::Stop
+                }
+                gtk::gdk::Key::k | gtk::gdk::Key::K => {
+                    ed.insert_link();
+                    gtk::glib::Propagation::Stop
+                }
+                gtk::gdk::Key::backslash => {
+                    ed.remove_formatting();
+                    gtk::glib::Propagation::Stop
                 }
                 _ => gtk::glib::Propagation::Proceed,
             }
         });
         self.view.add_controller(key_ctrl);
 
-        // Clickable links (mailto:, tel:, http:, https:)
+        // Clickable links + image selection with resize popover
         let click_ctrl = gtk::GestureClick::new();
         click_ctrl.set_button(1); // Left click only
         let ed_weak = std::rc::Rc::downgrade(self);
         click_ctrl.connect_released(move |gesture, _n_press, x, y| {
-            let Some(_ed) = ed_weak.upgrade() else { return };
+            let Some(ed) = ed_weak.upgrade() else { return };
             let Some(widget) = gesture.widget() else { return };
             let Some(view) = widget.downcast_ref::<gtk::TextView>() else { return };
             let (bx, by) = view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
@@ -247,18 +328,8 @@ impl NativeHtmlEditor {
                 for tag in iter.tags().iter() {
                     if let Some(name) = tag.name() {
                         if let Some(url) = name.strip_prefix("link:") {
-                            if url.starts_with("mailto:")
-                                || url.starts_with("tel:")
-                                || url.starts_with("http:")
-                                || url.starts_with("https:")
-                            {
-                                let launcher = gtk::UriLauncher::new(url);
-                                launcher.launch(
-                                    gtk::Window::NONE,
-                                    gtk::gio::Cancellable::NONE,
-                                    |_| {},
-                                );
-                            }
+                            let url = url.to_string();
+                            ed.show_link_popover(x, y, &url);
                             break;
                         }
                     }
@@ -304,6 +375,170 @@ impl NativeHtmlEditor {
             }
         });
         self.view.add_controller(motion_ctrl);
+
+        // Drag & drop image insert
+        let drop_target = gtk::DropTarget::new(gtk::gio::File::static_type(), gtk::gdk::DragAction::COPY);
+        let ed_weak = std::rc::Rc::downgrade(self);
+        drop_target.connect_drop(move |_target, value, _x, _y| {
+            let Some(ed) = ed_weak.upgrade() else { return false };
+            if let Ok(file) = value.get::<gtk::gio::File>() {
+                let path = file.path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+                let lower = path.to_lowercase();
+                if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg")
+                    || lower.ends_with(".gif") || lower.ends_with(".svg") || lower.ends_with(".webp")
+                    || lower.ends_with(".bmp") || lower.ends_with(".tiff")
+                {
+                    ed.insert_image_from_file(&file);
+                    return true;
+                }
+            }
+            false
+        });
+        self.view.add_controller(drop_target);
+
+        // Right-click context menu
+        let right_click = gtk::GestureClick::new();
+        right_click.set_button(3);
+        let ed_weak = std::rc::Rc::downgrade(self);
+        right_click.connect_released(move |_gesture, _n_press, x, y| {
+            let Some(ed) = ed_weak.upgrade() else { return };
+            ed.show_context_menu(x, y);
+        });
+        self.view.add_controller(right_click);
+    }
+
+    fn show_context_menu(self: &std::rc::Rc<Self>, x: f64, y: f64) {
+        let popover = gtk::Popover::new();
+        let vbox = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        vbox.set_margin_top(4);
+        vbox.set_margin_bottom(4);
+        vbox.set_margin_start(4);
+        vbox.set_margin_end(4);
+
+        let cut_btn = gtk::Button::with_label("Cut");
+        cut_btn.set_has_frame(false);
+        let copy_btn = gtk::Button::with_label("Copy");
+        copy_btn.set_has_frame(false);
+        let paste_btn = gtk::Button::with_label("Paste");
+        paste_btn.set_has_frame(false);
+
+        let sep1 = gtk::Separator::new(gtk::Orientation::Horizontal);
+
+        let link_btn = gtk::Button::with_label("Insert Link...");
+        link_btn.set_has_frame(false);
+        let hr_btn = gtk::Button::with_label("Insert Horizontal Rule");
+        hr_btn.set_has_frame(false);
+
+        let sep2 = gtk::Separator::new(gtk::Orientation::Horizontal);
+
+        let clear_btn = gtk::Button::with_label("Remove Formatting");
+        clear_btn.set_has_frame(false);
+
+        vbox.append(&cut_btn);
+        vbox.append(&copy_btn);
+        vbox.append(&paste_btn);
+        vbox.append(&sep1);
+        vbox.append(&link_btn);
+        vbox.append(&hr_btn);
+        vbox.append(&sep2);
+        vbox.append(&clear_btn);
+
+        // Wire buttons
+        let pop = popover.clone();
+        let ed = std::rc::Rc::downgrade(self);
+        cut_btn.connect_clicked(move |_| {
+            if let Some(e) = ed.upgrade() { e.cut_selection_as_html(); }
+            pop.popdown();
+        });
+
+        let pop = popover.clone();
+        let ed = std::rc::Rc::downgrade(self);
+        copy_btn.connect_clicked(move |_| {
+            if let Some(e) = ed.upgrade() { e.copy_selection_as_html(); }
+            pop.popdown();
+        });
+
+        let pop = popover.clone();
+        let ed = std::rc::Rc::downgrade(self);
+        paste_btn.connect_clicked(move |_| {
+            if let Some(e) = ed.upgrade() { let _ = e.paste_html_from_internal(); }
+            pop.popdown();
+        });
+
+        let pop = popover.clone();
+        let ed = std::rc::Rc::downgrade(self);
+        link_btn.connect_clicked(move |_| {
+            if let Some(e) = ed.upgrade() { e.insert_link(); }
+            pop.popdown();
+        });
+
+        let pop = popover.clone();
+        let ed = std::rc::Rc::downgrade(self);
+        hr_btn.connect_clicked(move |_| {
+            if let Some(e) = ed.upgrade() { e.insert_hr(); }
+            pop.popdown();
+        });
+
+        let pop = popover.clone();
+        let ed = std::rc::Rc::downgrade(self);
+        clear_btn.connect_clicked(move |_| {
+            if let Some(e) = ed.upgrade() { e.remove_formatting(); }
+            pop.popdown();
+        });
+
+        popover.set_child(Some(&vbox));
+        popover.set_parent(&self.view);
+        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        popover.popup();
+    }
+
+    fn show_link_popover(self: &std::rc::Rc<Self>, x: f64, y: f64, url: &str) {
+        let popover = gtk::Popover::new();
+        let vbox = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        vbox.set_margin_top(4);
+        vbox.set_margin_bottom(4);
+        vbox.set_margin_start(4);
+        vbox.set_margin_end(4);
+
+        let url_label = gtk::Label::new(Some(url));
+        url_label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        url_label.set_max_width_chars(40);
+        url_label.set_selectable(true);
+        url_label.set_margin_bottom(4);
+        vbox.append(&url_label);
+
+        let sep = gtk::Separator::new(gtk::Orientation::Horizontal);
+        vbox.append(&sep);
+
+        let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        let edit_btn = gtk::Button::with_label("Edit");
+        edit_btn.set_has_frame(false);
+        let visit_btn = gtk::Button::with_label("Visit");
+        visit_btn.set_has_frame(false);
+        hbox.append(&edit_btn);
+        hbox.append(&visit_btn);
+        vbox.append(&hbox);
+
+        let pop = popover.clone();
+        let ed = std::rc::Rc::downgrade(self);
+        edit_btn.connect_clicked(move |_| {
+            pop.popdown();
+            if let Some(e) = ed.upgrade() { e.insert_link(); }
+        });
+
+        let pop = popover.clone();
+        let url_owned = url.to_string();
+        visit_btn.connect_clicked(move |btn| {
+            pop.popdown();
+            let launcher = gtk::UriLauncher::new(&url_owned);
+            let root = btn.root().and_then(|r| r.downcast::<gtk::Window>().ok());
+            launcher.launch(root.as_ref(), gtk::gio::Cancellable::NONE, |_| {});
+        });
+
+        popover.set_child(Some(&vbox));
+        popover.set_parent(&self.view);
+        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        popover.popup();
     }
 
     fn clear_hover(&self) {
@@ -385,7 +620,8 @@ impl NativeHtmlEditor {
             .read_from(&mut html.as_bytes())
             .unwrap();
 
-        let result = parser::parse_html_to_buffer(&self.view, &dom, &buffer);
+        let resolver = self.cid_resolver.borrow().clone();
+        let result = parser::parse_html_to_buffer(&self.view, &dom, &buffer, resolver);
         *self.css_rules_store.borrow_mut() = result.css_rules_store;
         *self.hover_variants.borrow_mut() = result.hover_variants;
         *self.link_hover_tag.borrow_mut() = result.link_hover_tag;
@@ -597,6 +833,47 @@ impl NativeHtmlEditor {
         true
     }
 
+    /// Paste from the system clipboard with HTML sanitization.
+    fn paste_from_system_clipboard(self: &std::rc::Rc<Self>) {
+        let clipboard = self.view.clipboard();
+        let ed = std::rc::Rc::downgrade(self);
+        clipboard.read_text_async(gtk::gio::Cancellable::NONE, move |result| {
+            let Some(ed) = ed.upgrade() else { return };
+            if let Ok(Some(text)) = result {
+                let text_str = text.to_string();
+                if text_str.is_empty() { return; }
+
+                let buffer = ed.view.buffer();
+
+                // Delete selection if any
+                if let Some((mut s, mut e)) = buffer.selection_bounds() {
+                    buffer.delete(&mut s, &mut e);
+                }
+
+                // Check if it looks like HTML
+                if text_str.contains('<') && (text_str.contains("</") || text_str.contains("/>")) {
+                    let sanitized = sanitize_external_html(&text_str);
+                    let cursor = buffer.iter_at_mark(&buffer.get_insert());
+                    let store = ed.css_rules_store.borrow();
+                    let before = serializer::serialize_range(
+                        &buffer, &buffer.start_iter(), &cursor, &store,
+                    );
+                    let after = serializer::serialize_range(
+                        &buffer, &cursor, &buffer.end_iter(), &store,
+                    );
+                    drop(store);
+                    let combined = format!("{}{}{}", before, sanitized, after);
+                    ed.load_html_internal(&combined);
+                } else {
+                    // Plain text — insert directly
+                    let mut iter = buffer.iter_at_mark(&buffer.get_insert());
+                    buffer.insert(&mut iter, &text_str);
+                }
+                ed.capture_undo_snapshot();
+            }
+        });
+    }
+
     // ── Formatting Toggles ─────────────────────────────────────────────────
 
     pub fn toggle_bold(&self) {
@@ -626,6 +903,44 @@ impl NativeHtmlEditor {
             }
             self.capture_undo_snapshot();
         }
+    }
+
+    // ── Remove Formatting ───────────────────────────────────────────────────
+
+    pub fn remove_formatting(&self) {
+        let buffer = self.view.buffer();
+        let (start, end) = get_target_bounds(&buffer);
+
+        // Collect tags to remove (formatting only, keep structural)
+        let mut tags_to_remove: Vec<gtk::TextTag> = Vec::new();
+        let mut iter = start;
+        loop {
+            for tag in iter.tags().iter() {
+                if let Some(name) = tag.name() {
+                    let n = name.as_str();
+                    let should_remove = matches!(n,
+                        "b" | "strong" | "i" | "em" | "cite" | "var" | "u" | "ins"
+                        | "s" | "strike" | "del" | "code" | "tt" | "kbd" | "samp"
+                        | "mark" | "sub" | "sup" | "small" | "big" | "pre" | "a"
+                        | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "abbr_style"
+                    )
+                    || n.starts_with("link:")
+                    || n.starts_with("css_")
+                    || n.starts_with("abbr_title:");
+                    if should_remove && !tags_to_remove.iter().any(|t| {
+                        t.name().as_deref() == tag.name().as_deref()
+                    }) {
+                        tags_to_remove.push(tag.clone());
+                    }
+                }
+            }
+            if !iter.forward_char() || iter >= end { break; }
+        }
+
+        for tag in &tags_to_remove {
+            buffer.remove_tag(tag, &start, &end);
+        }
+        self.capture_undo_snapshot();
     }
 
     // ── Alignment ──────────────────────────────────────────────────────────
@@ -761,6 +1076,183 @@ impl NativeHtmlEditor {
         self.capture_undo_snapshot();
     }
 
+    // ── Link ───────────────────────────────────────────────────────────────
+
+    /// Show a dialog to insert or edit a hyperlink.
+    pub fn insert_link(self: &std::rc::Rc<Self>) {
+        let buffer = self.view.buffer();
+
+        // Detect existing link at cursor
+        let cursor_iter = buffer.iter_at_mark(&buffer.get_insert());
+        let mut existing_url: Option<String> = None;
+        let mut existing_link_tag: Option<gtk::TextTag> = None;
+        for tag in cursor_iter.tags().iter() {
+            if let Some(name) = tag.name() {
+                if let Some(url) = name.as_str().strip_prefix("link:") {
+                    existing_url = Some(url.to_string());
+                    existing_link_tag = Some(tag.clone());
+                    break;
+                }
+            }
+        }
+
+        // Get selected text for pre-fill
+        let selected_text = buffer.selection_bounds().map(|(s, e)| {
+            buffer.text(&s, &e, false).to_string()
+        });
+
+        // Get existing link text if editing
+        let (link_start_offset, link_end_offset) = if let Some(ref lt) = existing_link_tag {
+            let mut ls = cursor_iter;
+            let mut le = cursor_iter;
+            ls.backward_to_tag_toggle(Some(lt));
+            le.forward_to_tag_toggle(Some(lt));
+            (Some(ls.offset()), Some(le.offset()))
+        } else {
+            (None, None)
+        };
+        let existing_text = if let (Some(so), Some(eo)) = (link_start_offset, link_end_offset) {
+            let s = buffer.iter_at_offset(so);
+            let e = buffer.iter_at_offset(eo);
+            Some(buffer.text(&s, &e, false).to_string())
+        } else {
+            None
+        };
+
+        // Build dialog
+        let toplevel = self.view.root().and_then(|r| r.downcast::<gtk::Window>().ok());
+        let dialog = gtk::Window::builder()
+            .title("Insert Link")
+            .modal(true)
+            .resizable(false)
+            .default_width(380)
+            .build();
+        if let Some(ref win) = toplevel {
+            dialog.set_transient_for(Some(win));
+        }
+
+        let vbox = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        vbox.set_margin_top(12);
+        vbox.set_margin_bottom(12);
+        vbox.set_margin_start(12);
+        vbox.set_margin_end(12);
+
+        let url_label = gtk::Label::new(Some("URL:"));
+        url_label.set_halign(gtk::Align::Start);
+        let url_entry = gtk::Entry::new();
+        url_entry.set_placeholder_text(Some("https://"));
+        if let Some(ref url) = existing_url {
+            url_entry.set_text(url);
+        }
+
+        let text_label = gtk::Label::new(Some("Text:"));
+        text_label.set_halign(gtk::Align::Start);
+        let text_entry = gtk::Entry::new();
+        if let Some(ref t) = selected_text {
+            text_entry.set_text(t);
+        } else if let Some(ref t) = existing_text {
+            text_entry.set_text(t);
+        }
+
+        vbox.append(&url_label);
+        vbox.append(&url_entry);
+        vbox.append(&text_label);
+        vbox.append(&text_entry);
+
+        let btn_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        btn_box.set_halign(gtk::Align::End);
+        btn_box.set_margin_top(8);
+        let cancel_btn = gtk::Button::with_label("Cancel");
+        let insert_btn = gtk::Button::with_label(if existing_url.is_some() { "Update" } else { "Insert" });
+        btn_box.append(&cancel_btn);
+        btn_box.append(&insert_btn);
+        vbox.append(&btn_box);
+        dialog.set_child(Some(&vbox));
+
+        let dlg = dialog.clone();
+        cancel_btn.connect_clicked(move |_| dlg.close());
+
+        let dlg = dialog.clone();
+        let ed = std::rc::Rc::downgrade(self);
+        let has_selection = selected_text.is_some();
+        insert_btn.connect_clicked(move |_| {
+            let url = url_entry.text().to_string();
+            if url.is_empty() {
+                dlg.close();
+                return;
+            }
+            let display_text = text_entry.text().to_string();
+            let Some(ed) = ed.upgrade() else { dlg.close(); return; };
+            let buffer = ed.view.buffer();
+
+            // Remove old link tags if editing
+            if let (Some(so), Some(eo)) = (link_start_offset, link_end_offset) {
+                let s = buffer.iter_at_offset(so);
+                let e = buffer.iter_at_offset(eo);
+                // Remove old link: and a tags
+                if let Some(ref lt) = existing_link_tag {
+                    buffer.remove_tag(lt, &s, &e);
+                }
+                if let Some(a_tag) = buffer.tag_table().lookup("a") {
+                    buffer.remove_tag(&a_tag, &s, &e);
+                }
+                // If text changed, replace it
+                if let Some(ref old_text) = existing_text {
+                    if display_text != *old_text {
+                        let mut ms = buffer.iter_at_offset(so);
+                        let mut me = buffer.iter_at_offset(eo);
+                        buffer.delete(&mut ms, &mut me);
+                        let mut ins = buffer.iter_at_offset(so);
+                        buffer.insert(&mut ins, &display_text);
+                    }
+                }
+            } else if has_selection {
+                // Selection exists — tags will be applied to it
+            } else if !display_text.is_empty() {
+                // No selection, no existing link — insert text at cursor
+                let mut iter = buffer.iter_at_mark(&buffer.get_insert());
+                buffer.insert(&mut iter, &display_text);
+            }
+
+            // Determine range to tag
+            let (tag_start, tag_end) = if has_selection && existing_link_tag.is_none() {
+                if let Some((s, e)) = buffer.selection_bounds() {
+                    (s, e)
+                } else {
+                    dlg.close(); return;
+                }
+            } else if let Some(so) = link_start_offset {
+                let s = buffer.iter_at_offset(so);
+                let e = buffer.iter_at_offset(so + display_text.len() as i32);
+                (s, e)
+            } else {
+                // Newly inserted text
+                let cursor = buffer.iter_at_mark(&buffer.get_insert());
+                let s = buffer.iter_at_offset(cursor.offset() - display_text.len() as i32);
+                (s, cursor)
+            };
+
+            // Apply link tag
+            let link_tag_name = format!("link:{}", url);
+            let link_tag = if let Some(existing) = buffer.tag_table().lookup(&link_tag_name) {
+                existing
+            } else {
+                let new_tag = gtk::TextTag::new(Some(&link_tag_name));
+                buffer.tag_table().add(&new_tag);
+                new_tag
+            };
+            buffer.apply_tag(&link_tag, &tag_start, &tag_end);
+            if let Some(a_tag) = buffer.tag_table().lookup("a") {
+                buffer.apply_tag(&a_tag, &tag_start, &tag_end);
+            }
+
+            ed.capture_undo_snapshot();
+            dlg.close();
+        });
+
+        dialog.present();
+    }
+
     // ── Image ──────────────────────────────────────────────────────────────
 
     /// Insert an image from a file path.
@@ -776,38 +1268,98 @@ impl NativeHtmlEditor {
 
         let path_str = file.path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
 
-        // Load via Texture for proper error handling
-        let picture = match gtk::gdk::Texture::from_file(file) {
-            Ok(texture) => {
-                let pic = gtk::Picture::for_paintable(&texture);
-                // Constrain width while preserving aspect ratio
-                let natural_w = texture.width();
-                let natural_h = texture.height();
-                let max_w = 600;
-                let (display_w, display_h) = if natural_w > max_w {
-                    let scale = max_w as f64 / natural_w as f64;
-                    (max_w, (natural_h as f64 * scale) as i32)
-                } else {
-                    (natural_w, natural_h)
-                };
-                pic.set_size_request(display_w, display_h);
-                pic
-            }
-            Err(_) => {
-                // Fallback: try Picture::for_file which handles more formats
-                let pic = gtk::Picture::for_file(file);
-                pic.set_size_request(400, -1);
-                pic
-            }
-        };
+        let picture = gtk::Picture::for_file(file);
+        let max_w = 600;
+        if let Ok(texture) = gtk::gdk::Texture::from_file(file) {
+            let natural_w = texture.width();
+            let natural_h = texture.height();
+            let (display_w, display_h) = if natural_w > max_w {
+                let scale = max_w as f64 / natural_w as f64;
+                (max_w, (natural_h as f64 * scale) as i32)
+            } else {
+                (natural_w, natural_h)
+            };
+            picture.set_size_request(display_w, display_h);
+        } else {
+            picture.set_size_request(400, 300);
+        }
 
-        picture.set_can_shrink(true);
-        picture.set_halign(gtk::Align::Start);
         picture.set_widget_name(&format!("img:{}", path_str));
+        parser::setup_image_click_resize(&picture);
 
         let anchor = buffer.create_child_anchor(&mut iter);
         self.view.add_child_at_anchor(&picture, &anchor);
         self.capture_undo_snapshot();
+    }
+
+    /// Resize the image at the current cursor position (if any).
+    /// Returns true if an image was found and resized.
+    pub fn resize_image_at_cursor(&self, width: i32, height: i32) -> bool {
+        let buffer = self.view.buffer();
+        let iter = buffer.iter_at_mark(&buffer.get_insert());
+        if let Some(anchor) = iter.child_anchor() {
+            for widget in anchor.widgets() {
+                if let Some(pic) = widget.downcast_ref::<gtk::Picture>() {
+                    let name = pic.widget_name().to_string();
+                    if name.starts_with("img:") || name.starts_with("svg:") {
+                        pic.set_size_request(width.max(16), height.max(16));
+                        self.capture_undo_snapshot();
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Delete a Picture widget (and its child anchor) from the buffer.
+    fn delete_image_widget(&self, pic: &gtk::Picture) {
+        // Snapshot current state (with the image) so undo can restore it
+        self.capture_undo_snapshot();
+        let buffer = self.view.buffer();
+        let mut iter = buffer.start_iter();
+        loop {
+            if let Some(anchor) = iter.child_anchor() {
+                for w in anchor.widgets() {
+                    if w.eq(pic.upcast_ref::<gtk::Widget>()) {
+                        let mut end = iter;
+                        end.forward_char();
+                        buffer.delete(&mut iter, &mut end);
+                        // Snapshot state after deletion
+                        self.capture_undo_snapshot();
+                        return;
+                    }
+                }
+            }
+            if !iter.forward_char() { break; }
+        }
+    }
+
+    /// Copy a Picture's HTML representation to the internal clipboard.
+    fn copy_image_as_html(&self, pic: &gtk::Picture) {
+        let name = pic.widget_name().to_string();
+        let html = if name.starts_with("svg:") {
+            self.css_rules_store.borrow().get(&name).cloned().unwrap_or_default()
+        } else if let Some(rest) = name.strip_prefix("img:") {
+            let (src, alt) = if let Some(pipe_pos) = rest.find("|alt:") {
+                (&rest[..pipe_pos], Some(&rest[pipe_pos + 5..]))
+            } else {
+                (rest, None)
+            };
+            let mut tag = format!("<img src=\"{}\"", src);
+            if let Some(a) = alt { tag.push_str(&format!(" alt=\"{}\"", a)); }
+            let w = pic.width_request();
+            let h = pic.height_request();
+            if w > 0 { tag.push_str(&format!(" width=\"{}\"", w)); }
+            if h > 0 { tag.push_str(&format!(" height=\"{}\"", h)); }
+            tag.push('>');
+            tag
+        } else {
+            return;
+        };
+        *self.internal_clipboard.borrow_mut() = Some(html.clone());
+        self.clipboard_set_by_us.set(true);
+        self.view.clipboard().set_text(&name);
     }
 
     // ── Color ──────────────────────────────────────────────────────────────
@@ -1351,6 +1903,250 @@ impl NativeHtmlEditor {
         }
         self.capture_undo_snapshot();
     }
+
+    // ── Numbered List ──────────────────────────────────────────────────────
+
+    pub fn insert_numbered_list(&self) {
+        let buffer = self.view.buffer();
+        let (start, end) = get_target_bounds(&buffer);
+
+        let start_line = start.line();
+        let end_line = end.line();
+
+        let tag_table = buffer.tag_table();
+        let list_marker_tag = tag_table.lookup("list_marker").unwrap();
+        let li_tag = tag_table.lookup("li").unwrap();
+        let ol_tag = tag_table.lookup("ol_1").unwrap();
+
+        // Check if first line already has a numbered marker (ol_1 tag)
+        let first_line_start = buffer.iter_at_line(start_line).unwrap_or_else(|| buffer.start_iter());
+        let has_ol = first_line_start.has_tag(&ol_tag) || {
+            let mut check = first_line_start;
+            check.forward_chars(2);
+            check.has_tag(&ol_tag)
+        };
+
+        // Also check for bullet (ul_1) to handle switching
+        let ul_tag = tag_table.lookup("ul_1").unwrap();
+        let has_ul = first_line_start.has_tag(&ul_tag) || {
+            let mut check = first_line_start;
+            check.forward_chars(2);
+            check.has_tag(&ul_tag)
+        };
+
+        let toggling_off = has_ol;
+
+        for line_num in (start_line..=end_line).rev() {
+            let line_start = buffer.iter_at_line(line_num).unwrap_or_else(|| buffer.start_iter());
+            let mut line_end = line_start;
+            if !line_end.ends_line() { line_end.forward_to_line_end(); }
+
+            if toggling_off {
+                // Remove numbered marker: scan for digits followed by ". "
+                let line_text = buffer.text(&line_start, &line_end, false).to_string();
+                let marker_len = find_number_marker_len(&line_text);
+                if marker_len > 0 {
+                    let mut ms = buffer.iter_at_line(line_num).unwrap_or_else(|| buffer.start_iter());
+                    let mut me = buffer.iter_at_offset(ms.offset() + marker_len as i32);
+                    buffer.delete(&mut ms, &mut me);
+
+                    let ls = buffer.iter_at_line(line_num).unwrap_or_else(|| buffer.start_iter());
+                    let mut le = ls;
+                    if !le.ends_line() { le.forward_to_line_end(); }
+                    buffer.remove_tag(&li_tag, &ls, &le);
+                    buffer.remove_tag(&ol_tag, &ls, &le);
+                }
+            } else {
+                // If switching from bullet, remove bullet marker + ul tag first
+                if has_ul {
+                    let line_text = buffer.text(&line_start, &line_end, false).to_string();
+                    if line_text.starts_with("\u{2022} ") || line_text.starts_with("\u{25AA} ")
+                        || line_text.starts_with("\u{25CB} ") {
+                        let mut ms = buffer.iter_at_line(line_num).unwrap_or_else(|| buffer.start_iter());
+                        let mut me = buffer.iter_at_offset(ms.offset() + 2);
+                        buffer.delete(&mut ms, &mut me);
+                    }
+                    let ls = buffer.iter_at_line(line_num).unwrap_or_else(|| buffer.start_iter());
+                    let mut le = ls;
+                    if !le.ends_line() { le.forward_to_line_end(); }
+                    buffer.remove_tag(&ul_tag, &ls, &le);
+                }
+
+                // Insert numbered marker
+                let num = (line_num - start_line + 1) as i32;
+                let marker = format!("{}. ", num);
+                let marker_char_count = marker.len() as i32;
+                let mut ins = buffer.iter_at_line(line_num).unwrap_or_else(|| buffer.start_iter());
+                let offset = ins.offset();
+                buffer.insert(&mut ins, &marker);
+
+                let marker_start = buffer.iter_at_offset(offset);
+                let marker_end_iter = buffer.iter_at_offset(offset + marker_char_count - 1);
+                buffer.apply_tag(&list_marker_tag, &marker_start, &marker_end_iter);
+
+                let ls = buffer.iter_at_offset(offset);
+                let mut le = ls;
+                if !le.ends_line() { le.forward_to_line_end(); }
+                buffer.apply_tag(&li_tag, &ls, &le);
+                buffer.apply_tag(&ol_tag, &ls, &le);
+            }
+        }
+        self.capture_undo_snapshot();
+    }
+
+    // ── Blockquote / Quote ─────────────────────────────────────────────────
+
+    pub fn insert_quote(&self) {
+        let buffer = self.view.buffer();
+        let (start, end) = get_target_bounds(&buffer);
+
+        let current_depth = current_blockquote_depth(&buffer, &start);
+        let new_depth = std::cmp::min(current_depth + 1, 5);
+
+        let bq_tag_name = format!("blockquote_{}", new_depth);
+        if let Some(tag) = buffer.tag_table().lookup(&bq_tag_name) {
+            buffer.apply_tag(&tag, &start, &end);
+        }
+        self.capture_undo_snapshot();
+    }
+
+    pub fn remove_quote(&self) {
+        let buffer = self.view.buffer();
+        let (start, end) = get_target_bounds(&buffer);
+
+        let depth = current_blockquote_depth(&buffer, &start);
+        if depth > 0 {
+            let tag_name = format!("blockquote_{}", depth);
+            if let Some(tag) = buffer.tag_table().lookup(&tag_name) {
+                buffer.remove_tag(&tag, &start, &end);
+            }
+            self.capture_undo_snapshot();
+        }
+    }
+
+    // ── Signature ──────────────────────────────────────────────────────────
+
+    pub fn insert_signature(&self, signature_text: &str) {
+        let buffer = self.view.buffer();
+        let store = self.css_rules_store.borrow();
+        let before = serializer::serialize_buffer(&buffer, &store);
+        drop(store);
+
+        let escaped = signature_text
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('\n', "<br>");
+        let sig_html = format!(
+            "<div style=\"color: #888888; font-size: 10pt;\">-- <br>{}</div>",
+            escaped
+        );
+
+        let combined = format!("{}{}", before, sig_html);
+        self.load_html_internal(&combined);
+        self.capture_undo_snapshot();
+    }
+
+    // ── Table ──────────────────────────────────────────────────────────────
+
+    pub fn insert_table(&self, rows: u32, cols: u32) {
+        let buffer = self.view.buffer();
+
+        if let Some((mut s, mut e)) = buffer.selection_bounds() {
+            buffer.delete(&mut s, &mut e);
+        }
+
+        let cursor = buffer.iter_at_mark(&buffer.get_insert());
+        let buf_start = buffer.start_iter();
+        let buf_end = buffer.end_iter();
+        let store = self.css_rules_store.borrow();
+        let before = serializer::serialize_range(&buffer, &buf_start, &cursor, &store);
+        let after = serializer::serialize_range(&buffer, &cursor, &buf_end, &store);
+        drop(store);
+
+        let mut table_html = String::from(
+            "<table border=\"1\" style=\"border-collapse: collapse;\" cellpadding=\"4\">\n"
+        );
+        for _row in 0..rows {
+            table_html.push_str("  <tr>");
+            for _col in 0..cols {
+                table_html.push_str("<td>&nbsp;</td>");
+            }
+            table_html.push_str("</tr>\n");
+        }
+        table_html.push_str("</table>\n");
+
+        let combined = format!("{}{}{}", before, table_html, after);
+        self.load_html_internal(&combined);
+        self.capture_undo_snapshot();
+    }
+
+    pub fn show_table_dialog(self: &std::rc::Rc<Self>) {
+        let toplevel = self.view.root().and_then(|r| r.downcast::<gtk::Window>().ok());
+        let dialog = gtk::Window::builder()
+            .title("Insert Table")
+            .modal(true)
+            .resizable(false)
+            .default_width(250)
+            .build();
+        if let Some(ref win) = toplevel {
+            dialog.set_transient_for(Some(win));
+        }
+
+        let vbox = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        vbox.set_margin_top(12);
+        vbox.set_margin_bottom(12);
+        vbox.set_margin_start(12);
+        vbox.set_margin_end(12);
+
+        let grid = gtk::Grid::new();
+        grid.set_row_spacing(6);
+        grid.set_column_spacing(8);
+
+        let rows_label = gtk::Label::new(Some("Rows:"));
+        rows_label.set_halign(gtk::Align::End);
+        let rows_spin = gtk::SpinButton::with_range(1.0, 20.0, 1.0);
+        rows_spin.set_value(3.0);
+
+        let cols_label = gtk::Label::new(Some("Columns:"));
+        cols_label.set_halign(gtk::Align::End);
+        let cols_spin = gtk::SpinButton::with_range(1.0, 10.0, 1.0);
+        cols_spin.set_value(3.0);
+
+        grid.attach(&rows_label, 0, 0, 1, 1);
+        grid.attach(&rows_spin, 1, 0, 1, 1);
+        grid.attach(&cols_label, 0, 1, 1, 1);
+        grid.attach(&cols_spin, 1, 1, 1, 1);
+
+        vbox.append(&grid);
+
+        let btn_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        btn_box.set_halign(gtk::Align::End);
+        btn_box.set_margin_top(8);
+        let cancel_btn = gtk::Button::with_label("Cancel");
+        let insert_btn = gtk::Button::with_label("Insert");
+        btn_box.append(&cancel_btn);
+        btn_box.append(&insert_btn);
+        vbox.append(&btn_box);
+
+        dialog.set_child(Some(&vbox));
+
+        let dlg = dialog.clone();
+        cancel_btn.connect_clicked(move |_| dlg.close());
+
+        let dlg = dialog.clone();
+        let ed = std::rc::Rc::downgrade(self);
+        insert_btn.connect_clicked(move |_| {
+            let rows = rows_spin.value() as u32;
+            let cols = cols_spin.value() as u32;
+            if let Some(ed) = ed.upgrade() {
+                ed.insert_table(rows, cols);
+            }
+            dlg.close();
+        });
+
+        dialog.present();
+    }
 }
 
 impl Default for NativeHtmlEditor {
@@ -1496,6 +2292,80 @@ fn create_tag_weight_scale(buffer: &gtk::TextBuffer, name: &str, weight: i32, sc
     tag.set_property("weight", weight);
     tag.set_property("scale", scale);
     buffer.tag_table().add(&tag);
+}
+
+/// Sanitize HTML pasted from external sources (MS Word, web pages).
+fn sanitize_external_html(html: &str) -> String {
+    use regex::Regex;
+    let mut cleaned = html.to_string();
+
+    // Remove <style> blocks
+    let style_re = Regex::new(r"(?si)<style[^>]*>.*?</style>").unwrap();
+    cleaned = style_re.replace_all(&cleaned, "").to_string();
+
+    // Remove <script> blocks
+    let script_re = Regex::new(r"(?si)<script[^>]*>.*?</script>").unwrap();
+    cleaned = script_re.replace_all(&cleaned, "").to_string();
+
+    // Remove class attributes
+    let class_re = Regex::new(r#"\s+class="[^"]*""#).unwrap();
+    cleaned = class_re.replace_all(&cleaned, "").to_string();
+
+    // Strip mso-* CSS properties from inline styles
+    let mso_re = Regex::new(r"mso-[a-z-]+:\s*[^;]+;?").unwrap();
+    cleaned = mso_re.replace_all(&cleaned, "").to_string();
+
+    // Remove empty style attributes
+    let empty_style = Regex::new(r#"\s+style="\s*""#).unwrap();
+    cleaned = empty_style.replace_all(&cleaned, "").to_string();
+
+    // Remove HTML comments (Word conditional comments)
+    let comment_re = Regex::new(r"(?s)<!--.*?-->").unwrap();
+    cleaned = comment_re.replace_all(&cleaned, "").to_string();
+
+    // Remove Office namespace tags (<o:p>, <v:*>, <w:*>)
+    let office_re = Regex::new(r"(?si)</?[ovw]:[^>]*>").unwrap();
+    cleaned = office_re.replace_all(&cleaned, "").to_string();
+
+    cleaned
+}
+
+/// Find the length of a numbered list marker at the start of a line (e.g. "1. " → 3, "12. " → 4).
+fn find_number_marker_len(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == 0 { return 0; }
+    if i + 2 <= bytes.len() && bytes[i] == b'.' && bytes[i + 1] == b' ' {
+        i + 2
+    } else {
+        0
+    }
+}
+
+/// Get the current blockquote nesting depth at an iterator position.
+fn current_blockquote_depth(buffer: &gtk::TextBuffer, iter: &gtk::TextIter) -> i32 {
+    let mut max_depth = 0;
+    for tag in iter.tags().iter() {
+        if let Some(name) = tag.name() {
+            if let Some(depth_str) = name.as_str().strip_prefix("blockquote_") {
+                if let Ok(d) = depth_str.parse::<i32>() {
+                    max_depth = max_depth.max(d);
+                }
+            }
+        }
+    }
+    // Also check the "blockquote" base tag as depth 1
+    if max_depth == 0 {
+        if let Some(tag) = buffer.tag_table().lookup("blockquote") {
+            if iter.has_tag(&tag) {
+                max_depth = 1;
+            }
+        }
+    }
+    max_depth
 }
 
 fn get_target_bounds(buffer: &gtk::TextBuffer) -> (gtk::TextIter, gtk::TextIter) {

@@ -354,19 +354,24 @@ fn serialize_widget_anchor(iter: &gtk::TextIter, html: &mut String, css_rules_st
             if let Some(pic) = widget.downcast_ref::<gtk::Picture>() {
                 let name = pic.widget_name().to_string();
                 if name.starts_with("svg:") {
-                    // Inline SVG — retrieve original source from css_rules_store
                     if let Some(svg_source) = css_rules_store.get(&name) {
                         html.push_str(svg_source);
                     }
                 } else if let Some(rest) = name.strip_prefix("img:") {
-                    // Format: img:src or img:src|alt:text
-                    if let Some(pipe_pos) = rest.find("|alt:") {
-                        let src = &rest[..pipe_pos];
-                        let alt = &rest[pipe_pos + 5..];
-                        html.push_str(&format!("<img src=\"{}\" alt=\"{}\">", src, alt));
+                    let (src, alt) = if let Some(pipe_pos) = rest.find("|alt:") {
+                        (&rest[..pipe_pos], Some(&rest[pipe_pos + 5..]))
                     } else {
-                        html.push_str(&format!("<img src=\"{}\">", rest));
+                        (rest, None)
+                    };
+                    html.push_str(&format!("<img src=\"{}\"", src));
+                    if let Some(a) = alt {
+                        html.push_str(&format!(" alt=\"{}\"", a));
                     }
+                    let w = pic.width_request();
+                    let h = pic.height_request();
+                    if w > 0 { html.push_str(&format!(" width=\"{}\"", w)); }
+                    if h > 0 { html.push_str(&format!(" height=\"{}\"", h)); }
+                    html.push('>');
                 }
                 return;
             }

@@ -34,10 +34,15 @@ pub struct ParseContext {
     pub blockquote_depth: i32,
     pub element_meta: HashMap<String, ElementMeta>,
     pub element_providers: HashMap<String, gtk::CssProvider>,
+    pub cid_resolver: Option<std::rc::Rc<dyn Fn(&str) -> Option<Vec<u8>>>>,
 }
 
 impl ParseContext {
-    pub fn new(css_rules: HashMap<String, String>, hover_rules: HashMap<String, String>) -> Self {
+    pub fn new(
+        css_rules: HashMap<String, String>,
+        hover_rules: HashMap<String, String>,
+        cid_resolver: Option<std::rc::Rc<dyn Fn(&str) -> Option<Vec<u8>>>>,
+    ) -> Self {
         Self {
             css_rules,
             hover_rules,
@@ -54,6 +59,7 @@ impl ParseContext {
             blockquote_depth: 0,
             element_meta: HashMap::new(),
             element_providers: HashMap::new(),
+            cid_resolver,
         }
     }
 }
@@ -75,12 +81,13 @@ pub fn parse_html_to_buffer(
     view: &gtk::TextView,
     dom: &markup5ever_rcdom::RcDom,
     buffer: &gtk::TextBuffer,
+    cid_resolver: Option<std::rc::Rc<dyn Fn(&str) -> Option<Vec<u8>>>>,
 ) -> ParseResult {
     let mut css_rules = HashMap::new();
     let mut hover_rules = HashMap::new();
     collect_style_rules(&dom.document, &mut css_rules, &mut hover_rules);
 
-    let mut ctx = ParseContext::new(css_rules.clone(), hover_rules.clone());
+    let mut ctx = ParseContext::new(css_rules.clone(), hover_rules.clone(), cid_resolver);
     walk_dom(view, &dom.document, buffer, &mut ctx);
     ParseResult {
         css_rules_store: ctx.css_rules_store,
@@ -935,24 +942,17 @@ fn insert_svg_widget(
             let display_w = attr_width.unwrap_or(natural_w);
             let display_h = attr_height.unwrap_or(natural_h);
             picture.set_size_request(display_w, display_h);
-            picture.set_can_shrink(true);
-            picture.set_halign(gtk::Align::Start);
-
             // Store SVG source by hash for round-trip serialization
             let hash = simple_hash(svg_bytes);
             let key = format!("svg:{:x}", hash);
             ctx.css_rules_store.insert(key.clone(), svg_source);
             picture.set_widget_name(&key);
-
-            ensure_newline(buffer);
+            setup_image_click_resize(&picture);
             let mut end_iter = buffer.end_iter();
             let anchor = buffer.create_child_anchor(&mut end_iter);
             view.add_child_at_anchor(&picture, &anchor);
-            let mut end_iter = buffer.end_iter();
-            buffer.insert(&mut end_iter, "\n");
         }
         None => {
-            // SVG rendering failed — insert placeholder
             let mut end_iter = buffer.end_iter();
             buffer.insert(&mut end_iter, "[SVG]");
         }
@@ -980,7 +980,7 @@ fn decode_data_uri_to_texture(data_uri: &str) -> Option<gtk::gdk::Texture> {
     gtk::gdk::Texture::from_bytes(&bytes).ok()
 }
 
-fn insert_img_widget(view: &gtk::TextView, node: &Handle, buffer: &gtk::TextBuffer, _ctx: &mut ParseContext) {
+fn insert_img_widget(view: &gtk::TextView, node: &Handle, buffer: &gtk::TextBuffer, ctx: &mut ParseContext) {
     let mut src = String::new();
     let mut alt = String::new();
     let mut width: Option<i32> = None;
@@ -1083,8 +1083,31 @@ fn insert_img_widget(view: &gtk::TextView, node: &Handle, buffer: &gtk::TextBuff
             }
         }
     } else if src.starts_with("cid:") {
-        // cid: reference — placeholder for MIME-embedded images
         let content_id = src.strip_prefix("cid:").unwrap_or("");
+
+        // Try resolving via callback
+        let resolved = ctx.cid_resolver.as_ref().and_then(|r| r(content_id));
+        if let Some(bytes) = resolved {
+            let glib_bytes = gtk::glib::Bytes::from_owned(bytes);
+            match gtk::gdk::Texture::from_bytes(&glib_bytes) {
+                Ok(texture) => {
+                    let pic = gtk::Picture::for_paintable(&texture);
+                    size_picture(&pic, texture.width(), texture.height(), width, height);
+                    pic.set_widget_name(&format!("img:cid:{}", content_id));
+                    if !alt.is_empty() {
+                        pic.set_widget_name(&format!("img:cid:{}|alt:{}", content_id, alt));
+                    }
+                    setup_image_click_resize(&pic);
+                    let mut end_iter = buffer.end_iter();
+                    let anchor = buffer.create_child_anchor(&mut end_iter);
+                    view.add_child_at_anchor(&pic, &anchor);
+                    return;
+                }
+                Err(_) => {} // Fall through to placeholder
+            }
+        }
+
+        // Fallback: placeholder text
         let mut ei = buffer.end_iter();
         let label_text = if !alt.is_empty() {
             format!("[image: {}]", alt)
@@ -1132,16 +1155,293 @@ fn insert_img_widget(view: &gtk::TextView, node: &Handle, buffer: &gtk::TextBuff
             }
         }
     };
-    picture.set_can_shrink(true);
-    picture.set_halign(gtk::Align::Start);
-    // Store src (and alt if present) in widget_name for serialization
     if alt.is_empty() {
         picture.set_widget_name(&format!("img:{}", src));
     } else {
         picture.set_widget_name(&format!("img:{}|alt:{}", src, alt));
     }
-
+    setup_image_click_resize(&picture);
     view.add_child_at_anchor(&picture, &anchor);
+}
+
+// Shared state: the currently selected image (if any).
+thread_local! {
+    static SELECTED_IMAGE: std::cell::RefCell<Option<gtk::Picture>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Get the currently selected image, if any.
+pub(crate) fn selected_image() -> Option<gtk::Picture> {
+    SELECTED_IMAGE.with(|sel| sel.borrow().clone())
+}
+
+/// Clear the current image selection (remove highlight and forget).
+pub(crate) fn clear_image_selection() {
+    SELECTED_IMAGE.with(|sel| {
+        if let Some(prev) = sel.borrow_mut().take() {
+            prev.remove_css_class("image-selected");
+        }
+    });
+}
+
+/// Attach click handlers to a Picture: single click = select, double click = resize dialog.
+pub(crate) fn setup_image_click_resize(picture: &gtk::Picture) {
+    picture.set_can_target(true);
+
+    // Register CSS once
+    static CSS_REGISTERED: std::sync::Once = std::sync::Once::new();
+    CSS_REGISTERED.call_once(|| {
+        let css_provider = gtk::CssProvider::new();
+        css_provider.load_from_data("picture.image-selected { border: 2px solid @accent_color; }");
+        gtk::style_context_add_provider_for_display(
+            &gtk::gdk::Display::default().unwrap(),
+            &css_provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    });
+
+    let click = gtk::GestureClick::new();
+    click.set_button(1);
+    let pic = picture.clone();
+    click.connect_pressed(move |gesture, n_press, _x, _y| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        // Don't interact in readonly mode; ensure focus stays on the TextView for key events
+        let mut editable = true;
+        if let Some(view_widget) = pic.parent() {
+            if let Some(tv) = view_widget.downcast_ref::<gtk::TextView>() {
+                if !tv.is_editable() { editable = false; }
+                tv.grab_focus();
+            }
+        }
+        if !editable { return; }
+        if n_press == 1 {
+            let already_selected = pic.has_css_class("image-selected");
+            // Deselect previous
+            SELECTED_IMAGE.with(|sel| {
+                if let Some(prev) = sel.borrow_mut().take() {
+                    prev.remove_css_class("image-selected");
+                }
+            });
+            if !already_selected {
+                pic.add_css_class("image-selected");
+                SELECTED_IMAGE.with(|sel| {
+                    *sel.borrow_mut() = Some(pic.clone());
+                });
+            }
+        } else if n_press == 2 {
+            show_resize_dialog(&pic);
+        }
+    });
+    picture.add_controller(click);
+}
+
+/// Find the current paragraph justification for the line containing a Picture's child anchor.
+fn get_image_justification(pic: &gtk::Picture) -> gtk::Justification {
+    let Some(tv) = pic.parent().and_then(|p| p.downcast::<gtk::TextView>().ok()) else {
+        return gtk::Justification::Left;
+    };
+    let buffer = tv.buffer();
+    // Walk through the buffer to find the child anchor that holds this picture
+    let mut iter = buffer.start_iter();
+    loop {
+        if let Some(anchor) = iter.child_anchor() {
+            for w in anchor.widgets() {
+                if w.eq(pic.upcast_ref::<gtk::Widget>()) {
+                    // Found it — check justification tags on this line
+                    let line_start = {
+                        let mut ls = iter;
+                        ls.set_line_offset(0);
+                        ls
+                    };
+                    for tag in line_start.tags() {
+                        if let Some(name) = tag.name() {
+                            if name.contains("center") || name.contains("Center") {
+                                return gtk::Justification::Center;
+                            }
+                            if name.contains("right") || name.contains("Right") {
+                                return gtk::Justification::Right;
+                            }
+                        }
+                    }
+                    return gtk::Justification::Left;
+                }
+            }
+        }
+        if !iter.forward_char() { break; }
+    }
+    gtk::Justification::Left
+}
+
+/// Apply paragraph justification to the line containing a Picture's child anchor.
+fn apply_image_justification(pic: &gtk::Picture, justification: gtk::Justification) {
+    let Some(tv) = pic.parent().and_then(|p| p.downcast::<gtk::TextView>().ok()) else { return };
+    let buffer = tv.buffer();
+    // Find the iter at the child anchor
+    let mut iter = buffer.start_iter();
+    loop {
+        if let Some(anchor) = iter.child_anchor() {
+            for w in anchor.widgets() {
+                if w.eq(pic.upcast_ref::<gtk::Widget>()) {
+                    // Found it — apply justification to this line
+                    let mut line_start = iter;
+                    line_start.set_line_offset(0);
+                    let mut line_end = iter;
+                    if !line_end.ends_line() { line_end.forward_to_line_end(); }
+
+                    // Remove existing alignment tags
+                    for tag_name in &["text-align: left", "text-align: center", "text-align: right"] {
+                        if let Some(tag) = buffer.tag_table().lookup(tag_name) {
+                            buffer.remove_tag(&tag, &line_start, &line_end);
+                        }
+                    }
+
+                    let tag_name = match justification {
+                        gtk::Justification::Center => "text-align: center",
+                        gtk::Justification::Right => "text-align: right",
+                        _ => "text-align: left",
+                    };
+                    let tag = if let Some(t) = buffer.tag_table().lookup(tag_name) {
+                        t
+                    } else {
+                        let t = gtk::TextTag::builder()
+                            .name(tag_name)
+                            .justification(justification)
+                            .build();
+                        buffer.tag_table().add(&t);
+                        t
+                    };
+                    buffer.apply_tag(&tag, &line_start, &line_end);
+                    return;
+                }
+            }
+        }
+        if !iter.forward_char() { break; }
+    }
+}
+
+fn show_resize_dialog(pic: &gtk::Picture) {
+    let cur_w = pic.width();
+    let cur_h = pic.height();
+
+    let toplevel = pic.root().and_then(|r| r.downcast::<gtk::Window>().ok());
+
+    let dialog = gtk::Window::builder()
+        .title("Image Properties")
+        .modal(true)
+        .resizable(false)
+        .default_width(280)
+        .build();
+    if let Some(ref win) = toplevel {
+        dialog.set_transient_for(Some(win));
+    }
+
+    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    vbox.set_margin_top(12);
+    vbox.set_margin_bottom(12);
+    vbox.set_margin_start(12);
+    vbox.set_margin_end(12);
+
+    let grid = gtk::Grid::new();
+    grid.set_column_spacing(8);
+    grid.set_row_spacing(6);
+
+    let w_label = gtk::Label::new(Some("Width:"));
+    w_label.set_halign(gtk::Align::End);
+    let w_spin = gtk::SpinButton::with_range(16.0, 4000.0, 1.0);
+    w_spin.set_value(cur_w as f64);
+
+    let h_label = gtk::Label::new(Some("Height:"));
+    h_label.set_halign(gtk::Align::End);
+    let h_spin = gtk::SpinButton::with_range(16.0, 4000.0, 1.0);
+    h_spin.set_value(cur_h as f64);
+
+    grid.attach(&w_label, 0, 0, 1, 1);
+    grid.attach(&w_spin, 1, 0, 1, 1);
+    grid.attach(&h_label, 0, 1, 1, 1);
+    grid.attach(&h_spin, 1, 1, 1, 1);
+
+    // Alignment (applies to the paragraph in the TextBuffer)
+    let align_label = gtk::Label::new(Some("Align:"));
+    align_label.set_halign(gtk::Align::End);
+    let align_dropdown = gtk::DropDown::from_strings(&["Left", "Center", "Right"]);
+    let cur_just = get_image_justification(pic);
+    let cur_align_idx = match cur_just {
+        gtk::Justification::Center => 1,
+        gtk::Justification::Right => 2,
+        _ => 0,
+    };
+    align_dropdown.set_selected(cur_align_idx);
+    grid.attach(&align_label, 0, 2, 1, 1);
+    grid.attach(&align_dropdown, 1, 2, 1, 1);
+
+    vbox.append(&grid);
+
+    let aspect_check = gtk::CheckButton::with_label("Lock aspect ratio");
+    aspect_check.set_active(true);
+    vbox.append(&aspect_check);
+
+    let aspect_ratio = if cur_h > 0 { cur_w as f64 / cur_h as f64 } else { 1.0 };
+    let updating = std::rc::Rc::new(std::cell::Cell::new(false));
+
+    let h_spin_ref = h_spin.clone();
+    let aspect_check_ref = aspect_check.clone();
+    let ar = aspect_ratio;
+    let upd = updating.clone();
+    w_spin.connect_value_changed(move |w| {
+        if upd.get() { return; }
+        if aspect_check_ref.is_active() {
+            upd.set(true);
+            h_spin_ref.set_value((w.value() / ar).round());
+            upd.set(false);
+        }
+    });
+
+    let w_spin_ref = w_spin.clone();
+    let aspect_check_ref = aspect_check.clone();
+    let upd = updating.clone();
+    h_spin.connect_value_changed(move |h| {
+        if upd.get() { return; }
+        if aspect_check_ref.is_active() {
+            upd.set(true);
+            w_spin_ref.set_value((h.value() * aspect_ratio).round());
+            upd.set(false);
+        }
+    });
+
+    let btn_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    btn_box.set_halign(gtk::Align::End);
+
+    let apply_btn = gtk::Button::with_label("Apply");
+    apply_btn.add_css_class("suggested-action");
+    let cancel_btn = gtk::Button::with_label("Cancel");
+    btn_box.append(&cancel_btn);
+    btn_box.append(&apply_btn);
+    vbox.append(&btn_box);
+
+    dialog.set_child(Some(&vbox));
+
+    let pic_ref = pic.clone();
+    let dlg = dialog.clone();
+    apply_btn.connect_clicked(move |_| {
+        let new_w = w_spin.value() as i32;
+        let new_h = h_spin.value() as i32;
+        pic_ref.set_size_request(new_w, new_h);
+
+        let justification = match align_dropdown.selected() {
+            1 => gtk::Justification::Center,
+            2 => gtk::Justification::Right,
+            _ => gtk::Justification::Left,
+        };
+        apply_image_justification(&pic_ref, justification);
+
+        dlg.close();
+    });
+
+    let dlg = dialog.clone();
+    cancel_btn.connect_clicked(move |_| {
+        dlg.close();
+    });
+
+    dialog.present();
 }
 
 // ── List Handling ──────────────────────────────────────────────────────────
@@ -2693,7 +2993,8 @@ fn handle_table(
                 for c in 0..colspan {
                     max_chars_in_cols += *col_max_chars.get(&(current_col + c)).unwrap_or(&0);
                 }
-                let min_width = std::cmp::max(20, max_chars_in_cols * 8).min(600);
+                // Use a reasonable minimum: at least 60px per column so empty cells are usable
+                let min_width = std::cmp::max(60, max_chars_in_cols * 8).min(600);
                 cell_view.set_size_request(min_width, -1);
             }
 
