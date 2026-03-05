@@ -161,7 +161,9 @@ try:
 
         evt = seq.split('WidgetEvent=', 1)[1]
         parts = {}
-        for p in evt.split(';'):
+        evt_tmp = evt.replace('\\\\', '\x01').replace('\\;', '\x02')
+        for p in evt_tmp.split(';'):
+            p = p.replace('\x01', '\\\\').replace('\x02', '\\;')
             if ':' in p:
                 k, v = p.split(':', 1)
                 parts[k] = v
