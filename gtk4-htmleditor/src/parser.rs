@@ -10,6 +10,54 @@ use crate::css::{
     ListStyleType, TextDirection, TextTransform, WhiteSpaceMode,
 };
 
+/// Parse a dimension value like "100%", "50%", "300", "300px" into pixels.
+/// Percentage values are resolved against `reference`.
+pub(crate) fn resolve_dimension(value: &str, reference: i32) -> Option<i32> {
+    let val = value.trim();
+    if let Some(pct_str) = val.strip_suffix('%') {
+        pct_str.trim().parse::<f64>().ok().map(|pct| ((pct / 100.0) * reference as f64) as i32)
+    } else {
+        val.replace("px", "").trim().parse::<i32>().ok()
+    }
+}
+
+/// Get usable content width from a TextView (allocated minus margins).
+fn view_content_width(view: &gtk::TextView) -> i32 {
+    // 1. Use actual allocated width if available (works for reloads)
+    let w = view.allocated_width();
+    if w > 100 {
+        return w - view.left_margin() - view.right_margin();
+    }
+    // 2. Walk parent chain for an allocated ancestor
+    let mut parent = view.parent();
+    while let Some(ref p) = parent {
+        let pw = p.allocated_width();
+        if pw > 100 {
+            return pw - view.left_margin() - view.right_margin();
+        }
+        parent = p.parent();
+    }
+    // 3. Fallback
+    700 - view.left_margin() - view.right_margin()
+}
+
+/// Get usable content height from a TextView (allocated minus margins).
+fn view_content_height(view: &gtk::TextView) -> i32 {
+    let h = view.allocated_height();
+    if h > 100 {
+        return h - view.top_margin() - view.bottom_margin();
+    }
+    let mut parent = view.parent();
+    while let Some(ref p) = parent {
+        let ph = p.allocated_height();
+        if ph > 100 {
+            return ph - view.top_margin() - view.bottom_margin();
+        }
+        parent = p.parent();
+    }
+    500 - view.top_margin() - view.bottom_margin()
+}
+
 // ── Thread-local for table cell → editor communication ────────────────────
 
 thread_local! {
@@ -848,7 +896,7 @@ fn insert_hr_widget(view: &gtk::TextView, buffer: &gtk::TextBuffer, attrs: &[htm
     let mut height = 2;
     let mut color = "#888888".to_string();
     let mut widget_name = "hr_rule".to_string();
-    let mut fixed_width: Option<i32> = None;
+    let mut width_val: Option<String> = None;
     let mut halign = gtk::Align::Fill;
 
     for attr in attrs {
@@ -857,11 +905,7 @@ fn insert_hr_widget(view: &gtk::TextView, buffer: &gtk::TextBuffer, attrs: &[htm
         match name {
             "width" => {
                 widget_name = format!("hr_rule:width={}", val);
-                if !val.ends_with('%') {
-                    if let Ok(px) = val.parse::<i32>() {
-                        fixed_width = Some(px);
-                    }
-                }
+                width_val = Some(val.to_string());
             }
             "align" => {
                 halign = match val.to_lowercase().as_str() {
@@ -909,11 +953,19 @@ fn insert_hr_widget(view: &gtk::TextView, buffer: &gtk::TextBuffer, attrs: &[htm
     hr_line.set_halign(halign);
     hr_line.set_widget_name(&widget_name);
 
-    if let Some(px) = fixed_width {
-        hr_line.set_size_request(px, -1);
+    // Child anchors don't honor hexpand — compute explicit width.
+    // For default (no width attr), use a large value that gets clipped by the view.
+    if let Some(ref wv) = width_val {
+        let ref_w = view_content_width(view);
+        if let Some(px) = resolve_dimension(wv, ref_w) {
+            hr_line.set_size_request(px.max(1), -1);
+            // Center-align by default for percentage widths < 100%
+            if wv.ends_with('%') && px < ref_w && halign == gtk::Align::Fill {
+                hr_line.set_halign(gtk::Align::Center);
+            }
+        }
     } else {
-        // Child anchors don't honor hexpand — use a large width that the
-        // TextView will clip to its own allocation.
+        // No width specified → fill 100%. Use a large value; the TextView clips it.
         let w = view.allocated_width();
         hr_line.set_size_request(if w > 50 { w } else { 4096 }, -1);
     }
@@ -1042,8 +1094,8 @@ fn insert_svg_widget(
     if let NodeData::Element { ref attrs, .. } = node.data {
         for attr in attrs.borrow().iter() {
             match attr.name.local.to_string().as_str() {
-                "width" => attr_width = attr.value.to_string().replace("px", "").trim().parse().ok(),
-                "height" => attr_height = attr.value.to_string().replace("px", "").trim().parse().ok(),
+                "width" => attr_width = resolve_dimension(&attr.value, view_content_width(view)),
+                "height" => attr_height = resolve_dimension(&attr.value, view_content_height(view)),
                 _ => {}
             }
         }
@@ -1098,6 +1150,8 @@ fn insert_img_widget(view: &gtk::TextView, node: &Handle, buffer: &gtk::TextBuff
     let mut alt = String::new();
     let mut width: Option<i32> = None;
     let mut height: Option<i32> = None;
+    let mut raw_width: Option<String> = None;
+    let mut raw_height: Option<String> = None;
 
     if let NodeData::Element { ref attrs, .. } = node.data {
         for attr in attrs.borrow().iter() {
@@ -1106,8 +1160,14 @@ fn insert_img_widget(view: &gtk::TextView, node: &Handle, buffer: &gtk::TextBuff
             match aname.as_str() {
                 "src" => src = aval,
                 "alt" => alt = aval,
-                "width" => width = aval.replace("px", "").trim().parse().ok(),
-                "height" => height = aval.replace("px", "").trim().parse().ok(),
+                "width" => {
+                    if aval.contains('%') { raw_width = Some(aval.clone()); }
+                    width = resolve_dimension(&aval, view_content_width(view));
+                }
+                "height" => {
+                    if aval.contains('%') { raw_height = Some(aval.clone()); }
+                    height = resolve_dimension(&aval, view_content_height(view));
+                }
                 _ => {}
             }
         }
@@ -1268,11 +1328,18 @@ fn insert_img_widget(view: &gtk::TextView, node: &Handle, buffer: &gtk::TextBuff
             }
         }
     };
-    if alt.is_empty() {
-        picture.set_widget_name(&format!("img:{}", src));
-    } else {
-        picture.set_widget_name(&format!("img:{}|alt:{}", src, alt));
+    // Build widget_name with optional percentage dimension info for deferred recompute
+    let mut wname = format!("img:{}", src);
+    if !alt.is_empty() {
+        wname.push_str(&format!("|alt:{}", alt));
     }
+    if let Some(ref rw) = raw_width {
+        wname.push_str(&format!("|pctw:{}", rw));
+    }
+    if let Some(ref rh) = raw_height {
+        wname.push_str(&format!("|pcth:{}", rh));
+    }
+    picture.set_widget_name(&wname);
     setup_image_click_resize(&picture);
     view.add_child_at_anchor(&picture, &anchor);
 }
@@ -1749,10 +1816,7 @@ fn handle_flex(
     let justify = css_props.justify_content.as_deref().unwrap_or("flex-start");
     let align = css_props.align_items.as_deref().unwrap_or("stretch");
 
-    let available_width = {
-        let vw = view.allocated_width();
-        if vw > 100 { vw } else { 700 }
-    };
+    let available_width = view_content_width(view);
 
     // ── Pre-scan: content widths + explicit CSS widths ──
     let mut child_infos: Vec<(i32, Option<i32>)> = Vec::new(); // (content_w, explicit_px)
@@ -1781,7 +1845,7 @@ fn handle_flex(
                 &child_tag, child_class.as_deref(), child_id.as_deref(),
                 child_style.as_deref(), &ctx.css_rules,
             );
-            let ew = ccss.width.as_ref().and_then(|w| w.replace("px", "").trim().parse::<i32>().ok());
+            let ew = ccss.width.as_ref().and_then(|w| resolve_dimension(w, available_width));
             let ph = ccss.padding_left.unwrap_or(0) + ccss.padding_right.unwrap_or(0);
             (ew, ph)
         } else {
@@ -2683,15 +2747,18 @@ fn handle_table(
 
     // Apply table width
     if let Some(ref w) = table_width {
-        if let Some(px) = w.strip_suffix('%') {
-            // Percentage width — expand to fill
-            if let Ok(_pct) = px.trim().parse::<i32>() {
+        let ref_w = view_content_width(view);
+        if let Some(px) = resolve_dimension(w, ref_w) {
+            grid.set_size_request(px, -1);
+            // Percentage widths still expand; pixel widths don't
+            if w.contains('%') {
                 grid.set_hexpand(true);
                 grid.set_halign(gtk::Align::Fill);
+            } else {
+                grid.set_hexpand(false);
             }
-        } else if let Ok(px_val) = w.replace("px", "").trim().parse::<i32>() {
-            grid.set_size_request(px_val, -1);
-            grid.set_hexpand(false);
+        } else {
+            grid.set_hexpand(true);
         }
     } else {
         grid.set_hexpand(true);
@@ -2869,9 +2936,10 @@ fn handle_table(
                         "nowrap" => cell_nowrap = true,
                         "width" => {
                             let wval = attr.value.to_string();
-                            if !wval.contains('%') {
-                                cell_width = wval.replace("px", "").trim().parse().ok();
-                            }
+                            let ref_w = table_width.as_ref()
+                                .and_then(|tw| resolve_dimension(tw, view_content_width(view)))
+                                .unwrap_or_else(|| view_content_width(view));
+                            cell_width = resolve_dimension(&wval, ref_w);
                         }
                         _ => {}
                     }

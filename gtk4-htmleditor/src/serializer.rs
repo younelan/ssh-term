@@ -366,19 +366,36 @@ fn serialize_widget_anchor(iter: &gtk::TextIter, html: &mut String, css_rules_st
                         html.push_str(svg_source);
                     }
                 } else if let Some(rest) = name.strip_prefix("img:") {
-                    let (src, alt) = if let Some(pipe_pos) = rest.find("|alt:") {
-                        (&rest[..pipe_pos], Some(&rest[pipe_pos + 5..]))
-                    } else {
-                        (rest, None)
-                    };
+                    // Parse pipe-delimited parts: img:URL|alt:TEXT|pctw:50%|pcth:auto
+                    let parts: Vec<&str> = rest.splitn(2, '|').collect();
+                    let src = parts[0];
+                    let mut alt: Option<&str> = None;
+                    let mut pctw: Option<&str> = None;
+                    let mut pcth: Option<&str> = None;
+                    if parts.len() > 1 {
+                        for segment in parts[1].split('|') {
+                            if let Some(v) = segment.strip_prefix("alt:") { alt = Some(v); }
+                            else if let Some(v) = segment.strip_prefix("pctw:") { pctw = Some(v); }
+                            else if let Some(v) = segment.strip_prefix("pcth:") { pcth = Some(v); }
+                        }
+                    }
                     html.push_str(&format!("<img src=\"{}\"", src));
                     if let Some(a) = alt {
                         html.push_str(&format!(" alt=\"{}\"", a));
                     }
-                    let w = pic.width_request();
-                    let h = pic.height_request();
-                    if w > 0 { html.push_str(&format!(" width=\"{}\"", w)); }
-                    if h > 0 { html.push_str(&format!(" height=\"{}\"", h)); }
+                    // Use original percentage string if available, otherwise pixel value
+                    if let Some(pw) = pctw {
+                        html.push_str(&format!(" width=\"{}\"", pw));
+                    } else {
+                        let w = pic.width_request();
+                        if w > 0 { html.push_str(&format!(" width=\"{}\"", w)); }
+                    }
+                    if let Some(ph) = pcth {
+                        html.push_str(&format!(" height=\"{}\"", ph));
+                    } else {
+                        let h = pic.height_request();
+                        if h > 0 { html.push_str(&format!(" height=\"{}\"", h)); }
+                    }
                     html.push('>');
                 }
                 return;

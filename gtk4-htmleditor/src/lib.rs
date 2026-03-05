@@ -190,6 +190,24 @@ impl NativeHtmlEditor {
         // Store weak self-reference for thread-local callbacks
         *self.self_weak.borrow_mut() = Some(std::rc::Rc::downgrade(self));
 
+        // Resize handler: recompute percentage-based widths when view width changes.
+        // Uses a timer (200ms) to detect allocation changes without causing
+        // continuous frame-clock requests like add_tick_callback would.
+        let last_w = std::rc::Rc::new(Cell::new(0i32));
+        let ed_resize = std::rc::Rc::downgrade(self);
+        let view_clone = self.view.clone();
+        gtk::glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+            let Some(ed) = ed_resize.upgrade() else {
+                return gtk::glib::ControlFlow::Break;
+            };
+            let w = view_clone.allocated_width();
+            if w > 100 && w != last_w.get() {
+                last_w.set(w);
+                ed.recompute_percentage_widths();
+            }
+            gtk::glib::ControlFlow::Continue
+        });
+
         // Snapshot capture after each user edit (typing, deleting, pasting)
         let editor = std::rc::Rc::downgrade(self);
         self.view.buffer().connect_end_user_action(move |_buf| {
@@ -903,6 +921,196 @@ impl NativeHtmlEditor {
             &self.css_rules_store.borrow(),
         );
         self.undo_mgr.borrow_mut().reset(initial_html);
+
+        // Schedule deferred percentage recompute after the view gets allocated
+        if self.view.allocated_width() <= 100 {
+            if let Some(ref weak) = *self.self_weak.borrow() {
+                let weak = weak.clone();
+                glib::idle_add_local_once(move || {
+                    if let Some(editor) = weak.upgrade() {
+                        editor.recompute_percentage_widths();
+                    }
+                });
+            }
+        }
+    }
+
+    /// Recompute percentage-based widths for all child-anchor widgets
+    /// (tables, HRs, images, flex containers) using the actual allocated view width.
+    /// Called after initial layout and on resize.
+    pub fn recompute_percentage_widths(&self) {
+        let view = &self.view;
+        let w = view.allocated_width();
+        if w <= 100 { return; } // View not allocated yet
+        let content_w = w - view.left_margin() - view.right_margin();
+        let content_h = {
+            let h = view.allocated_height();
+            if h > 100 { h - view.top_margin() - view.bottom_margin() } else { return; }
+        };
+
+        let buffer = view.buffer();
+        let mut iter = buffer.start_iter();
+        loop {
+            if let Some(anchor) = iter.child_anchor() {
+                for widget in anchor.widgets() {
+                    let name = widget.widget_name().to_string();
+
+                    // Table (Grid) — widget_name has raw attrs: width="60%" border="1"
+                    if widget.is::<gtk::Grid>() {
+                        if let Some(w_str) = Self::extract_html_attr(&name, "width") {
+                            if w_str.contains('%') {
+                                if let Some(px) = parser::resolve_dimension(&w_str, content_w) {
+                                    widget.set_size_request(px, -1);
+                                }
+                            }
+                        }
+                        // Also recompute cell widths
+                        let table_w = Self::extract_html_attr(&name, "width")
+                            .and_then(|tw| parser::resolve_dimension(&tw, content_w))
+                            .unwrap_or(content_w);
+                        let mut child = widget.first_child();
+                        while let Some(ref c) = child {
+                            let cname = c.widget_name().to_string();
+                            if let Some(cw) = Self::extract_html_attr(&cname, "width") {
+                                if cw.contains('%') {
+                                    if let Some(px) = parser::resolve_dimension(&cw, table_w) {
+                                        c.set_size_request(px, -1);
+                                    }
+                                }
+                            }
+                            child = c.next_sibling();
+                        }
+                    }
+
+                    // HR (Separator) — widget_name: hr_rule:width=80%;size=4
+                    else if name.starts_with("hr_rule") {
+                        if let Some(w_str) = Self::extract_hr_param(&name, "width") {
+                            if w_str.contains('%') {
+                                if let Some(px) = parser::resolve_dimension(&w_str, content_w) {
+                                    widget.set_size_request(px, -1);
+                                }
+                            }
+                        } else {
+                            // Default HR: fill entire view
+                            widget.set_size_request(w, -1);
+                        }
+                    }
+
+                    // Image (Picture) — widget_name: img:url|alt:text|pctw:50%|pcth:auto
+                    else if name.starts_with("img:") {
+                        let pctw = Self::extract_pipe_param(&name, "pctw");
+                        let pcth = Self::extract_pipe_param(&name, "pcth");
+                        if pctw.is_some() || pcth.is_some() {
+                            let cur_w = widget.width_request();
+                            let cur_h = widget.height_request();
+                            let new_w = pctw.as_ref()
+                                .and_then(|v| parser::resolve_dimension(v, content_w));
+                            let new_h = pcth.as_ref()
+                                .and_then(|v| parser::resolve_dimension(v, content_h));
+                            // Maintain aspect ratio if only one dimension is percentage
+                            let (fw, fh) = match (new_w, new_h) {
+                                (Some(nw), Some(nh)) => (nw, nh),
+                                (Some(nw), None) => {
+                                    let nh = if cur_w > 0 && cur_h > 0 {
+                                        (cur_h as f64 * nw as f64 / cur_w as f64) as i32
+                                    } else { cur_h };
+                                    (nw, nh)
+                                }
+                                (None, Some(nh)) => {
+                                    let nw = if cur_w > 0 && cur_h > 0 {
+                                        (cur_w as f64 * nh as f64 / cur_h as f64) as i32
+                                    } else { cur_w };
+                                    (nw, nh)
+                                }
+                                (None, None) => continue,
+                            };
+                            widget.set_size_request(fw, fh);
+                        }
+                    }
+
+                    // Flex container (Box or FlowBox) — widget_name: flex:div|style="..."
+                    else if name.starts_with("flex:") {
+                        // Update container size_request to match actual view width
+                        let cur_req = widget.width_request();
+                        if cur_req > 0 && cur_req != content_w {
+                            widget.set_size_request(content_w, -1);
+                        }
+                        // Update flex children with percentage widths
+                        let mut child = widget.first_child();
+                        while let Some(ref c) = child {
+                            let cname = c.widget_name().to_string();
+                            if cname.starts_with("flexchild:") {
+                                if let Some(css_w) = Self::extract_css_width(&cname) {
+                                    if css_w.contains('%') {
+                                        if let Some(px) = parser::resolve_dimension(&css_w, content_w) {
+                                            c.set_size_request(px, -1);
+                                        }
+                                    }
+                                }
+                            }
+                            child = c.next_sibling();
+                        }
+                    }
+                }
+            }
+            if !iter.forward_char() {
+                break;
+            }
+        }
+    }
+
+    /// Extract an HTML attribute value from a raw attrs string like: width="60%" border="1"
+    fn extract_html_attr(attrs_str: &str, attr_name: &str) -> Option<String> {
+        let pattern = format!("{}=\"", attr_name);
+        if let Some(start) = attrs_str.find(&pattern) {
+            let value_start = start + pattern.len();
+            if let Some(end) = attrs_str[value_start..].find('"') {
+                return Some(attrs_str[value_start..value_start + end].to_string());
+            }
+        }
+        None
+    }
+
+    /// Extract a parameter from HR widget_name like: hr_rule:width=80%;size=4;color=#2c3e50
+    fn extract_hr_param(name: &str, param: &str) -> Option<String> {
+        if let Some(params) = name.strip_prefix("hr_rule:") {
+            let prefix = format!("{}=", param);
+            for part in params.split(';') {
+                if let Some(val) = part.strip_prefix(&prefix) {
+                    return Some(val.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// Extract a pipe-delimited parameter from widget_name like: img:url|alt:text|pctw:50%
+    fn extract_pipe_param(name: &str, param: &str) -> Option<String> {
+        let prefix = format!("{}:", param);
+        for part in name.split('|') {
+            if let Some(val) = part.strip_prefix(&prefix) {
+                return Some(val.to_string());
+            }
+        }
+        None
+    }
+
+    /// Extract CSS width value from a flexchild widget_name like: flexchild:div|style="width: 30%; ..."
+    fn extract_css_width(name: &str) -> Option<String> {
+        // Look for width: VALUE in the style attribute within the widget_name
+        if let Some(style_start) = name.find("style=\"") {
+            let style_content = &name[style_start + 7..];
+            if let Some(style_end) = style_content.find('"') {
+                let style = &style_content[..style_end];
+                for decl in style.split(';') {
+                    let decl = decl.trim();
+                    if let Some(val) = decl.strip_prefix("width:") {
+                        return Some(val.trim().to_string());
+                    }
+                }
+            }
+        }
+        None
     }
 
     pub fn get_html(&self) -> String {
