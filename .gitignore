@@ -3,3 +3,5 @@ Cargo.lock
 .claude
 .vscode
 .DS_Store
+tmp
+target
