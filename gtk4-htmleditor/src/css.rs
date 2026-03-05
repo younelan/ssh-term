@@ -107,6 +107,8 @@ pub struct CssProperties {
     pub margin_right: Option<i32>,
     pub margin_top: Option<i32>,
     pub margin_bottom: Option<i32>,
+    pub margin_left_auto: bool,
+    pub margin_right_auto: bool,
     pub padding_left: Option<i32>,
     pub padding_right: Option<i32>,
     pub padding_top: Option<i32>,
@@ -155,6 +157,9 @@ pub struct CssProperties {
 
     // Background image (applied via GTK CSS on embedded widgets)
     pub background_image: Option<String>,
+    pub background_repeat: Option<String>,
+    pub background_size: Option<String>,
+    pub background_position: Option<String>,
 
     // Shadows (applied via GTK CSS on embedded widgets)
     pub box_shadow: Option<String>,
@@ -212,6 +217,8 @@ impl CssProperties {
         merge_field!(margin_right);
         merge_field!(margin_top);
         merge_field!(margin_bottom);
+        if other.margin_left_auto { self.margin_left_auto = true; }
+        if other.margin_right_auto { self.margin_right_auto = true; }
         merge_field!(padding_left);
         merge_field!(padding_right);
         merge_field!(padding_top);
@@ -243,6 +250,9 @@ impl CssProperties {
         merge_field!(min_height);
         merge_field!(max_height);
         merge_field!(background_image);
+        merge_field!(background_repeat);
+        merge_field!(background_size);
+        merge_field!(background_position);
         merge_field!(box_shadow);
         merge_field!(text_shadow);
         merge_field!(opacity);
@@ -364,8 +374,16 @@ impl CssProperties {
         }
         if let Some(v) = self.margin_top { parts.push(format!("margin-top: {}px", v)); }
         if let Some(v) = self.margin_bottom { parts.push(format!("margin-bottom: {}px", v)); }
-        if let Some(v) = self.margin_left { parts.push(format!("margin-left: {}px", v)); }
-        if let Some(v) = self.margin_right { parts.push(format!("margin-right: {}px", v)); }
+        if self.margin_left_auto {
+            parts.push("margin-left: auto".to_string());
+        } else if let Some(v) = self.margin_left {
+            parts.push(format!("margin-left: {}px", v));
+        }
+        if self.margin_right_auto {
+            parts.push("margin-right: auto".to_string());
+        } else if let Some(v) = self.margin_right {
+            parts.push(format!("margin-right: {}px", v));
+        }
         if let Some(v) = self.padding_top { parts.push(format!("padding-top: {}px", v)); }
         if let Some(v) = self.padding_bottom { parts.push(format!("padding-bottom: {}px", v)); }
         if let Some(v) = self.padding_left { parts.push(format!("padding-left: {}px", v)); }
@@ -425,6 +443,9 @@ impl CssProperties {
         if let Some(ref v) = self.min_height { parts.push(format!("min-height: {}", v)); }
         if let Some(ref v) = self.max_height { parts.push(format!("max-height: {}", v)); }
         if let Some(ref v) = self.background_image { parts.push(format!("background-image: {}", v)); }
+        if let Some(ref v) = self.background_repeat { parts.push(format!("background-repeat: {}", v)); }
+        if let Some(ref v) = self.background_size { parts.push(format!("background-size: {}", v)); }
+        if let Some(ref v) = self.background_position { parts.push(format!("background-position: {}", v)); }
         if let Some(ref v) = self.box_shadow { parts.push(format!("box-shadow: {}", v)); }
         if let Some(ref v) = self.text_shadow { parts.push(format!("text-shadow: {}", v)); }
         if let Some(ref va) = self.vertical_align {
@@ -665,22 +686,57 @@ pub fn parse_declarations(decls: &str) -> CssProperties {
                         props.background_image = Some(rest[..=close].to_string());
                     }
                 }
-                // Extract color (first token that isn't url() or gradient)
-                for token in val.split_whitespace() {
-                    if !token.starts_with("url(") && !token.contains("gradient")
-                        && !token.starts_with("no-repeat") && !token.starts_with("repeat")
-                        && !token.starts_with("center") && !token.starts_with("top")
-                        && !token.starts_with("bottom") && !token.starts_with("left")
-                        && !token.starts_with("right") && !token.starts_with("cover")
-                        && !token.starts_with("contain")
-                    {
-                        // Likely a color value
-                        if token.starts_with('#') || token.starts_with("rgb")
-                            || token.starts_with("hsl") || token.chars().next().map_or(false, |c| c.is_alphabetic())
-                        {
-                            props.background_color = Some(token.to_string());
-                            props.paragraph_background = Some(token.to_string());
-                            break;
+                // Extract gradient as background-image (CSS gradients are image values)
+                if let Some(grad_start) = val.find("gradient(") {
+                    // Find the function name (linear-gradient, radial-gradient, etc.)
+                    let prefix = &val[..grad_start];
+                    let func_start = prefix.rfind(|c: char| c.is_whitespace() || c == ':')
+                        .map(|i| i + 1).unwrap_or(0);
+                    // Find matching closing paren
+                    let rest = &val[func_start..];
+                    let mut depth = 0;
+                    let mut end = rest.len();
+                    for (i, ch) in rest.char_indices() {
+                        match ch {
+                            '(' => depth += 1,
+                            ')' => {
+                                depth -= 1;
+                                if depth == 0 { end = i + 1; break; }
+                            }
+                            _ => {}
+                        }
+                    }
+                    props.background_image = Some(rest[..end].to_string());
+                }
+                // Extract repeat, size, position, and color tokens from shorthand
+                if props.background_image.is_none() || !val.contains("gradient") {
+                    for token in val.split_whitespace() {
+                        match token {
+                            "no-repeat" | "repeat" | "repeat-x" | "repeat-y" | "space" | "round" => {
+                                props.background_repeat = Some(token.to_string());
+                            }
+                            "cover" | "contain" => {
+                                props.background_size = Some(token.to_string());
+                            }
+                            "center" | "top" | "bottom" | "left" | "right" => {
+                                // Accumulate position tokens
+                                if let Some(ref mut pos) = props.background_position {
+                                    pos.push(' ');
+                                    pos.push_str(token);
+                                } else {
+                                    props.background_position = Some(token.to_string());
+                                }
+                            }
+                            _ if !token.starts_with("url(") && !token.contains("gradient") => {
+                                // Likely a color value
+                                if token.starts_with('#') || token.starts_with("rgb")
+                                    || token.starts_with("hsl") || token.chars().next().map_or(false, |c| c.is_alphabetic())
+                                {
+                                    props.background_color = Some(token.to_string());
+                                    props.paragraph_background = Some(token.to_string());
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -849,10 +905,21 @@ pub fn parse_declarations(decls: &str) -> CssProperties {
             "margin" | "padding" => {
                 let [top, right, bottom, left] = expand_box_shorthand(val);
                 if key == "margin" {
+                    // Detect "auto" in margin shorthand (e.g. "0 auto", "auto")
+                    let tokens: Vec<&str> = val.split_whitespace().collect();
+                    let auto_flags = match tokens.len() {
+                        1 => { let a = tokens[0] == "auto"; [a, a, a, a] }
+                        2 => { let a = tokens[1] == "auto"; [tokens[0] == "auto", a, tokens[0] == "auto", a] }
+                        3 => { [tokens[0] == "auto", tokens[1] == "auto", tokens[2] == "auto", tokens[1] == "auto"] }
+                        4.. => { [tokens[0] == "auto", tokens[1] == "auto", tokens[2] == "auto", tokens[3] == "auto"] }
+                        _ => [false; 4],
+                    };
+                    if auto_flags[3] { props.margin_left_auto = true; }
+                    else if left.is_some() { props.margin_left = left; }
+                    if auto_flags[1] { props.margin_right_auto = true; }
+                    else if right.is_some() { props.margin_right = right; }
                     if top.is_some() { props.margin_top = top; }
-                    if right.is_some() { props.margin_right = right; }
                     if bottom.is_some() { props.margin_bottom = bottom; }
-                    if left.is_some() { props.margin_left = left; }
                 } else {
                     if top.is_some() { props.padding_top = top; }
                     if right.is_some() { props.padding_right = right; }
@@ -860,8 +927,14 @@ pub fn parse_declarations(decls: &str) -> CssProperties {
                     if left.is_some() { props.padding_left = left; }
                 }
             }
-            "margin-left" | "margin-inline-start" => { props.margin_left = parse_px(val); }
-            "margin-right" | "margin-inline-end" => { props.margin_right = parse_px(val); }
+            "margin-left" | "margin-inline-start" => {
+                if val.trim() == "auto" { props.margin_left_auto = true; }
+                else { props.margin_left = parse_px(val); }
+            }
+            "margin-right" | "margin-inline-end" => {
+                if val.trim() == "auto" { props.margin_right_auto = true; }
+                else { props.margin_right = parse_px(val); }
+            }
             "margin-top" | "margin-block-start" => { props.margin_top = parse_px(val); }
             "margin-bottom" | "margin-block-end" => { props.margin_bottom = parse_px(val); }
             "padding-left" | "padding-inline-start" => { props.padding_left = parse_px(val); }
@@ -1006,7 +1079,12 @@ pub fn parse_declarations(decls: &str) -> CssProperties {
             "opacity" => { props.opacity = val.parse().ok(); }
 
             // ── Background image ──
-            "background-image" => { props.background_image = Some(val.to_string()); }
+            "background-image" => {
+                props.background_image = Some(val.to_string());
+            }
+            "background-repeat" => { props.background_repeat = Some(val.to_string()); }
+            "background-size" => { props.background_size = Some(val.to_string()); }
+            "background-position" => { props.background_position = Some(val.to_string()); }
 
             // ── Shadows (applied via GTK CSS on embedded widgets) ──
             "box-shadow" => { props.box_shadow = Some(val.to_string()); }
@@ -1283,11 +1361,13 @@ pub fn apply_to_text_tag(props: &CssProperties, tag: &gtk::TextTag, is_block: bo
     if let Some(v) = props.effective_right_margin() {
         tag.set_right_margin(v);
     }
-    if let Some(v) = props.margin_top {
-        tag.set_pixels_above_lines(v);
+    {
+        let above = props.margin_top.unwrap_or(0) + props.padding_top.unwrap_or(0);
+        if above > 0 { tag.set_pixels_above_lines(above); }
     }
-    if let Some(v) = props.margin_bottom {
-        tag.set_pixels_below_lines(v);
+    {
+        let below = props.margin_bottom.unwrap_or(0) + props.padding_bottom.unwrap_or(0);
+        if below > 0 { tag.set_pixels_below_lines(below); }
     }
     if let Some(v) = props.text_indent {
         tag.set_indent(v);

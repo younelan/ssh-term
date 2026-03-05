@@ -69,6 +69,84 @@ pub(crate) fn set_table_editor(editor: Option<std::rc::Weak<crate::NativeHtmlEdi
     TABLE_EDITOR_WEAK.with(|e| *e.borrow_mut() = editor);
 }
 
+// ── Background image URL cache ─────────────────────────────────────────────
+thread_local! {
+    static BG_IMAGE_CACHE: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+}
+
+/// Resolve a CSS background-image value, downloading remote URLs to temp files.
+/// Returns a CSS-ready string like `url('/tmp/bg_abc123.png')`.
+fn resolve_background_image(bg_value: &str) -> String {
+    // Extract URL from url('...') or url(...)
+    let url = if let Some(start) = bg_value.find("url(") {
+        let rest = &bg_value[start + 4..];
+        let url_inner = if let Some(end) = rest.find(')') {
+            rest[..end].trim().trim_matches(|c| c == '\'' || c == '"')
+        } else {
+            return bg_value.to_string();
+        };
+        url_inner
+    } else {
+        return bg_value.to_string();
+    };
+
+    // For local paths, resolve to absolute with file:// so GTK CSS can find them
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        if url.starts_with("data:") || url.starts_with("file://") {
+            return bg_value.to_string();
+        }
+        if url.starts_with('/') {
+            // Already absolute, just add file:// protocol
+            return format!("url('file://{}')", url);
+        }
+        // Relative path — make absolute using current working directory
+        if let Ok(cwd) = std::env::current_dir() {
+            let abs = cwd.join(url);
+            if abs.exists() {
+                return format!("url('file://{}')", abs.display());
+            }
+        }
+        return bg_value.to_string();
+    }
+
+    // Check cache first
+    let cached = BG_IMAGE_CACHE.with(|c| c.borrow().get(url).cloned());
+    if let Some(local_path) = cached {
+        return format!("url('file://{}')", local_path);
+    }
+
+    // Download to temp file
+    match ureq::get(url)
+        .header("User-Agent", "Mozilla/5.0 gHtmlEditor/1.0")
+        .call()
+    {
+        Ok(response) => {
+            if let Ok(body) = response.into_body().read_to_vec() {
+                if !body.is_empty() {
+                    let ext = url.rsplit('.').next()
+                        .filter(|e| ["png", "jpg", "jpeg", "gif", "webp", "svg"].contains(e))
+                        .unwrap_or("png");
+                    let hash = {
+                        let mut h: u64 = 0xcbf29ce484222325;
+                        for &b in url.as_bytes() {
+                            h ^= b as u64;
+                            h = h.wrapping_mul(0x100000001b3);
+                        }
+                        h
+                    };
+                    let path = format!("{}/ghtmleditor_bg_{:x}.{}", std::env::temp_dir().display(), hash, ext);
+                    if std::fs::write(&path, &body).is_ok() {
+                        BG_IMAGE_CACHE.with(|c| c.borrow_mut().insert(url.to_string(), path.clone()));
+                        return format!("url('file://{}')", path);
+                    }
+                }
+            }
+            bg_value.to_string()
+        }
+        Err(_) => bg_value.to_string(),
+    }
+}
+
 // ── Parse Context ──────────────────────────────────────────────────────────
 
 /// Metadata for an HTML element with an `id`, used for class manipulation.
@@ -320,7 +398,7 @@ fn walk_dom(
             // ── Self-closing / special elements ──
             match tag_name.as_str() {
                 "img" => {
-                    insert_img_widget(view, node, buffer, ctx);
+                    insert_img_widget(view, node, buffer, ctx, &css_props);
                     return;
                 }
                 "svg" => {
@@ -724,6 +802,19 @@ fn ensure_newline(buffer: &gtk::TextBuffer) {
     }
 }
 
+/// Apply CSS margin and padding to a GTK widget (used for child-anchor widgets like tables, flex, grids, images).
+/// For anchored widgets, padding is applied as additional margin since GTK widgets don't have inner padding.
+fn apply_widget_margins(widget: &impl gtk::prelude::WidgetExt, css: &CssProperties) {
+    let top = css.margin_top.unwrap_or(0) + css.padding_top.unwrap_or(0);
+    let bottom = css.margin_bottom.unwrap_or(0) + css.padding_bottom.unwrap_or(0);
+    let left = css.margin_left.unwrap_or(0) + css.padding_left.unwrap_or(0);
+    let right = css.margin_right.unwrap_or(0) + css.padding_right.unwrap_or(0);
+    if top > 0 { widget.set_margin_top(top); }
+    if bottom > 0 { widget.set_margin_bottom(bottom); }
+    if left > 0 { widget.set_margin_start(left); }
+    if right > 0 { widget.set_margin_end(right); }
+}
+
 // ── HTML Attribute → CSS ───────────────────────────────────────────────────
 
 fn build_extra_css_from_attrs(node: &Handle, tag_name: &str, extra_css: &mut String) {
@@ -867,6 +958,19 @@ fn handle_body(
     if let Some(ref bg) = css_props.background_color {
         css_parts.push(format!("background-color: {};", bg));
     }
+    if let Some(ref bgi) = css_props.background_image {
+        let resolved = resolve_background_image(bgi);
+        css_parts.push(format!("background-image: {};", resolved));
+    }
+    if let Some(ref v) = css_props.background_repeat {
+        css_parts.push(format!("background-repeat: {};", v));
+    }
+    if let Some(ref v) = css_props.background_size {
+        css_parts.push(format!("background-size: {};", v));
+    }
+    if let Some(ref v) = css_props.background_position {
+        css_parts.push(format!("background-position: {};", v));
+    }
     if let Some(ref color) = css_props.color {
         css_parts.push(format!("color: {};", color));
     }
@@ -874,11 +978,22 @@ fn handle_body(
         #[allow(deprecated)]
         {
             let provider = gtk::CssProvider::new();
-            provider.load_from_data(&format!("textview {{ {} }} textview text {{ {} }}",
-                css_parts.join(" "), css_parts.join(" ")));
-            view.style_context().add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+            let css_str = format!("textview {{ {} }} textview text {{ {} }}",
+                css_parts.join(" "), css_parts.join(" "));
+            provider.load_from_data(&css_str);
+            view.style_context().add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_USER);
         }
     }
+
+    // Apply body margins and padding to the view widget
+    let ml = css_props.margin_left.unwrap_or(0) + css_props.padding_left.unwrap_or(0);
+    let mr = css_props.margin_right.unwrap_or(0) + css_props.padding_right.unwrap_or(0);
+    let mt = css_props.margin_top.unwrap_or(0) + css_props.padding_top.unwrap_or(0);
+    let mb = css_props.margin_bottom.unwrap_or(0) + css_props.padding_bottom.unwrap_or(0);
+    if ml > 0 { view.set_left_margin(view.left_margin() + ml); }
+    if mr > 0 { view.set_right_margin(view.right_margin() + mr); }
+    if mt > 0 { view.set_top_margin(view.top_margin() + mt); }
+    if mb > 0 { view.set_bottom_margin(view.bottom_margin() + mb); }
 
     for child in node.children.borrow().iter() {
         walk_dom(view, child, buffer, ctx);
@@ -1145,7 +1260,7 @@ fn decode_data_uri_to_texture(data_uri: &str) -> Option<gtk::gdk::Texture> {
     gtk::gdk::Texture::from_bytes(&bytes).ok()
 }
 
-fn insert_img_widget(view: &gtk::TextView, node: &Handle, buffer: &gtk::TextBuffer, ctx: &mut ParseContext) {
+fn insert_img_widget(view: &gtk::TextView, node: &Handle, buffer: &gtk::TextBuffer, ctx: &mut ParseContext, css_props: &CssProperties) {
     let mut src = String::new();
     let mut alt = String::new();
     let mut width: Option<i32> = None;
@@ -1340,6 +1455,20 @@ fn insert_img_widget(view: &gtk::TextView, node: &Handle, buffer: &gtk::TextBuff
         wname.push_str(&format!("|pcth:{}", rh));
     }
     picture.set_widget_name(&wname);
+    apply_widget_margins(&picture, css_props);
+    // CSS width/height override HTML attributes
+    if let Some(ref w) = css_props.width {
+        if let Some(px) = resolve_dimension(w, view_content_width(view)) {
+            let (_, cur_h) = picture.size_request();
+            picture.set_size_request(px, cur_h);
+        }
+    }
+    if let Some(ref h) = css_props.height {
+        if let Some(px) = resolve_dimension(h, view_content_height(view)) {
+            let (cur_w, _) = picture.size_request();
+            picture.set_size_request(cur_w, px);
+        }
+    }
     setup_image_click_resize(&picture);
     view.add_child_at_anchor(&picture, &anchor);
 }
@@ -1921,6 +2050,16 @@ fn handle_flex(
         gbox.upcast::<gtk::Widget>()
     };
 
+    // margin: auto centering
+    if css_props.margin_left_auto && css_props.margin_right_auto {
+        container.set_halign(gtk::Align::Center);
+        container.set_hexpand(false);
+    } else if css_props.margin_left_auto {
+        container.set_halign(gtk::Align::End);
+    } else if css_props.margin_right_auto {
+        container.set_halign(gtk::Align::Start);
+    }
+
     // ── Create child widgets ──
     let mut child_idx = 0usize;
     for child in node.children.borrow().iter() {
@@ -2079,11 +2218,36 @@ fn handle_flex(
         child_idx += 1;
     }
 
+    apply_widget_margins(&container, css_props);
+
     ensure_newline(buffer);
     let mut end_iter = buffer.end_iter();
+    let anchor_offset = end_iter.offset();
     let anchor = buffer.create_child_anchor(&mut end_iter);
     view.add_child_at_anchor(&container, &anchor);
-    buffer.insert(&mut end_iter, "\n");
+
+    // Apply paragraph justification for margin:auto centering on child anchors
+    if css_props.margin_left_auto && css_props.margin_right_auto {
+        if let Some(tag) = buffer.create_tag(None, &[("justification", &gtk::Justification::Center)]) {
+            let start = buffer.iter_at_offset(anchor_offset);
+            let end = buffer.end_iter();
+            buffer.apply_tag(&tag, &start, &end);
+        }
+    } else if css_props.margin_left_auto {
+        if let Some(tag) = buffer.create_tag(None, &[("justification", &gtk::Justification::Right)]) {
+            let start = buffer.iter_at_offset(anchor_offset);
+            let end = buffer.end_iter();
+            buffer.apply_tag(&tag, &start, &end);
+        }
+    } else if css_props.margin_right_auto {
+        if let Some(tag) = buffer.create_tag(None, &[("justification", &gtk::Justification::Left)]) {
+            let start = buffer.iter_at_offset(anchor_offset);
+            let end = buffer.end_iter();
+            buffer.apply_tag(&tag, &start, &end);
+        }
+    }
+
+    buffer.insert(&mut buffer.end_iter(), "\n");
 }
 
 // ── CSS Grid Layout Handling ──────────────────────────────────────────────
@@ -2108,6 +2272,16 @@ fn handle_css_grid(
     grid.set_can_target(true);
     grid.set_hexpand(true);
     grid.set_halign(gtk::Align::Fill);
+
+    // margin: auto centering
+    if css_props.margin_left_auto && css_props.margin_right_auto {
+        grid.set_halign(gtk::Align::Center);
+        grid.set_hexpand(false);
+    } else if css_props.margin_left_auto {
+        grid.set_halign(gtk::Align::End);
+    } else if css_props.margin_right_auto {
+        grid.set_halign(gtk::Align::Start);
+    }
 
     // Store original element + style for round-trip serialization
     let tag_name = if let NodeData::Element { ref name, .. } = node.data {
@@ -2366,11 +2540,36 @@ fn handle_css_grid(
         grid.set_size_request(grid_available_width, -1);
     }
 
+    apply_widget_margins(&grid, css_props);
+
     ensure_newline(buffer);
     let mut end_iter = buffer.end_iter();
+    let anchor_offset = end_iter.offset();
     let anchor = buffer.create_child_anchor(&mut end_iter);
     view.add_child_at_anchor(&grid, &anchor);
-    buffer.insert(&mut end_iter, "\n");
+
+    // Apply paragraph justification for margin:auto centering on child anchors
+    if css_props.margin_left_auto && css_props.margin_right_auto {
+        if let Some(tag) = buffer.create_tag(None, &[("justification", &gtk::Justification::Center)]) {
+            let start = buffer.iter_at_offset(anchor_offset);
+            let end = buffer.end_iter();
+            buffer.apply_tag(&tag, &start, &end);
+        }
+    } else if css_props.margin_left_auto {
+        if let Some(tag) = buffer.create_tag(None, &[("justification", &gtk::Justification::Right)]) {
+            let start = buffer.iter_at_offset(anchor_offset);
+            let end = buffer.end_iter();
+            buffer.apply_tag(&tag, &start, &end);
+        }
+    } else if css_props.margin_right_auto {
+        if let Some(tag) = buffer.create_tag(None, &[("justification", &gtk::Justification::Left)]) {
+            let start = buffer.iter_at_offset(anchor_offset);
+            let end = buffer.end_iter();
+            buffer.apply_tag(&tag, &start, &end);
+        }
+    }
+
+    buffer.insert(&mut buffer.end_iter(), "\n");
 }
 
 // ── Shared helpers for flex/grid ──────────────────────────────────────────
@@ -2473,7 +2672,17 @@ pub fn build_widget_css_string(css: &CssProperties, hover_css: Option<&CssProper
         css_parts.push(format!("text-shadow: {};", ts));
     }
     if let Some(ref bg) = css.background_image {
-        css_parts.push(format!("background-image: {};", bg));
+        let resolved = resolve_background_image(bg);
+        css_parts.push(format!("background-image: {};", resolved));
+    }
+    if let Some(ref v) = css.background_repeat {
+        css_parts.push(format!("background-repeat: {};", v));
+    }
+    if let Some(ref v) = css.background_size {
+        css_parts.push(format!("background-size: {};", v));
+    }
+    if let Some(ref v) = css.background_position {
+        css_parts.push(format!("background-position: {};", v));
     }
 
     let mut hover_parts = Vec::new();
@@ -2547,6 +2756,17 @@ fn apply_child_css_provider_with_hover(child_view: &gtk::TextView, css: &CssProp
         if let Ok(px) = mw.replace("px", "").trim().parse::<i32>() {
             let (cur_w, cur_h) = child_view.size_request();
             child_view.set_size_request(px.max(cur_w), cur_h);
+        }
+    }
+
+    // Apply max-width as widget size constraint (px values; % handled at container level)
+    if let Some(ref mw) = css.max_width {
+        if let Some(px) = resolve_dimension(mw, 700) {
+            let (cur_w, cur_h) = child_view.size_request();
+            if cur_w < 0 || cur_w > px {
+                child_view.set_size_request(px, cur_h);
+            }
+            child_view.set_hexpand(false);
         }
     }
 
@@ -2771,6 +2991,27 @@ fn handle_table(
         grid.set_halign(gtk::Align::Fill);
     }
 
+    // margin: auto centering (overrides halign when set)
+    if css_props.margin_left_auto && css_props.margin_right_auto {
+        grid.set_halign(gtk::Align::Center);
+        grid.set_hexpand(false);
+    } else if css_props.margin_left_auto {
+        grid.set_halign(gtk::Align::End);
+    } else if css_props.margin_right_auto {
+        grid.set_halign(gtk::Align::Start);
+    }
+
+    // Apply max-width as size constraint on the table
+    if let Some(ref mw) = css_props.max_width {
+        if let Some(max_px) = resolve_dimension(mw, view_content_width(view)) {
+            let cur_w = grid.width_request();
+            if cur_w < 0 || cur_w > max_px {
+                grid.set_size_request(max_px, -1);
+            }
+            grid.set_hexpand(false);
+        }
+    }
+
     // Apply table-level CSS only when explicitly specified
     #[allow(deprecated)]
     {
@@ -2898,6 +3139,10 @@ fn handle_table(
             let mut cell_font_size: Option<String> = None;
             let mut cell_padding: Option<i32> = None;
             let mut cell_hover_bg: Option<String> = None;
+            let mut cell_bg_image: Option<String> = None;
+            let mut cell_bg_repeat: Option<String> = None;
+            let mut cell_bg_size: Option<String> = None;
+            let mut cell_bg_position: Option<String> = None;
 
             if let NodeData::Element { ref name, ref attrs, .. } = cell_node.data {
                 if name.local.to_string() == "th" {
@@ -2977,6 +3222,18 @@ fn handle_table(
                 }
                 if cell_css.padding_top.is_some() {
                     cell_padding = cell_css.padding_top;
+                }
+                if cell_css.background_image.is_some() {
+                    cell_bg_image = cell_css.background_image.clone();
+                }
+                if cell_css.background_repeat.is_some() {
+                    cell_bg_repeat = cell_css.background_repeat.clone();
+                }
+                if cell_css.background_size.is_some() {
+                    cell_bg_size = cell_css.background_size.clone();
+                }
+                if cell_css.background_position.is_some() {
+                    cell_bg_position = cell_css.background_position.clone();
                 }
                 // Resolve :hover rules for this cell
                 if !ctx.hover_rules.is_empty() {
@@ -3122,6 +3379,19 @@ fn handle_table(
                 if let Some(ref bg) = bg_color {
                     css_parts.push(format!("background-color: {};", bg));
                 }
+                if let Some(ref bgi) = cell_bg_image {
+                    let resolved = resolve_background_image(bgi);
+                    css_parts.push(format!("background-image: {};", resolved));
+                }
+                if let Some(ref v) = cell_bg_repeat {
+                    css_parts.push(format!("background-repeat: {};", v));
+                }
+                if let Some(ref v) = cell_bg_size {
+                    css_parts.push(format!("background-size: {};", v));
+                }
+                if let Some(ref v) = cell_bg_position {
+                    css_parts.push(format!("background-position: {};", v));
+                }
                 if let Some(ref c) = cell_color {
                     css_parts.push(format!("color: {};", c));
                 }
@@ -3155,7 +3425,8 @@ fn handle_table(
                     let provider = gtk::CssProvider::new();
                     let mut css_str = String::new();
                     if !css_parts.is_empty() {
-                        css_str.push_str(&format!("textview {{ {} }}", css_parts.join(" ")));
+                        let joined = css_parts.join(" ");
+                        css_str.push_str(&format!("textview {{ {} }} textview text {{ {} }}", joined, joined));
                     }
                     if !hover_parts.is_empty() {
                         css_str.push_str(&format!(" textview:hover {{ {} }}", hover_parts.join(" ")));
@@ -3201,11 +3472,36 @@ fn handle_table(
         }
     }
 
+    apply_widget_margins(&grid, css_props);
+
     ensure_newline(buffer);
     let mut end_iter = buffer.end_iter();
+    let anchor_offset = end_iter.offset();
     let anchor = buffer.create_child_anchor(&mut end_iter);
     view.add_child_at_anchor(&grid, &anchor);
-    buffer.insert(&mut end_iter, "\n");
+
+    // Apply paragraph justification for margin:auto centering on child anchors
+    if css_props.margin_left_auto && css_props.margin_right_auto {
+        if let Some(tag) = buffer.create_tag(None, &[("justification", &gtk::Justification::Center)]) {
+            let start = buffer.iter_at_offset(anchor_offset);
+            let end = buffer.end_iter();
+            buffer.apply_tag(&tag, &start, &end);
+        }
+    } else if css_props.margin_left_auto {
+        if let Some(tag) = buffer.create_tag(None, &[("justification", &gtk::Justification::Right)]) {
+            let start = buffer.iter_at_offset(anchor_offset);
+            let end = buffer.end_iter();
+            buffer.apply_tag(&tag, &start, &end);
+        }
+    } else if css_props.margin_right_auto {
+        if let Some(tag) = buffer.create_tag(None, &[("justification", &gtk::Justification::Left)]) {
+            let start = buffer.iter_at_offset(anchor_offset);
+            let end = buffer.end_iter();
+            buffer.apply_tag(&tag, &start, &end);
+        }
+    }
+
+    buffer.insert(&mut buffer.end_iter(), "\n");
 }
 
 fn get_span_attrs(node: &Handle) -> (i32, i32) {

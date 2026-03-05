@@ -959,7 +959,14 @@ impl NativeHtmlEditor {
                     if widget.is::<gtk::Grid>() {
                         if let Some(w_str) = Self::extract_html_attr(&name, "width") {
                             if w_str.contains('%') {
-                                if let Some(px) = parser::resolve_dimension(&w_str, content_w) {
+                                if let Some(mut px) = parser::resolve_dimension(&w_str, content_w) {
+                                    // Clamp to max-width if present in style
+                                    if let Some(mw) = Self::extract_css_prop(&name, "max-width") {
+                                        if let Some(max_px) = parser::resolve_dimension(&mw, content_w) {
+                                            px = px.min(max_px);
+                                            widget.set_hexpand(false);
+                                        }
+                                    }
                                     widget.set_size_request(px, -1);
                                 }
                             }
@@ -1035,17 +1042,24 @@ impl NativeHtmlEditor {
                         if cur_req > 0 && cur_req != content_w {
                             widget.set_size_request(content_w, -1);
                         }
-                        // Update flex children with percentage widths
+                        // Update flex children with percentage widths/heights
                         let mut child = widget.first_child();
                         while let Some(ref c) = child {
                             let cname = c.widget_name().to_string();
                             if cname.starts_with("flexchild:") {
-                                if let Some(css_w) = Self::extract_css_width(&cname) {
-                                    if css_w.contains('%') {
-                                        if let Some(px) = parser::resolve_dimension(&css_w, content_w) {
-                                            c.set_size_request(px, -1);
-                                        }
-                                    }
+                                let css_w = Self::extract_css_prop(&cname, "width");
+                                let css_h = Self::extract_css_prop(&cname, "height");
+                                let new_w = css_w.as_ref()
+                                    .filter(|v| v.contains('%'))
+                                    .and_then(|v| parser::resolve_dimension(v, content_w));
+                                let new_h = css_h.as_ref()
+                                    .filter(|v| v.contains('%'))
+                                    .and_then(|v| parser::resolve_dimension(v, content_h));
+                                match (new_w, new_h) {
+                                    (Some(nw), Some(nh)) => c.set_size_request(nw, nh),
+                                    (Some(nw), None) => c.set_size_request(nw, c.height_request()),
+                                    (None, Some(nh)) => c.set_size_request(c.width_request(), nh),
+                                    _ => {}
                                 }
                             }
                             child = c.next_sibling();
@@ -1095,16 +1109,17 @@ impl NativeHtmlEditor {
         None
     }
 
-    /// Extract CSS width value from a flexchild widget_name like: flexchild:div|style="width: 30%; ..."
-    fn extract_css_width(name: &str) -> Option<String> {
-        // Look for width: VALUE in the style attribute within the widget_name
+    /// Extract a CSS property value from the style attribute in a widget_name.
+    /// e.g. extract_css_prop("flexchild:div|style=\"width: 30%; height: 50%\"", "width") → Some("30%")
+    fn extract_css_prop(name: &str, prop: &str) -> Option<String> {
         if let Some(style_start) = name.find("style=\"") {
             let style_content = &name[style_start + 7..];
             if let Some(style_end) = style_content.find('"') {
                 let style = &style_content[..style_end];
+                let prefix = format!("{}:", prop);
                 for decl in style.split(';') {
                     let decl = decl.trim();
-                    if let Some(val) = decl.strip_prefix("width:") {
+                    if let Some(val) = decl.strip_prefix(&prefix) {
                         return Some(val.trim().to_string());
                     }
                 }
