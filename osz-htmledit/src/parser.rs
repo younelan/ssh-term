@@ -3097,14 +3097,20 @@ fn handle_table(
         let mut cell_nodes = Vec::new();
         extract_elements_by_tag(tr_node, &["td", "th"], &mut cell_nodes);
 
-        // Get row-level attributes (bgcolor, valign)
+        // Get row-level attributes (bgcolor, style/class/id background-color, valign)
         let mut row_bg: Option<String> = None;
         let mut row_valign: Option<gtk::Align> = None;
         if let NodeData::Element { ref attrs, .. } = tr_node.data {
+            let mut tr_class: Option<String> = None;
+            let mut tr_id: Option<String> = None;
+            let mut tr_style: Option<String> = None;
             for attr in attrs.borrow().iter() {
                 let aname = attr.name.local.to_string();
                 match aname.as_str() {
                     "bgcolor" => row_bg = Some(attr.value.to_string()),
+                    "class" => tr_class = Some(attr.value.to_string()),
+                    "id" => tr_id = Some(attr.value.to_string()),
+                    "style" => tr_style = Some(attr.value.to_string()),
                     "valign" => {
                         match attr.value.to_string().to_lowercase().as_str() {
                             "top" => row_valign = Some(gtk::Align::Start),
@@ -3114,6 +3120,20 @@ fn handle_table(
                         }
                     }
                     _ => {}
+                }
+            }
+            // Resolve CSS cascade for <tr> (style tag rules + inline style)
+            let row_css = apply_css_cascade(
+                "tr",
+                tr_class.as_deref(),
+                tr_id.as_deref(),
+                tr_style.as_deref(),
+                &ctx.css_rules,
+            );
+            if let Some(bg) = row_css.background_color {
+                // bgcolor attribute wins if both are set (already assigned above)
+                if row_bg.is_none() {
+                    row_bg = Some(bg);
                 }
             }
         }
