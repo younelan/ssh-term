@@ -97,7 +97,11 @@ pub fn add_terminal_tab(
         bg, fg, settings.font_size
     );
     provider.load_from_data(&css);
-    text_view.style_context().add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 500);
+    gtk::style_context_add_provider_for_display(
+        &text_view.display(),
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 500,
+    );
 
     scrolled.set_child(Some(&text_view));
 
@@ -405,22 +409,22 @@ pub fn add_terminal_tab(
                         Some(w) => w,
                         None => continue,
                     };
-                    let dialog = gtk::MessageDialog::builder()
-                        .transient_for(&win)
-                        .modal(true)
-                        .message_type(gtk::MessageType::Warning)
-                        .buttons(gtk::ButtonsType::YesNo)
-                        .text("SSH Host Key Verification")
-                        .secondary_text(&format!(
+                    let dialog = gtk::AlertDialog::builder()
+                        .message("SSH Host Key Verification")
+                        .detail(&format!(
                             "The authenticity of host '{}:{}' can't be established.\n\nSHA256 Fingerprint: {}\n\nAre you sure you want to continue connecting?",
                             host, port, fingerprint
                         ))
+                        .buttons(["No", "Yes"])
+                        .cancel_button(0)
+                        .default_button(1)
+                        .modal(true)
                         .build();
                     let resp_tx = response.clone();
                     let h_clone = host.clone();
                     let fp_clone = fingerprint.clone();
-                    dialog.connect_response(move |d, res| {
-                        let approved = res == gtk::ResponseType::Yes;
+                    dialog.choose(Some(&win), None::<&gtk::gio::Cancellable>, move |result| {
+                        let approved = matches!(result, Ok(1));
                         if approved {
                             let mut current = crate::config::load_known_hosts();
                             current.retain(|kh| !(kh.host == h_clone && kh.port == port));
@@ -438,9 +442,7 @@ pub fn add_terminal_tab(
                             });
                         }
                         let _ = resp_tx.send(approved);
-                        d.destroy();
                     });
-                    dialog.show();
                 }
             }
         }

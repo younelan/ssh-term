@@ -2,7 +2,7 @@ use crate::config::{ConnectionSettings, THEMES};
 use crate::app_state::update_active_terminals;
 use gtk4 as gtk;
 use gtk::prelude::*;
-use gtk::{glib, Box as GtkBox, Button, CheckButton, ColorButton, DropDown, Entry, Label, ListBox, MenuButton, Orientation, StringList};
+use gtk::{glib, Box as GtkBox, Button, CheckButton, ColorDialogButton, DropDown, Entry, Label, ListBox, MenuButton, Orientation, StringList};
 use std::sync::{Arc, Mutex};
 
 pub fn populate_list(
@@ -14,13 +14,13 @@ pub fn populate_list(
     user_e: &Entry, 
     pass_e: &Entry, 
     save_p: &CheckButton, 
-    fg_b: &ColorButton, 
-    bg_b: &ColorButton, 
+    fg_b: &ColorDialogButton, 
+    bg_b: &ColorDialogButton, 
     font_d: &DropDown, 
     cur_d: &DropDown, 
     blink_c: &CheckButton, 
     scroll_e: &Entry, 
-    palette_btns: &[ColorButton], 
+    palette_btns: &[ColorDialogButton], 
     sessions_arc: Arc<Mutex<Vec<ConnectionSettings>>>, 
     key_e: &Entry, 
     theme_d: &DropDown, 
@@ -249,23 +249,34 @@ pub fn populate_list(
 
         action_rename.connect_activate(move |_, _| {
             let win = match win_weak_ren.upgrade() { Some(w) => w, None => return };
-            let dialog = gtk::MessageDialog::builder()
-                .transient_for(&win)
+            let dialog = gtk::Window::builder()
+                .title("Rename Session")
                 .modal(true)
-                .message_type(gtk::MessageType::Question)
-                .buttons(gtk::ButtonsType::OkCancel)
-                .text("Rename Session")
-                .secondary_text("Enter the new name for this session:")
+                .transient_for(&win)
+                .default_width(350)
+                .default_height(150)
                 .build();
-                
-            let entry = Entry::builder().text(&current_name).margin_top(10).margin_bottom(10).margin_start(10).margin_end(10).build();
-            dialog.content_area().append(&entry);
+            let vbox = GtkBox::new(Orientation::Vertical, 10);
+            vbox.set_margin_top(15); vbox.set_margin_bottom(15);
+            vbox.set_margin_start(15); vbox.set_margin_end(15);
+            let label = Label::new(Some("Enter the new name for this session:"));
+            let entry = Entry::builder().text(&current_name).build();
+            let btn_box = GtkBox::new(Orientation::Horizontal, 8);
+            btn_box.set_halign(gtk::Align::End);
+            let ok_btn = Button::with_label("OK");
+            let cancel_btn = Button::with_label("Cancel");
+            btn_box.append(&cancel_btn);
+            btn_box.append(&ok_btn);
+            vbox.append(&label);
+            vbox.append(&entry);
+            vbox.append(&btn_box);
+            dialog.set_child(Some(&vbox));
             entry.grab_focus();
-            
+
             let s_arc_ren_inner = s_arc_ren.clone();
             let n_e_weak_ren_inner = n_e_w_ren.clone();
             let l_w_ren_inner = list_w_ren.clone();
-            
+
             let h_e_ren_i = h_e_ren.clone();
             let p_e_ren_i = p_e_ren.clone();
             let u_e_ren_i = u_e_ren.clone();
@@ -286,26 +297,31 @@ pub fn populate_list(
             let lf_ren_i = lf_ren.clone();
             let rf_ren_i = rf_ren.clone();
 
-            dialog.connect_response(move |d, res| {
-                if res == gtk::ResponseType::Ok {
-                    let new_name = entry.text().to_string();
-                    if !new_name.trim().is_empty() {
-                        let mut s = s_arc_ren_inner.lock().unwrap();
-                        if index < s.len() {
-                            s[index].name = new_name;
-                            crate::config::save_sessions(&s);
-                            
-                            if let (Some(ls_up), Some(ne_up), Some(he_up), Some(pe_up), Some(ue_up), Some(pse_up), Some(sp_up), Some(fg_up), Some(bg_up), Some(fd_up), Some(cd_up), Some(bc_up), Some(sc_up), Some(ke_up), Some(th_up), Some(ka_up), Some(ac_up), Some(md_up), Some(lf_up), Some(rf_up)) = (
-                                l_w_ren_inner.upgrade(), n_e_weak_ren_inner.upgrade(), h_e_ren_i.upgrade(), p_e_ren_i.upgrade(), u_e_ren_i.upgrade(), ps_e_ren_i.upgrade(), sp_ren_i.upgrade(), fg_ren_i.upgrade(), bg_ren_i.upgrade(), f_d_ren_i.upgrade(), c_d_ren_i.upgrade(), bc_ren_i.upgrade(), sc_ren_i.upgrade(), ke_ren_i.upgrade(), th_ren_i.upgrade(), ka_ren_i.upgrade(), ac_ren_i.upgrade(), md_ren_i.upgrade(), lf_ren_i.upgrade(), rf_ren_i.upgrade()
-                            ) {
-                                populate_list(&ls_up, &s, &ne_up, &he_up, &pe_up, &ue_up, &pse_up, &sp_up, &fg_up, &bg_up, &fd_up, &cd_up, &bc_up, &sc_up, &pb_ren_i, s_arc_ren_inner.clone(), &ke_up, &th_up, &ka_up, &ac_up, &md_up, &lf_up, &rf_up);
-                            }
+            let dialog_weak = dialog.downgrade();
+            ok_btn.connect_clicked(move |_| {
+                let new_name = entry.text().to_string();
+                if !new_name.trim().is_empty() {
+                    let mut s = s_arc_ren_inner.lock().unwrap();
+                    if index < s.len() {
+                        s[index].name = new_name;
+                        crate::config::save_sessions(&s);
+
+                        if let (Some(ls_up), Some(ne_up), Some(he_up), Some(pe_up), Some(ue_up), Some(pse_up), Some(sp_up), Some(fg_up), Some(bg_up), Some(fd_up), Some(cd_up), Some(bc_up), Some(sc_up), Some(ke_up), Some(th_up), Some(ka_up), Some(ac_up), Some(md_up), Some(lf_up), Some(rf_up)) = (
+                            l_w_ren_inner.upgrade(), n_e_weak_ren_inner.upgrade(), h_e_ren_i.upgrade(), p_e_ren_i.upgrade(), u_e_ren_i.upgrade(), ps_e_ren_i.upgrade(), sp_ren_i.upgrade(), fg_ren_i.upgrade(), bg_ren_i.upgrade(), f_d_ren_i.upgrade(), c_d_ren_i.upgrade(), bc_ren_i.upgrade(), sc_ren_i.upgrade(), ke_ren_i.upgrade(), th_ren_i.upgrade(), ka_ren_i.upgrade(), ac_ren_i.upgrade(), md_ren_i.upgrade(), lf_ren_i.upgrade(), rf_ren_i.upgrade()
+                        ) {
+                            populate_list(&ls_up, &s, &ne_up, &he_up, &pe_up, &ue_up, &pse_up, &sp_up, &fg_up, &bg_up, &fd_up, &cd_up, &bc_up, &sc_up, &pb_ren_i, s_arc_ren_inner.clone(), &ke_up, &th_up, &ka_up, &ac_up, &md_up, &lf_up, &rf_up);
                         }
                     }
                 }
-                d.destroy();
+                if let Some(d) = dialog_weak.upgrade() { d.close(); }
             });
-            dialog.show();
+
+            let dialog_weak2 = dialog.downgrade();
+            cancel_btn.connect_clicked(move |_| {
+                if let Some(d) = dialog_weak2.upgrade() { d.close(); }
+            });
+
+            dialog.present();
         });
         action_group.add_action(&action_rename);
 
@@ -339,25 +355,36 @@ pub fn populate_list(
 
         action_clone.connect_activate(move |_, _| {
             let win = match win_weak_cl.upgrade() { Some(w) => w, None => return };
-            let dialog = gtk::MessageDialog::builder()
-                .transient_for(&win)
+            let dialog = gtk::Window::builder()
+                .title("Clone Session")
                 .modal(true)
-                .message_type(gtk::MessageType::Question)
-                .buttons(gtk::ButtonsType::OkCancel)
-                .text("Clone Session")
-                .secondary_text("Enter a name for the new cloned session:")
+                .transient_for(&win)
+                .default_width(350)
+                .default_height(150)
                 .build();
-                
+            let vbox = GtkBox::new(Orientation::Vertical, 10);
+            vbox.set_margin_top(15); vbox.set_margin_bottom(15);
+            vbox.set_margin_start(15); vbox.set_margin_end(15);
+            let label = Label::new(Some("Enter a name for the new cloned session:"));
             let default_clone_name = format!("{} (Copy)", s_to_clone.name);
-            let entry = Entry::builder().text(&default_clone_name).margin_top(10).margin_bottom(10).margin_start(10).margin_end(10).build();
-            dialog.content_area().append(&entry);
+            let entry = Entry::builder().text(&default_clone_name).build();
+            let btn_box = GtkBox::new(Orientation::Horizontal, 8);
+            btn_box.set_halign(gtk::Align::End);
+            let ok_btn = Button::with_label("OK");
+            let cancel_btn = Button::with_label("Cancel");
+            btn_box.append(&cancel_btn);
+            btn_box.append(&ok_btn);
+            vbox.append(&label);
+            vbox.append(&entry);
+            vbox.append(&btn_box);
+            dialog.set_child(Some(&vbox));
             entry.grab_focus();
-            
+
             let s_arc_cl_inner = s_arc_cl.clone();
             let stc_inner = s_to_clone.clone();
             let l_w_cl_inner = list_w_cl.clone();
             let n_e_w_cl_inner = n_e_w_cl.clone();
-            
+
             let h_e_cl_i = h_e_cl.clone();
             let p_e_cl_i = p_e_cl.clone();
             let u_e_cl_i = u_e_cl.clone();
@@ -378,27 +405,32 @@ pub fn populate_list(
             let lf_cl_i = lf_cl.clone();
             let rf_cl_i = rf_cl.clone();
 
-            dialog.connect_response(move |d, res| {
-                if res == gtk::ResponseType::Ok {
-                    let new_name = entry.text().to_string();
-                    if !new_name.trim().is_empty() {
-                        let mut cloned_settings = stc_inner.clone();
-                        cloned_settings.name = new_name;
-                        
-                        let mut s = s_arc_cl_inner.lock().unwrap();
-                        s.push(cloned_settings);
-                        crate::config::save_sessions(&s);
-                        
-                        if let (Some(ls_up), Some(ne_up), Some(he_up), Some(pe_up), Some(ue_up), Some(pse_up), Some(sp_up), Some(fg_up), Some(bg_up), Some(fd_up), Some(cd_up), Some(bc_up), Some(sc_up), Some(ke_up), Some(th_up), Some(ka_up), Some(ac_up), Some(md_up), Some(lf_up), Some(rf_up)) = (
-                            l_w_cl_inner.upgrade(), n_e_w_cl_inner.upgrade(), h_e_cl_i.upgrade(), p_e_cl_i.upgrade(), u_e_cl_i.upgrade(), ps_e_cl_i.upgrade(), sp_cl_i.upgrade(), fg_cl_i.upgrade(), bg_cl_i.upgrade(), f_d_cl_i.upgrade(), c_d_cl_i.upgrade(), bc_cl_i.upgrade(), sc_cl_i.upgrade(), ke_cl_i.upgrade(), th_cl_i.upgrade(), ka_cl_i.upgrade(), ac_cl_i.upgrade(), md_cl_i.upgrade(), lf_cl_i.upgrade(), rf_cl_i.upgrade()
-                        ) {
-                            populate_list(&ls_up, &s, &ne_up, &he_up, &pe_up, &ue_up, &pse_up, &sp_up, &fg_up, &bg_up, &fd_up, &cd_up, &bc_up, &sc_up, &pb_cl_i, s_arc_cl_inner.clone(), &ke_up, &th_up, &ka_up, &ac_up, &md_up, &lf_up, &rf_up);
-                        }
+            let dialog_weak = dialog.downgrade();
+            ok_btn.connect_clicked(move |_| {
+                let new_name = entry.text().to_string();
+                if !new_name.trim().is_empty() {
+                    let mut cloned_settings = stc_inner.clone();
+                    cloned_settings.name = new_name;
+
+                    let mut s = s_arc_cl_inner.lock().unwrap();
+                    s.push(cloned_settings);
+                    crate::config::save_sessions(&s);
+
+                    if let (Some(ls_up), Some(ne_up), Some(he_up), Some(pe_up), Some(ue_up), Some(pse_up), Some(sp_up), Some(fg_up), Some(bg_up), Some(fd_up), Some(cd_up), Some(bc_up), Some(sc_up), Some(ke_up), Some(th_up), Some(ka_up), Some(ac_up), Some(md_up), Some(lf_up), Some(rf_up)) = (
+                        l_w_cl_inner.upgrade(), n_e_w_cl_inner.upgrade(), h_e_cl_i.upgrade(), p_e_cl_i.upgrade(), u_e_cl_i.upgrade(), ps_e_cl_i.upgrade(), sp_cl_i.upgrade(), fg_cl_i.upgrade(), bg_cl_i.upgrade(), f_d_cl_i.upgrade(), c_d_cl_i.upgrade(), bc_cl_i.upgrade(), sc_cl_i.upgrade(), ke_cl_i.upgrade(), th_cl_i.upgrade(), ka_cl_i.upgrade(), ac_cl_i.upgrade(), md_cl_i.upgrade(), lf_cl_i.upgrade(), rf_cl_i.upgrade()
+                    ) {
+                        populate_list(&ls_up, &s, &ne_up, &he_up, &pe_up, &ue_up, &pse_up, &sp_up, &fg_up, &bg_up, &fd_up, &cd_up, &bc_up, &sc_up, &pb_cl_i, s_arc_cl_inner.clone(), &ke_up, &th_up, &ka_up, &ac_up, &md_up, &lf_up, &rf_up);
                     }
                 }
-                d.destroy();
+                if let Some(d) = dialog_weak.upgrade() { d.close(); }
             });
-            dialog.show();
+
+            let dialog_weak2 = dialog.downgrade();
+            cancel_btn.connect_clicked(move |_| {
+                if let Some(d) = dialog_weak2.upgrade() { d.close(); }
+            });
+
+            dialog.present();
         });
         action_group.add_action(&action_clone);
 
@@ -577,8 +609,8 @@ fn find_parent_window<W: glib::prelude::IsA<gtk::Widget>>(widget: &W) -> glib::o
 
 pub fn user_entry_downgrade(e: &Entry) -> glib::object::WeakRef<Entry> { e.downgrade() }
 pub fn pass_entry_downgrade(e: &Entry) -> glib::object::WeakRef<Entry> { e.downgrade() }
-pub fn fg_button_downgrade(b: &ColorButton) -> glib::object::WeakRef<ColorButton> { b.downgrade() }
-pub fn bg_button_downgrade(b: &ColorButton) -> glib::object::WeakRef<ColorButton> { b.downgrade() }
+pub fn fg_button_downgrade(b: &ColorDialogButton) -> glib::object::WeakRef<ColorDialogButton> { b.downgrade() }
+pub fn bg_button_downgrade(b: &ColorDialogButton) -> glib::object::WeakRef<ColorDialogButton> { b.downgrade() }
 pub fn font_dropdown_downgrade(d: &DropDown) -> glib::object::WeakRef<DropDown> { d.downgrade() }
 pub fn cur_dropdown_downgrade(d: &DropDown) -> glib::object::WeakRef<DropDown> { d.downgrade() }
 pub fn blink_check_downgrade(c: &CheckButton) -> glib::object::WeakRef<CheckButton> { c.downgrade() }
@@ -586,8 +618,8 @@ pub fn scroll_entry_downgrade(e: &Entry) -> glib::object::WeakRef<Entry> { e.dow
 
 pub fn upgrade_user_e(w: &glib::object::WeakRef<Entry>) -> Option<Entry> { w.upgrade() }
 pub fn upgrade_pass_e(w: &glib::object::WeakRef<Entry>) -> Option<Entry> { w.upgrade() }
-pub fn upgrade_fg_b(w: &glib::object::WeakRef<ColorButton>) -> Option<ColorButton> { w.upgrade() }
-pub fn upgrade_bg_b(w: &glib::object::WeakRef<ColorButton>) -> Option<ColorButton> { w.upgrade() }
+pub fn upgrade_fg_b(w: &glib::object::WeakRef<ColorDialogButton>) -> Option<ColorDialogButton> { w.upgrade() }
+pub fn upgrade_bg_b(w: &glib::object::WeakRef<ColorDialogButton>) -> Option<ColorDialogButton> { w.upgrade() }
 pub fn upgrade_font_d(w: &glib::object::WeakRef<DropDown>) -> Option<DropDown> { w.upgrade() }
 pub fn upgrade_cur_d(w: &glib::object::WeakRef<DropDown>) -> Option<DropDown> { w.upgrade() }
 pub fn upgrade_blink_c(w: &glib::object::WeakRef<CheckButton>) -> Option<CheckButton> { w.upgrade() }

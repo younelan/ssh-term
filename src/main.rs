@@ -18,7 +18,7 @@ use gtk::gio;
 use gtk::prelude::*;
 use gtk::{
     glib, Application, ApplicationWindow, Box as GtkBox, Button, Entry, ListBox, Orientation,
-    HeaderBar, ColorButton, DropDown, StringList, Notebook, MenuButton, CheckButton, Grid,
+    HeaderBar, ColorDialogButton, DropDown, StringList, Notebook, MenuButton, CheckButton, Grid,
     Label, ScrolledWindow, CssProvider, gdk
 };
 use std::sync::{Arc, Mutex};
@@ -633,24 +633,15 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
     let win_for_key = window.clone();
     let key_e_clone = key_entry.clone();
     key_btn.connect_clicked(move |_| {
-        let dialog = gtk::FileChooserDialog::new(
-            Some("Select Private Key"),
-            Some(&win_for_key),
-            gtk::FileChooserAction::Open,
-            &[("Open", gtk::ResponseType::Accept), ("Cancel", gtk::ResponseType::Cancel)],
-        );
+        let dialog = gtk::FileDialog::builder().title("Select Private Key").build();
         let key_e = key_e_clone.clone();
-        dialog.connect_response(move |d, res| {
-            if res == gtk::ResponseType::Accept {
-                if let Some(file) = d.file() {
-                    if let Some(path) = file.path() {
-                        key_e.set_text(&path.to_string_lossy());
-                    }
+        dialog.open(Some(&win_for_key), None::<&gio::Cancellable>, move |result| {
+            if let Ok(file) = result {
+                if let Some(path) = file.path() {
+                    key_e.set_text(&path.to_string_lossy());
                 }
             }
-            d.destroy();
         });
-        dialog.show();
     });
 
     let btn_box = GtkBox::new(Orientation::Horizontal, 12);
@@ -696,8 +687,8 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
     let theme_model = StringList::new(&theme_modelstr);
     let theme_d = DropDown::builder().model(&theme_model).build();
     
-    let fg_b = ColorButton::with_rgba(&hex_to_rgba("#00ff00"));
-    let bg_b = ColorButton::with_rgba(&hex_to_rgba("#000000"));
+    let fg_b = { let d = gtk::ColorDialog::new(); let b = ColorDialogButton::new(Some(d)); b.set_rgba(&hex_to_rgba("#00ff00")); b };
+    let bg_b = { let d = gtk::ColorDialog::new(); let b = ColorDialogButton::new(Some(d)); b.set_rgba(&hex_to_rgba("#000000")); b };
     let blink_c = CheckButton::builder().label("Blinking Cursor").active(true).build();
     
     let basic_grid = Grid::builder().row_spacing(10).column_spacing(10).build();
@@ -720,7 +711,7 @@ fn ensure_connect_window(app: &Application, target_nb: Option<Notebook>) {
     let mut palette_btns = Vec::new();
     let default_pal = THEMES[0].palette;
     for i in 0..16 {
-        let btn = ColorButton::with_rgba(&hex_to_rgba(default_pal[i]));
+        let btn = { let d = gtk::ColorDialog::new(); let b = ColorDialogButton::new(Some(d)); b.set_rgba(&hex_to_rgba(default_pal[i])); b };
         pal_grid.attach(&btn, (i % 8) as i32, (1 + i / 8) as i32, 1, 1);
         palette_btns.push(btn);
     }

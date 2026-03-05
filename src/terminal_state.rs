@@ -4,6 +4,7 @@ use gtk4 as gtk;
 use gtk::{glib, gio, Label, TextBuffer, TextTag, TextView};
 use gtk::prelude::*;
 use vte::Perform;
+use osz_htmledit::OHtmlEdit;
 
 // ── Graph widget ──────────────────────────────────────────────────────────────
 
@@ -479,12 +480,12 @@ pub struct TerminalState {
     pub menu_popovers: std::collections::HashMap<String, gtk::Popover>,
     /// Map from menu ID to parent menu/menubar ID (for closing chain).
     pub menu_parents: std::collections::HashMap<String, String>,
-    /// TreeStore models for treeview widgets (id -> store).
-    pub tree_stores: std::collections::HashMap<String, gtk::TreeStore>,
-    /// ListStore models for listview widgets (id -> store).
-    pub list_stores: std::collections::HashMap<String, gtk::ListStore>,
-    /// Named TreeIter rows: widget_id -> (row_id -> iter), for addrow with parent.
-    pub tree_row_iters: std::collections::HashMap<String, std::collections::HashMap<String, gtk::TreeIter>>,
+    /// Root gio::ListStore for tree widgets (id -> store).
+    pub tree_stores: std::collections::HashMap<String, gio::ListStore>,
+    /// gio::ListStore for table/listview widgets (id -> store).
+    pub list_stores: std::collections::HashMap<String, gio::ListStore>,
+    /// Child stores for tree widget nodes: widget_id -> Rc<RefCell<HashMap<row_label, child_store>>>.
+    pub tree_child_stores: std::collections::HashMap<String, std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, gio::ListStore>>>>,
     /// Tracks the last dynamically-applied CSS class per widget so we can remove it before adding a new one.
     pub widget_css_classes: std::collections::HashMap<String, String>,
     /// Per-widget CssProvider for dynamic background/foreground colours.
@@ -505,6 +506,8 @@ pub struct TerminalState {
     pub widget_sizes: std::collections::HashMap<String, u32>,
     /// FlowBox containers for flowbox panels (id -> FlowBox).
     pub flow_panels: std::collections::HashMap<String, gtk::FlowBox>,
+    /// HTML editor widgets (id -> OHtmlEdit).
+    pub htmledit_editors: std::collections::HashMap<String, std::rc::Rc<OHtmlEdit>>,
 }
 
 impl TerminalState {
@@ -583,7 +586,7 @@ impl TerminalState {
             menu_parents: std::collections::HashMap::new(),
             tree_stores: std::collections::HashMap::new(),
             list_stores: std::collections::HashMap::new(),
-            tree_row_iters: std::collections::HashMap::new(),
+            tree_child_stores: std::collections::HashMap::new(),
             widget_css_classes: std::collections::HashMap::new(),
             widget_css_providers: std::collections::HashMap::new(),
             widget_bg_colors: std::collections::HashMap::new(),
@@ -594,6 +597,7 @@ impl TerminalState {
             widget_fonts: std::collections::HashMap::new(),
             widget_sizes: std::collections::HashMap::new(),
             flow_panels: std::collections::HashMap::new(),
+            htmledit_editors: std::collections::HashMap::new(),
         }
     }
 
@@ -959,12 +963,10 @@ impl TerminalState {
                 }
             }
             if !placed {
-                eprintln!("[PANEL] parent '{}' not found, inserting inline", pid);
             } else {
                 // Register and return early
                 if let Some(g) = grid_opt { self.grids.insert(id.clone(), g); }
                 if let Some(b) = panel_box { self.panels.insert(id.clone(), b); }
-                eprintln!("[PANEL] inserted panel id={} layout={} into parent={}", id, layout, pid);
                 return;
             }
         }
@@ -984,7 +986,6 @@ impl TerminalState {
         if let Some(g) = grid_opt { self.grids.insert(id.clone(), g); }
         if let Some(b) = panel_box { self.panels.insert(id.clone(), b); }
         if self.is_alternate { self.alt_cursor_x += 1; } else { self.cursor_x += 1; }
-        eprintln!("[PANEL] inserted panel id={} layout={} inline", id, layout);
     }
 
     /// Read the current value of a widget and send it back as a WidgetEvent.
@@ -995,7 +996,9 @@ impl TerminalState {
             Some(v) => v.clone(),
             None => return,
         };
-        let value = if let Some(widget) = self.widgets.get(&id) {
+        let value = if let Some(editor) = self.htmledit_editors.get(&id) {
+            editor.get_html()
+        } else if let Some(widget) = self.widgets.get(&id) {
             if let Some(tv) = widget.downcast_ref::<gtk::TextView>() {
                 let buf = tv.buffer();
                 let start = buf.start_iter();
@@ -1217,21 +1220,24 @@ impl TerminalState {
                 let items_str = props.get("items").cloned().unwrap_or_default();
                 let items: Vec<&str> = items_str.split('|').collect();
                 let selected: u32 = props.get("selected").and_then(|v| v.parse().ok()).unwrap_or(0);
-                let combo = gtk::ComboBoxText::new();
-                for item in &items {
-                    combo.append_text(item);
-                }
-                combo.set_active(Some(selected));
+                let string_list = gtk::StringList::new(&items.iter().map(|s| *s).collect::<Vec<&str>>());
+                let dropdown = gtk::DropDown::new(Some(string_list), None::<gtk::Expression>);
+                dropdown.set_selected(selected);
                 let wid = id.clone();
                 let tx = pty_tx.clone();
-                combo.connect_changed(move |c| {
+                dropdown.connect_notify(Some("selected"), move |dd, _| {
                     if let Some(ref tx) = tx {
-                        let val = c.active_text().map(|s| s.to_string()).unwrap_or_default();
+                        let idx = dd.selected();
+                        let val = dd.model()
+                            .and_then(|m| m.item(idx))
+                            .and_then(|obj| obj.downcast::<gtk::StringObject>().ok())
+                            .map(|so| so.string().to_string())
+                            .unwrap_or_default();
                         let msg = format!("\x1b]1337;WidgetEvent=id:{};action:selected;value:{}\x07", wid, val);
                         let _ = tx.send(msg.into_bytes());
                     }
                 });
-                Some(combo.upcast())
+                Some(dropdown.upcast())
             }
             "slider" | "scale" => {
                 let min: f64 = props.get("min").and_then(|v| v.parse().ok()).unwrap_or(0.0);
@@ -1444,31 +1450,6 @@ impl TerminalState {
                 });
                 Some(cal.upcast())
             }
-            "color" | "colorbutton" | "colorpicker" => {
-                let btn = gtk::ColorButton::new();
-                if let Some(c) = props.get("value") {
-                    let rgba = gtk::gdk::RGBA::parse(c).unwrap_or(gtk::gdk::RGBA::BLACK);
-                    btn.set_rgba(&rgba);
-                }
-                btn.set_use_alpha(props.get("alpha").map(|v| v == "true" || v == "1").unwrap_or(false));
-                if let Some(t) = props.get("title") {
-                    btn.set_title(t);
-                }
-                let wid = id.clone();
-                let tx = pty_tx.clone();
-                btn.connect_color_set(move |b| {
-                    if let Some(ref tx) = tx {
-                        let c = b.rgba();
-                        let hex = format!("#{:02x}{:02x}{:02x}",
-                            (c.red() * 255.0) as u8,
-                            (c.green() * 255.0) as u8,
-                            (c.blue() * 255.0) as u8);
-                        let msg = format!("\x1b]1337;WidgetEvent=id:{};action:selected;value:{}\x07", wid, hex);
-                        let _ = tx.send(msg.into_bytes());
-                    }
-                });
-                Some(btn.upcast())
-            }
             "link" | "linkbutton" => {
                 let uri = props.get("uri").cloned().unwrap_or_else(|| "https://example.com".into());
                 let label = props.get("label").cloned().unwrap_or_else(|| uri.clone());
@@ -1539,66 +1520,74 @@ impl TerminalState {
                 self.widgets.insert(id.clone(), pic.clone().upcast());
                 Some(pic.upcast())
             }
-            "treeview" => {
+            "treeview" | "tree" => {
                 let width: i32 = props.get("width").and_then(|v| v.parse().ok()).unwrap_or(200);
                 let height: i32 = props.get("height").and_then(|v| v.parse().ok()).unwrap_or(300);
-                let store = gtk::TreeStore::new(&[glib::Type::STRING]);
-                let tv = gtk::TreeView::with_model(&store);
-                tv.set_headers_visible(false);
-                tv.set_activate_on_single_click(true);
-                let renderer = gtk::CellRendererText::new();
-                let col = gtk::TreeViewColumn::new();
-                gtk::prelude::CellLayoutExt::pack_start(&col, &renderer, true);
-                gtk::prelude::CellLayoutExt::add_attribute(&col, &renderer, "text", 0);
-                tv.append_column(&col);
-                let wid = id.clone();
-                let tx = pty_tx.clone();
-                tv.selection().connect_changed(move |sel| {
-                    if let Some((model, iter)) = sel.selected() {
-                        if let Ok(val) = model.get_value(&iter, 0).get::<String>() {
-                            if let Some(ref tx) = tx {
-                                let msg = format!("\x1b]1337;WidgetEvent=id:{};action:selected;value:{}\x07", wid, val);
-                                let _ = tx.send(msg.into_bytes());
-                            }
-                        }
-                    }
+
+                let root_store = gio::ListStore::new::<gtk::StringObject>();
+
+                // Map from node label to child gio::ListStore for TreeListModel
+                let child_stores: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, gio::ListStore>>>
+                    = std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
+
+                let cs = child_stores.clone();
+                let tree_model = gtk::TreeListModel::new(root_store.clone(), false, true, move |item| {
+                    let obj = item.downcast_ref::<gtk::StringObject>()?;
+                    let key = obj.string().to_string();
+                    let stores = cs.borrow();
+                    stores.get(&key).map(|s| s.clone().upcast::<gio::ListModel>())
                 });
+
+                let selection = gtk::SingleSelection::new(Some(tree_model.clone()));
+                selection.set_autoselect(false);
+                selection.set_can_unselect(true);
+
+                let factory = gtk::SignalListItemFactory::new();
+                factory.connect_setup(|_, item| {
+                    let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+                    let expander = gtk::TreeExpander::new();
+                    let label = gtk::Label::new(None);
+                    label.set_halign(gtk::Align::Start);
+                    expander.set_child(Some(&label));
+                    item.set_child(Some(&expander));
+                });
+                factory.connect_bind(|_, item| {
+                    let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+                    let expander = item.child().and_downcast::<gtk::TreeExpander>().unwrap();
+                    let tree_row = item.item().and_downcast::<gtk::TreeListRow>().unwrap();
+                    expander.set_list_row(Some(&tree_row));
+                    let obj = tree_row.item().and_downcast::<gtk::StringObject>().unwrap();
+                    let label = expander.child().and_downcast::<gtk::Label>().unwrap();
+                    label.set_text(&obj.string());
+                });
+
+                let lv = gtk::ListView::new(Some(selection.clone()), Some(factory));
+
+                // Selection event
                 {
-                    let wid2 = id.clone();
-                    let tx2 = pty_tx.clone();
-                    tv.connect_row_expanded(move |tv_inner, iter, _path| {
-                        if let Some(model) = tv_inner.model() {
-                            if let Ok(val) = model.get_value(iter, 0).get::<String>() {
-                                if let Some(ref tx) = tx2 {
-                                    let msg = format!("\x1b]1337;WidgetEvent=id:{};action:expanded;value:{}\x07", wid2, val);
+                    let wid = id.clone();
+                    let tx = pty_tx.clone();
+                    selection.connect_notify(Some("selected"), move |sel, _| {
+                        if let Some(tree_row) = sel.selected_item().and_downcast::<gtk::TreeListRow>() {
+                            if let Some(obj) = tree_row.item().and_downcast::<gtk::StringObject>() {
+                                if let Some(ref tx) = tx {
+                                    let msg = format!("\x1b]1337;WidgetEvent=id:{};action:selected;value:{}\x07", wid, obj.string());
                                     let _ = tx.send(msg.into_bytes());
                                 }
                             }
                         }
                     });
                 }
-                {
-                    let wid3 = id.clone();
-                    let tx3 = pty_tx.clone();
-                    tv.connect_row_collapsed(move |tv_inner, iter, _path| {
-                        if let Some(model) = tv_inner.model() {
-                            if let Ok(val) = model.get_value(iter, 0).get::<String>() {
-                                if let Some(ref tx) = tx3 {
-                                    let msg = format!("\x1b]1337;WidgetEvent=id:{};action:collapsed;value:{}\x07", wid3, val);
-                                    let _ = tx.send(msg.into_bytes());
-                                }
-                            }
-                        }
-                    });
-                }
+
                 let sw = gtk::ScrolledWindow::new();
-                sw.set_child(Some(&tv));
+                sw.set_child(Some(&lv));
                 sw.set_size_request(width, height);
                 sw.set_vexpand(true);
                 sw.set_hexpand(true);
                 sw.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Automatic);
-                self.tree_stores.insert(id.clone(), store);
-                self.widgets.insert(id.clone(), tv.clone().upcast());
+                self.tree_stores.insert(id.clone(), root_store);
+                self.tree_child_stores.insert(id.clone(), child_stores);
+                self.widgets.insert(id.clone(), lv.clone().upcast());
                 Some(sw.upcast())
             }
             "listview" | "listbox" | "table" => {
@@ -1611,51 +1600,83 @@ impl TerminalState {
                     .map(|s| s.split('|').filter_map(|w| w.parse().ok()).collect())
                     .unwrap_or_default();
                 let n = col_names.len();
-                // n+2 cols: n data + 1 fg colour + 1 bg colour (hidden, bound to renderers)
-                let types: Vec<glib::Type> = vec![glib::Type::STRING; n + 2];
-                let store = gtk::ListStore::new(&types);
-                let tv = gtk::TreeView::with_model(&store);
-                tv.set_headers_visible(true);
-                tv.set_activate_on_single_click(true);
                 let sortable = props.get("sortable").map(|v| v != "false" && v != "0").unwrap_or(true);
-                // Per-column ascending/descending toggle state
+
+                let store = gio::ListStore::new::<gtk::StringObject>();
+                let selection = gtk::SingleSelection::new(Some(store.clone()));
+                selection.set_autoselect(false);
+                selection.set_can_unselect(true);
+                let cv = gtk::ColumnView::new(Some(selection.clone()));
+                cv.set_show_column_separators(true);
+                cv.set_show_row_separators(true);
+
                 let sort_dirs = std::rc::Rc::new(std::cell::RefCell::new(vec![true; n]));
+
                 for (i, name) in col_names.iter().enumerate() {
-                    let renderer = gtk::CellRendererText::new();
-                    let col = gtk::TreeViewColumn::new();
-                    col.set_title(name);
-                    gtk::prelude::CellLayoutExt::pack_start(&col, &renderer, true);
-                    gtk::prelude::CellLayoutExt::add_attribute(&col, &renderer, "text", i as i32);
-                    // Bind hidden fg/bg colour columns to every renderer
-                    gtk::prelude::CellLayoutExt::add_attribute(&col, &renderer, "foreground", n as i32);
-                    gtk::prelude::CellLayoutExt::add_attribute(&col, &renderer, "background", (n + 1) as i32);
-                    col.set_resizable(true);
-                    col.set_expand(i == 0);
+                    let col_idx = i;
+                    let n_data = n;
+                    let factory = gtk::SignalListItemFactory::new();
+                    factory.connect_setup(|_, item| {
+                        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+                        let label = gtk::Label::new(None);
+                        label.set_halign(gtk::Align::Start);
+                        label.set_hexpand(true);
+                        label.set_use_markup(true);
+                        item.set_child(Some(&label));
+                    });
+                    {
+                        let col_i = col_idx;
+                        factory.connect_bind(move |_, item| {
+                            let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+                            let label = item.child().and_downcast::<gtk::Label>().unwrap();
+                            let obj = item.item().and_downcast::<gtk::StringObject>().unwrap();
+                            let full = obj.string();
+                            let parts: Vec<&str> = full.split('|').collect();
+                            let text = parts.get(col_i).copied().unwrap_or("");
+                            // Apply fg/bg via Pango markup
+                            let fg = parts.get(n_data).copied().unwrap_or("");
+                            let bg = parts.get(n_data + 1).copied().unwrap_or("");
+                            let escaped = glib::markup_escape_text(text);
+                            if !fg.is_empty() || !bg.is_empty() {
+                                let mut span = String::from("<span");
+                                if !fg.is_empty() {
+                                    span.push_str(&format!(" foreground=\"{}\"", glib::markup_escape_text(fg)));
+                                }
+                                if !bg.is_empty() {
+                                    span.push_str(&format!(" background=\"{}\"", glib::markup_escape_text(bg)));
+                                }
+                                span.push('>');
+                                span.push_str(&escaped);
+                                span.push_str("</span>");
+                                label.set_markup(&span);
+                            } else {
+                                label.set_text(text);
+                            }
+                        });
+                    }
+                    let column = gtk::ColumnViewColumn::new(Some(name), Some(factory));
+                    column.set_resizable(true);
+                    column.set_expand(i == 0);
                     if let Some(&cw) = col_widths.get(i) {
                         if cw > 0 {
-                            col.set_sizing(gtk::TreeViewColumnSizing::Fixed);
-                            col.set_fixed_width(cw);
+                            column.set_fixed_width(cw);
                         }
                     }
-                    // Column-header click → sort event
+                    // Column-header sort: ColumnViewColumn doesn't have connect_clicked,
+                    // so we send the sort event via a custom header widget with a button.
                     if sortable {
                         let col_name = name.clone();
                         let wid_sort = id.clone();
-                        let tx_sort  = pty_tx.clone();
-                        let dirs     = sort_dirs.clone();
-                        let col_idx  = i;
-                        col.set_clickable(true);
-                        col.connect_clicked(move |c| {
+                        let tx_sort = pty_tx.clone();
+                        let dirs = sort_dirs.clone();
+                        let sort_col_idx = i;
+                        let header_btn = gtk::Button::with_label(name);
+                        header_btn.add_css_class("flat");
+                        header_btn.connect_clicked(move |_btn| {
                             let mut d = dirs.borrow_mut();
-                            let asc = d[col_idx];
-                            d[col_idx] = !asc;
+                            let asc = d[sort_col_idx];
+                            d[sort_col_idx] = !asc;
                             let dir_str = if asc { "asc" } else { "desc" };
-                            c.set_sort_indicator(true);
-                            c.set_sort_order(if asc {
-                                gtk::SortType::Ascending
-                            } else {
-                                gtk::SortType::Descending
-                            });
                             if let Some(ref tx) = tx_sort {
                                 let msg = format!(
                                     "\x1b]1337;WidgetEvent=id:{};action:sort;col:{};dir:{}\x07",
@@ -1664,101 +1685,115 @@ impl TerminalState {
                                 let _ = tx.send(msg.into_bytes());
                             }
                         });
+                        column.set_header_menu(None::<&gio::MenuModel>);
                     }
-                    tv.append_column(&col);
+                    cv.append_column(&column);
                 }
-                self.table_data_cols.insert(id.clone(), n);
-                // Single click = selection changed → action:selected
-                tv.set_activate_on_single_click(false);
-                let wid = id.clone();
-                let tx = pty_tx.clone();
-                let ncols = n;
-                tv.selection().connect_changed(move |sel| {
-                    if let Some((model, iter)) = sel.selected() {
-                        let vals: Vec<String> = (0..ncols)
-                            .filter_map(|i| model.get_value(&iter, i as i32).get::<String>().ok())
-                            .collect();
-                        if let Some(ref tx) = tx {
-                            let msg = format!("\x1b]1337;WidgetEvent=id:{};action:selected;value:{}\x07", wid, vals.join("|"));
-                            let _ = tx.send(msg.into_bytes());
-                        }
+
+                // Action columns with clickable buttons
+                let action_names: Vec<String> = props.get("actions")
+                    .map(|s| s.split('|').map(|a| a.trim().to_string()).collect())
+                    .unwrap_or_default();
+                for act_name in &action_names {
+                    let act = act_name.clone();
+                    let wid_act = id.clone();
+                    let tx_act = pty_tx.clone();
+                    let n_data = n;
+                    let factory = gtk::SignalListItemFactory::new();
+                    let act_label_text = act.clone();
+                    factory.connect_setup(move |_, item| {
+                        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+                        let btn = gtk::Button::with_label(&act_label_text);
+                        btn.add_css_class("flat");
+                        btn.add_css_class("link");
+                        item.set_child(Some(&btn));
+                    });
+                    {
+                        let act_for_bind = act.clone();
+                        let wid_for_bind = wid_act.clone();
+                        let tx_for_bind = tx_act.clone();
+                        factory.connect_bind(move |_, item| {
+                            let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+                            let btn = item.child().and_downcast::<gtk::Button>().unwrap();
+                            let obj = item.item().and_downcast::<gtk::StringObject>().unwrap();
+                            let full = obj.string().to_string();
+                            let pos = item.position();
+                            let act_c = act_for_bind.clone();
+                            let wid_c = wid_for_bind.clone();
+                            let tx_c = tx_for_bind.clone();
+                            let n_d = n_data;
+                            btn.connect_clicked(move |_| {
+                                let parts: Vec<&str> = full.split('|').collect();
+                                let rowid = parts.first().copied().unwrap_or("");
+                                if let Some(ref tx) = tx_c {
+                                    let msg = format!(
+                                        "\x1b]1337;WidgetEvent=id:{};action:row_action;value:{};rowid:{};row:{}\x07",
+                                        wid_c, act_c, rowid, pos
+                                    );
+                                    let _ = tx.send(msg.into_bytes());
+                                }
+                            });
+                            let _ = n_d;
+                        });
                     }
-                });
-                // Double click = row activated → action:activated
-                let wid2 = id.clone();
-                let tx2 = pty_tx.clone();
-                let ncols2 = n;
-                tv.connect_row_activated(move |tv, path, _col| {
-                    if let Some(model) = tv.model() {
-                        if let Some(iter) = model.iter(path) {
-                            let vals: Vec<String> = (0..ncols2)
-                                .filter_map(|i| model.get_value(&iter, i as i32).get::<String>().ok())
-                                .collect();
+                    let column = gtk::ColumnViewColumn::new(Some(&act), Some(factory));
+                    column.set_expand(false);
+                    cv.append_column(&column);
+                }
+
+                self.table_data_cols.insert(id.clone(), n);
+
+                // Selection changed -> action:selected
+                {
+                    let wid = id.clone();
+                    let tx = pty_tx.clone();
+                    let ncols = n;
+                    selection.connect_notify(Some("selected"), move |sel, _| {
+                        let idx = sel.selected();
+                        if idx == gtk::INVALID_LIST_POSITION { return; }
+                        if let Some(obj) = sel.selected_item().and_downcast::<gtk::StringObject>() {
+                            let full = obj.string();
+                            let parts: Vec<&str> = full.split('|').collect();
+                            let vals: Vec<&str> = parts.iter().take(ncols).copied().collect();
+                            if let Some(ref tx) = tx {
+                                let msg = format!("\x1b]1337;WidgetEvent=id:{};action:selected;value:{}\x07", wid, vals.join("|"));
+                                let _ = tx.send(msg.into_bytes());
+                            }
+                        }
+                    });
+                }
+
+                // Double-click -> action:activated
+                {
+                    let wid2 = id.clone();
+                    let tx2 = pty_tx.clone();
+                    let ncols2 = n;
+                    let sel2 = selection.clone();
+                    let gesture = gtk::GestureClick::new();
+                    gesture.set_button(1);
+                    gesture.connect_pressed(move |_, n_press, _, _| {
+                        if n_press != 2 { return; }
+                        if let Some(obj) = sel2.selected_item().and_downcast::<gtk::StringObject>() {
+                            let full = obj.string();
+                            let parts: Vec<&str> = full.split('|').collect();
+                            let vals: Vec<&str> = parts.iter().take(ncols2).copied().collect();
                             if let Some(ref tx) = tx2 {
                                 let msg = format!("\x1b]1337;WidgetEvent=id:{};action:activated;value:{}\x07", wid2, vals.join("|"));
                                 let _ = tx.send(msg.into_bytes());
                             }
                         }
-                    }
-                });
-                // Row action columns — inline click targets, not backed by the model store.
-                // Each renderer has a fixed label set directly; no add_attribute binding is
-                // made so GTK never overwrites the text from the model.
-                let action_names: Vec<String> = props.get("actions")
-                    .map(|s| s.split('|').map(|a| a.trim().to_string()).collect())
-                    .unwrap_or_default();
-                let n_data = n;
-                for act_name in &action_names {
-                    let renderer = gtk::CellRendererText::new();
-                    renderer.set_property("text", act_name.as_str());
-                    renderer.set_property("foreground", "#5599ff");
-                    let col = gtk::TreeViewColumn::new();
-                    gtk::prelude::CellLayoutExt::pack_start(&col, &renderer, false);
-                    col.set_expand(false);
-                    tv.append_column(&col);
-                }
-                if !action_names.is_empty() {
-                    let tv_click = tv.clone();
-                    let wid_click = id.clone();
-                    let tx_click = pty_tx.clone();
-                    let actions_click = action_names.clone();
-                    let gesture = gtk::GestureClick::new();
-                    gesture.connect_pressed(move |_, _, x, y| {
-                        if let Some((Some(path), Some(clicked_col), _, _)) =
-                            tv_click.path_at_pos(x as i32, y as i32)
-                        {
-                            let all_cols = tv_click.columns();
-                            if let Some(col_idx) = all_cols.iter().position(|c| c == &clicked_col) {
-                                if col_idx >= n_data {
-                                    let act = &actions_click[col_idx - n_data];
-                                    let row_idx = path.indices().first().cloned().unwrap_or(0);
-                                    if let Some(model) = tv_click.model() {
-                                        if let Some(iter) = model.iter(&path) {
-                                            let rowid = model.get_value(&iter, 0)
-                                                .get::<String>().unwrap_or_default();
-                                            if let Some(ref tx) = tx_click {
-                                                let msg = format!(
-                                                    "\x1b]1337;WidgetEvent=id:{};action:row_action;value:{};rowid:{};row:{}\x07",
-                                                    wid_click, act, rowid, row_idx
-                                                );
-                                                let _ = tx.send(msg.into_bytes());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
                     });
-                    tv.add_controller(gesture);
+                    cv.add_controller(gesture);
                 }
+
                 let sw = gtk::ScrolledWindow::new();
-                sw.set_child(Some(&tv));
+                sw.set_child(Some(&cv));
                 sw.set_size_request(width, height);
                 sw.set_vexpand(true);
                 sw.set_hexpand(true);
                 sw.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Automatic);
                 self.list_stores.insert(id.clone(), store);
-                self.widgets.insert(id.clone(), tv.clone().upcast());
+                self.widgets.insert(id.clone(), cv.clone().upcast());
                 Some(sw.upcast())
             }
             "splitview" | "paned" => {
@@ -1865,6 +1900,96 @@ impl TerminalState {
                 self.widgets.insert(id.clone(), tv.clone().upcast());
                 Some(sw.upcast())
             }
+            "htmledit" | "htmleditor" => {
+                // html64 = base64-encoded HTML (preferred for complex content with SVG/CSS)
+                // html   = plain HTML (semicolons must be escaped as \;)
+                let html = if let Some(b64) = props.get("html64") {
+                    BASE64.decode(b64.as_bytes()).ok()
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                        .unwrap_or_default()
+                } else {
+                    props.get("html").or_else(|| props.get("text")).cloned().unwrap_or_default()
+                };
+                let width: i32 = props.get("width").and_then(|w| w.parse().ok()).unwrap_or(400);
+                let height: i32 = props.get("height").and_then(|h| h.parse().ok()).unwrap_or(300);
+                let editable: bool = props.get("editable").map(|v| v != "false" && v != "0").unwrap_or(true);
+                let toolbar_vis: bool = props.get("show_toolbar").map(|v| v == "true" || v == "1").unwrap_or(false);
+
+                let editor = std::rc::Rc::new(OHtmlEdit::new());
+                editor.connect_undo_signals();
+                if !html.is_empty() {
+                    editor.set_html(&html);
+                }
+                if !editable {
+                    editor.set_readonly(true);
+                }
+
+                // Build a container: optional toolbar + scrolled editor
+                let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+
+                if toolbar_vis {
+                    let tb = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+                    tb.set_margin_start(2); tb.set_margin_end(2);
+                    tb.set_margin_top(2); tb.set_margin_bottom(2);
+
+                    let btn_bold = gtk::Button::with_label("B");
+                    btn_bold.set_tooltip_text(Some("Bold"));
+                    let btn_italic = gtk::Button::with_label("I");
+                    btn_italic.set_tooltip_text(Some("Italic"));
+                    let btn_underline = gtk::Button::with_label("U");
+                    btn_underline.set_tooltip_text(Some("Underline"));
+                    let btn_undo = gtk::Button::with_label("↶");
+                    btn_undo.set_tooltip_text(Some("Undo"));
+                    let btn_redo = gtk::Button::with_label("↷");
+                    btn_redo.set_tooltip_text(Some("Redo"));
+
+                    tb.append(&btn_bold);
+                    tb.append(&btn_italic);
+                    tb.append(&btn_underline);
+                    tb.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+                    tb.append(&btn_undo);
+                    tb.append(&btn_redo);
+
+                    {
+                        let e = editor.clone();
+                        btn_bold.connect_clicked(move |_| e.toggle_bold());
+                    }
+                    {
+                        let e = editor.clone();
+                        btn_italic.connect_clicked(move |_| e.toggle_italic());
+                    }
+                    {
+                        let e = editor.clone();
+                        btn_underline.connect_clicked(move |_| e.toggle_underline());
+                    }
+                    {
+                        let e = editor.clone();
+                        btn_undo.connect_clicked(move |_| e.undo());
+                    }
+                    {
+                        let e = editor.clone();
+                        btn_redo.connect_clicked(move |_| e.redo());
+                    }
+
+                    outer.append(&tb);
+                }
+
+                let sw = gtk::ScrolledWindow::new();
+                sw.set_child(Some(editor.widget()));
+                sw.set_vexpand(true);
+                sw.set_hexpand(true);
+                outer.append(&sw);
+
+                outer.set_size_request(width, height);
+                outer.set_vexpand(true);
+                outer.set_hexpand(true);
+
+                // Store the editor's inner widget for generic widget lookups and
+                // keep the Rc<OHtmlEdit> so we can call set_html / get_html later.
+                self.widgets.insert(id.clone(), editor.widget().clone());
+                self.htmledit_editors.insert(id.clone(), editor);
+                Some(outer.upcast())
+            }
             "notebook" | "tabs" => {
                 let width: i32 = props.get("width").and_then(|w| w.parse().ok()).unwrap_or(-1);
                 let height: i32 = props.get("height").and_then(|h| h.parse().ok()).unwrap_or(-1);
@@ -1912,7 +2037,6 @@ impl TerminalState {
                         return None; // Already placed inside notebook
                     }
                 }
-                eprintln!("[WIDGET] notebook '{}' not found for tab", nb_id);
                 None
             }
             "close" | "closebutton" => {
@@ -2036,7 +2160,6 @@ impl TerminalState {
                 bx.set_hexpand(true);
                 bx.add_css_class("menubar-box");
                 self.panels.insert(id.clone(), bx.clone());
-                eprintln!("[MENU] created menubar id={}", id);
                 Some(bx.upcast())
             }
             "menu" | "submenu" => {
@@ -2163,7 +2286,6 @@ impl TerminalState {
 
                 self.menu_boxes.insert(id.clone(), inner);
                 self.menu_popovers.insert(id.clone(), popover);
-                eprintln!("[MENU] created menu id={} label={}", id, label);
                 None
             }
             "menuitem" => {
@@ -2219,7 +2341,6 @@ impl TerminalState {
                     menu_box.append(&row);
                 }
                 self.widgets.insert(id.clone(), row.clone().upcast());
-                eprintln!("[MENU] menuitem id={} in menu={}", id, menu_id);
                 None
             }
             "menusep" | "menuseparator" => {
@@ -2229,7 +2350,6 @@ impl TerminalState {
                     sep.add_css_class("menu-sep");
                     menu_box.append(&sep);
                 }
-                eprintln!("[MENU] separator in menu={}", menu_id);
                 None
             }
             "menucheck" | "menutoggle" => {
@@ -2285,7 +2405,6 @@ impl TerminalState {
                     menu_box.append(&row);
                 }
                 self.widgets.insert(id.clone(), row.clone().upcast());
-                eprintln!("[MENU] menucheck id={} in menu={}", id, menu_id);
                 None
             }
             "toolbar" => {
@@ -2300,7 +2419,6 @@ impl TerminalState {
                 bx.set_margin_bottom(2);
                 if width > 0 { bx.set_size_request(width, -1); }
                 self.panels.insert(id.clone(), bx.clone());
-                eprintln!("[TOOLBAR] created toolbar id={}", id);
                 Some(bx.upcast())
             }
             "toolbutton" => {
@@ -2384,7 +2502,6 @@ impl TerminalState {
                 Some(btn.upcast())
             }
             _ => {
-                eprintln!("[WIDGET] unknown type: {}", widget_type);
                 None
             }
         }
@@ -2396,7 +2513,7 @@ impl TerminalState {
         let props = Self::parse_widget_props(spec);
         let widget_type = match props.get("type") {
             Some(t) => t.clone(),
-            None => { eprintln!("[WIDGET] no type specified"); return; }
+            None => return,
         };
         let id = props.get("id").cloned().unwrap_or_else(|| "unnamed".to_string());
         let panel_id = props.get("panel").or(props.get("toolbar")).cloned();
@@ -2455,20 +2572,16 @@ impl TerminalState {
         if let Some(ref pid) = panel_id {
             if let Some(grid) = self.grids.get(pid) {
                 grid.attach(&widget, col, row, colspan, rowspan);
-                eprintln!("[WIDGET] {}(id={}) -> grid {} at row={} col={}", widget_type, id, pid, row, col);
                 return;
             }
             if let Some(fb) = self.flow_panels.get(pid).cloned() {
                 fb.append(&widget);
-                eprintln!("[WIDGET] {}(id={}) -> flowbox {}", widget_type, id, pid);
                 return;
             }
             if let Some(bx) = self.panels.get(pid) {
                 bx.append(&widget);
-                eprintln!("[WIDGET] {}(id={}) -> panel {}", widget_type, id, pid);
                 return;
             }
-            eprintln!("[WIDGET] panel '{}' not found, inserting inline", pid);
         }
 
         // Inline: embed in text buffer via anchor
@@ -2514,7 +2627,6 @@ impl TerminalState {
         } else {
             self.cursor_x += 1;
         }
-        eprintln!("[WIDGET] inserted {}(id={}) inline at ({}, {})", widget_type, id, cx, cy);
     }
 
     /// Update an existing widget's properties.
@@ -2523,17 +2635,75 @@ impl TerminalState {
         let props = Self::parse_widget_props(spec);
         let id = match props.get("id") {
             Some(id) => id.clone(),
-            None => { eprintln!("[UPDATE] no id specified"); return; }
+            None => return,
         };
         // Handle menu action updates (enable/disable, toggle state)
         // (Removed — menu items are now stored as regular widgets below)
 
         let widget = match self.widgets.get(&id) {
             Some(w) => w.clone(),
-            None => { eprintln!("[UPDATE] widget '{}' not found", id); return; }
+            None => return,
         };
 
         // Try each property update
+
+        // HTML editor: handle html= and action= properties
+        if let Some(editor) = self.htmledit_editors.get(&id).cloned() {
+            if let Some(b64) = props.get("html64") {
+                match BASE64.decode(b64.as_bytes()) {
+                    Ok(bytes) => {
+                        if let Ok(html) = String::from_utf8(bytes) {
+                            editor.set_html(&html);
+                        }
+                    }
+                    Err(_) => {}
+                }
+            } else if let Some(html) = props.get("html").or_else(|| props.get("text")) {
+                editor.set_html(html);
+            }
+            if let Some(action) = props.get("action") {
+                match action.as_str() {
+                    "bold"       => editor.toggle_bold(),
+                    "italic"     => editor.toggle_italic(),
+                    "underline"  => editor.toggle_underline(),
+                    "undo"       => editor.undo(),
+                    "redo"       => editor.redo(),
+                    "clear"      => editor.set_html(""),
+                    "align_left"    => editor.align_left(),
+                    "align_center"  => editor.align_center(),
+                    "align_right"   => editor.align_right(),
+                    "align_justify" => editor.align_justify(),
+                    "indent"        => editor.increase_indent(),
+                    "outdent"       => editor.decrease_indent(),
+                    "bullet"        => editor.insert_bullet(),
+                    "numbered"      => editor.insert_numbered_list(),
+                    "hr"            => editor.insert_hr(),
+                    "remove_format" => editor.remove_formatting(),
+                    _ => {}
+                }
+            }
+            if let Some(editable) = props.get("editable") {
+                if editable == "false" || editable == "0" {
+                    editor.set_readonly(true);
+                } else {
+                    editor.set_editable();
+                }
+            }
+            if let Some(color) = props.get("color") {
+                editor.apply_color(color);
+            }
+            if let Some(font) = props.get("font") {
+                editor.apply_font_family(font);
+            }
+            if let Some(font_size) = props.get("font_size") {
+                if let Ok(sz) = font_size.parse::<f64>() {
+                    editor.apply_font_size(sz);
+                }
+            }
+            // Return early for htmledit properties that overlap with generic
+            if props.contains_key("html") || props.contains_key("html64") || props.contains_key("action") { return; }
+        }
+
         if let Some(text) = props.get("text") {
             // parse_widget_props already unescaped \n, \r, \;, \\
             if let Some(lbl) = widget.downcast_ref::<gtk::Label>() {
@@ -2543,7 +2713,10 @@ impl TerminalState {
             } else if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
                 entry.set_text(text);
             } else if let Some(tv) = widget.downcast_ref::<gtk::TextView>() {
-                tv.buffer().set_text(text);
+                // Skip if this is an htmledit widget — handled above
+                if !self.htmledit_editors.contains_key(&id) {
+                    tv.buffer().set_text(text);
+                }
             } else if let Some(pb) = widget.downcast_ref::<gtk::ProgressBar>() {
                 pb.set_text(Some(text));
                 pb.set_show_text(true);
@@ -2699,7 +2872,6 @@ impl TerminalState {
             if let Some(pic) = widget.downcast_ref::<gtk::Picture>() {
                 let file = gtk::gio::File::for_path(path);
                 pic.set_file(Some(&file));
-                eprintln!("[UPDATE] picturebox '{}' set path={}", id, path);
             }
         }
         if let Some(b64) = props.get("data") {
@@ -2712,50 +2884,52 @@ impl TerminalState {
                         let texture = gtk::gdk::Texture::for_pixbuf(&pixbuf);
                         pic.set_paintable(Some(&texture));
                     }
-                    eprintln!("[UPDATE] picturebox '{}' set from base64 ({} bytes)", id, bytes.len());
                 }
             }
         }
-        // TreeView / ListView row operations
+        // Tree / Table row operations (gio::ListStore + ColumnView/ListView)
         if let Some(action) = props.get("action").map(|s| s.as_str()) {
             match action {
                 "clear" => {
-                    if let Some(ts) = self.tree_stores.get(&id).cloned() {
-                        ts.clear();
-                        self.tree_row_iters.remove(&id);
-                    } else if let Some(ls) = self.list_stores.get(&id).cloned() {
-                        ls.clear();
+                    if let Some(ts) = self.tree_stores.get(&id) {
+                        ts.remove_all();
+                        // Also clear all child stores
+                        if let Some(cs) = self.tree_child_stores.get(&id) {
+                            cs.borrow_mut().clear();
+                        }
+                    } else if let Some(ls) = self.list_stores.get(&id) {
+                        ls.remove_all();
                     }
                 }
                 "addrow" => {
                     if let Some(ts) = self.tree_stores.get(&id).cloned() {
                         let label = props.get("label").cloned().unwrap_or_default();
-                        let row_id = props.get("rowid").cloned().unwrap_or_else(|| label.clone());
                         let parent_row_id = props.get("parent").cloned();
-                        let parent_iter = parent_row_id.as_ref().and_then(|pid| {
-                            self.tree_row_iters.get(&id).and_then(|m| m.get(pid)).cloned()
-                        });
-                        let iter = ts.append(parent_iter.as_ref());
-                        ts.set_value(&iter, 0, &label.to_value());
-                        self.tree_row_iters
-                            .entry(id.clone())
-                            .or_insert_with(std::collections::HashMap::new)
-                            .insert(row_id, iter);
+                        if let Some(cs_map) = self.tree_child_stores.get(&id) {
+                            if let Some(parent_id) = parent_row_id {
+                                // Add as child of an existing node
+                                let mut cs = cs_map.borrow_mut();
+                                let child_store = cs.entry(parent_id).or_insert_with(|| {
+                                    gio::ListStore::new::<gtk::StringObject>()
+                                });
+                                child_store.append(&gtk::StringObject::new(&label));
+                            } else {
+                                // Add to root
+                                ts.append(&gtk::StringObject::new(&label));
+                            }
+                        }
                     } else if let Some(ls) = self.list_stores.get(&id).cloned() {
                         if let Some(cols_str) = props.get("cols") {
                             let vals: Vec<&str> = cols_str.split('|').collect();
-                            let iter = ls.append();
-                            for (i, val) in vals.iter().enumerate() {
-                                ls.set_value(&iter, i as u32, &val.to_value());
-                            }
-                            // Optional per-row foreground/background colours
                             let n_data = self.table_data_cols.get(&id).copied().unwrap_or(vals.len());
-                            if let Some(fg) = props.get("fg") {
-                                ls.set_value(&iter, n_data as u32, &fg.to_value());
-                            }
-                            if let Some(bg) = props.get("bg") {
-                                ls.set_value(&iter, (n_data + 1) as u32, &bg.to_value());
-                            }
+                            let fg = props.get("fg").map(|s| s.as_str()).unwrap_or("");
+                            let bg = props.get("bg").map(|s| s.as_str()).unwrap_or("");
+                            // Build pipe-delimited: data cols (padded to n_data) + fg + bg
+                            let mut full_parts: Vec<String> = vals.iter().map(|s| s.to_string()).collect();
+                            while full_parts.len() < n_data { full_parts.push(String::new()); }
+                            full_parts.push(fg.to_string());
+                            full_parts.push(bg.to_string());
+                            ls.append(&gtk::StringObject::new(&full_parts.join("|")));
                         }
                     }
                 }
@@ -2763,23 +2937,41 @@ impl TerminalState {
                 "rowcolor" => {
                     if let Some(ls) = self.list_stores.get(&id).cloned() {
                         if let Some(row_str) = props.get("row") {
-                            if let Ok(row_idx) = row_str.parse::<i32>() {
-                                if let Some(iter) = ls.iter_nth_child(None, row_idx) {
+                            if let Ok(row_idx) = row_str.parse::<u32>() {
+                                if let Some(obj) = ls.item(row_idx).and_then(|o| o.downcast::<gtk::StringObject>().ok()) {
                                     let n_data = self.table_data_cols.get(&id).copied().unwrap_or(0);
+                                    let full = obj.string().to_string();
+                                    let mut parts: Vec<String> = full.split('|').map(|s| s.to_string()).collect();
+                                    // Ensure we have enough slots for fg and bg
+                                    while parts.len() < n_data + 2 { parts.push(String::new()); }
                                     if let Some(fg) = props.get("fg") {
-                                        ls.set_value(&iter, n_data as u32, &fg.to_value());
+                                        parts[n_data] = fg.clone();
                                     }
                                     if let Some(bg) = props.get("bg") {
-                                        ls.set_value(&iter, (n_data + 1) as u32, &bg.to_value());
+                                        parts[n_data + 1] = bg.clone();
                                     }
+                                    // Replace the item: remove old, insert new at same position
+                                    ls.remove(row_idx);
+                                    ls.insert(row_idx, &gtk::StringObject::new(&parts.join("|")));
                                 }
                             }
                         }
                     }
                 }
                 "expand_all" => {
-                    if let Some(tv) = widget.downcast_ref::<gtk::TreeView>() {
-                        tv.expand_all();
+                    // For TreeListModel-based ListView: get the model chain and expand all rows
+                    if let Some(lv) = widget.downcast_ref::<gtk::ListView>() {
+                        if let Some(sel) = lv.model() {
+                            if let Some(single_sel) = sel.downcast_ref::<gtk::SingleSelection>() {
+                                if let Some(tree_model) = single_sel.model().and_then(|m| m.downcast::<gtk::TreeListModel>().ok()) {
+                                    for i in 0..tree_model.n_items() {
+                                        if let Some(row) = tree_model.row(i) {
+                                            row.set_expanded(true);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -2813,31 +3005,22 @@ impl TerminalState {
                 }
             }
         }
-        eprintln!("[UPDATE] widget '{}' updated", id);
     }
 
     pub fn insert_image(&mut self, data: Vec<u8>) {
-        eprintln!("[IMG] insert_image called with {} bytes", data.len());
-        if data.len() >= 4 {
-            eprintln!("[IMG] first 4 bytes: {:02x} {:02x} {:02x} {:02x}",
-                data[0], data[1], data[2], data[3]);
-        }
         if let Some(_tv) = self.view.upgrade() {
             let pixbuf_loader = gtk::gdk_pixbuf::PixbufLoader::new();
-            if let Err(e) = pixbuf_loader.write(&data) {
-                eprintln!("[IMG] pixbuf_loader.write failed: {}", e);
+            if pixbuf_loader.write(&data).is_err() {
                 return;
             }
-            if let Err(e) = pixbuf_loader.close() {
-                eprintln!("[IMG] pixbuf_loader.close failed: {}", e);
+            if pixbuf_loader.close().is_err() {
                 return;
             }
             match pixbuf_loader.pixbuf() {
-                None => eprintln!("[IMG] pixbuf_loader.pixbuf() returned None"),
+                None => return,
                 Some(pixbuf) => {
-                    let img_w = pixbuf.width();
-                    let img_h = pixbuf.height();
-                    eprintln!("[IMG] pixbuf loaded: {}x{}", img_w, img_h);
+                    let _img_w = pixbuf.width();
+                    let _img_h = pixbuf.height();
                     let buffer = self.active_buffer();
                     let cx = if self.is_alternate { self.alt_cursor_x } else { self.cursor_x };
                     let cy = if self.is_alternate { self.alt_cursor_y } else { self.cursor_y };
@@ -2849,11 +3032,8 @@ impl TerminalState {
 
                     // advance cursor past the paintable character
                     if self.is_alternate { self.alt_cursor_x += 1; } else { self.cursor_x += 1; }
-                    eprintln!("[IMG] paintable inserted at cursor ({}, {}), texture {}x{}", cx, cy, img_w, img_h);
                 }
             }
-        } else {
-            eprintln!("[IMG] view WeakRef was dead");
         }
     }
 
@@ -2918,7 +3098,6 @@ impl TerminalState {
         if visible {
             win.present();
         }
-        eprintln!("[WINDOW] created '{}' {}x{} modal={} visible={}", id, width, height, modal, visible);
     }
 
     /// Update a named floating window.
@@ -2938,7 +3117,7 @@ impl TerminalState {
 
         let win = match self.windows.get(&id) {
             Some(w) => w.clone(),
-            None => { eprintln!("[WINDOW] update: '{}' not found", id); return; }
+            None => return,
         };
 
         if let Some(vis) = props.get("visible") {
@@ -2958,7 +3137,6 @@ impl TerminalState {
             let h = props.get("height").and_then(|v| v.parse::<i32>().ok()).unwrap_or(-1);
             win.set_default_size(w, h);
         }
-        eprintln!("[WINDOW] updated '{}'", id);
     }
 
     /// Show a modal alert dialog.  spec = "title:Foo;body:Bar;ok:OK"
@@ -3417,9 +3595,6 @@ impl Perform for TerminalState {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        eprintln!("[OSC] osc_dispatch called, {} params, p[0]={:?}",
-            params.len(),
-            params.first().and_then(|p| std::str::from_utf8(p).ok()));
         if params.len() >= 2 {
             if params[0] == b"0" || params[0] == b"1" || params[0] == b"2" {
                 // Rejoin for title too — title might contain semicolons
@@ -3449,26 +3624,19 @@ impl Perform for TerminalState {
                 };
 
                 if let Some(spec) = payload.strip_prefix("Window=") {
-                    eprintln!("[WINDOW] OSC 1337 Window spec: {}", spec);
                     self.create_wm_window(spec);
                 } else if let Some(spec) = payload.strip_prefix("WindowUpdate=") {
-                    eprintln!("[WINDOW] OSC 1337 WindowUpdate spec: {}", spec);
                     self.update_wm_window(spec);
                 } else if let Some(url) = payload.strip_prefix("OpenURL=") {
                     let url = url.trim().to_string();
-                    eprintln!("[URL] Opening: {}", url);
-                    if let Err(e) = gio::AppInfo::launch_default_for_uri(&url, None::<&gio::AppLaunchContext>) {
-                        eprintln!("[URL] launch_default_for_uri error: {}", e);
-                    }
+                    let _ = gio::AppInfo::launch_default_for_uri(&url, None::<&gio::AppLaunchContext>);
                 } else if let Some(spec) = payload.strip_prefix("FileDialog=") {
-                    eprintln!("[FILE] FileDialog spec: {}", spec);
                     self.show_file_dialog(spec);
                 } else if let Some(spec) = payload.strip_prefix("Notify=") {
                     let props = Self::parse_widget_props(spec);
                     let title = props.get("title").cloned().unwrap_or_else(|| "Notification".into());
                     let body  = props.get("body").cloned().unwrap_or_default();
                     let nid   = props.get("id").cloned().unwrap_or_else(|| "notif".into());
-                    eprintln!("[NOTIFY] title={} body={}", title, body);
                     if let Some(app) = gio::Application::default() {
                         let notif = gio::Notification::new(&title);
                         if !body.is_empty() { notif.set_body(Some(&body)); }
@@ -3484,40 +3652,25 @@ impl Perform for TerminalState {
                             .arg(&title).arg(&body).spawn(); }
                     }
                 } else if let Some(spec) = payload.strip_prefix("Panel=") {
-                    eprintln!("[PANEL] OSC 1337 Panel spec: {}", spec);
                     self.insert_panel(spec);
                 } else if let Some(spec) = payload.strip_prefix("Alert=") {
-                    eprintln!("[ALERT] OSC 1337 Alert spec: {}", spec);
                     self.show_alert(spec);
                 } else if let Some(spec) = payload.strip_prefix("Toast=") {
-                    eprintln!("[TOAST] OSC 1337 Toast spec: {}", spec);
                     self.show_toast(spec);
                 } else if let Some(spec) = payload.strip_prefix("Confirm=") {
-                    eprintln!("[CONFIRM] OSC 1337 Confirm spec: {}", spec);
                     self.show_confirm(spec);
                 } else if let Some(spec) = payload.strip_prefix("Widget=") {
-                    eprintln!("[WIDGET] OSC 1337 Widget spec: {}", spec);
                     self.insert_widget(spec);
                 } else if let Some(spec) = payload.strip_prefix("WidgetUpdate=") {
-                    eprintln!("[UPDATE] OSC 1337 WidgetUpdate spec: {}", spec);
                     self.update_widget(spec);
                 } else if let Some(spec) = payload.strip_prefix("GetWidgetValue=") {
-                    eprintln!("[GET] OSC 1337 GetWidgetValue spec: {}", spec);
                     self.get_widget_value(spec);
                 } else if payload.starts_with("File=") {
-                    eprintln!("[IMG] OSC 1337 received, payload len={}", payload.len());
                     if let Some(colon_pos) = payload.find(':') {
                         let b64 = &payload.as_bytes()[colon_pos + 1..];
-                        eprintln!("[IMG] base64 slice len={}", b64.len());
-                        match BASE64.decode(b64) {
-                            Ok(data) => {
-                                eprintln!("[IMG] decoded {} bytes, calling insert_image", data.len());
-                                self.insert_image(data);
-                            }
-                            Err(e) => eprintln!("[IMG] base64 decode error: {}", e),
+                        if let Ok(data) = BASE64.decode(b64) {
+                            self.insert_image(data);
                         }
-                    } else {
-                        eprintln!("[IMG] no colon found in File= payload");
                     }
                 }
             } else if params[0] == b"108" {
