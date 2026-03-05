@@ -61,11 +61,11 @@ fn view_content_height(view: &gtk::TextView) -> i32 {
 // ── Thread-local for table cell → editor communication ────────────────────
 
 thread_local! {
-    static TABLE_EDITOR_WEAK: RefCell<Option<std::rc::Weak<crate::NativeHtmlEditor>>> =
+    static TABLE_EDITOR_WEAK: RefCell<Option<std::rc::Weak<crate::OHtmlEdit>>> =
         const { RefCell::new(None) };
 }
 
-pub(crate) fn set_table_editor(editor: Option<std::rc::Weak<crate::NativeHtmlEditor>>) {
+pub(crate) fn set_table_editor(editor: Option<std::rc::Weak<crate::OHtmlEdit>>) {
     TABLE_EDITOR_WEAK.with(|e| *e.borrow_mut() = editor);
 }
 
@@ -134,7 +134,7 @@ fn resolve_background_image(bg_value: &str) -> String {
                         }
                         h
                     };
-                    let path = format!("{}/ghtmleditor_bg_{:x}.{}", std::env::temp_dir().display(), hash, ext);
+                    let path = format!("{}/gOHtmlEditor_bg_{:x}.{}", std::env::temp_dir().display(), hash, ext);
                     if std::fs::write(&path, &body).is_ok() {
                         BG_IMAGE_CACHE.with(|c| c.borrow_mut().insert(url.to_string(), path.clone()));
                         return format!("url('file://{}')", path);

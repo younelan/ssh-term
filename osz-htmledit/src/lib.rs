@@ -90,9 +90,9 @@ impl UndoManager {
     }
 }
 
-// ── NativeHtmlEditor ───────────────────────────────────────────────────────
+// ── OHtmlEdit ───────────────────────────────────────────────────────
 
-pub struct NativeHtmlEditor {
+pub struct OHtmlEdit {
     view: gtk::TextView,
     /// Per-editor store mapping css_* tag names → original CSS strings for serialization.
     css_rules_store: RefCell<HashMap<String, String>>,
@@ -123,12 +123,12 @@ pub struct NativeHtmlEditor {
     /// Resolver for cid: image references in HTML emails.
     cid_resolver: RefCell<Option<std::rc::Rc<dyn Fn(&str) -> Option<Vec<u8>>>>>,
     /// Weak self-reference for thread-local callbacks (e.g. table cell right-click).
-    self_weak: RefCell<Option<std::rc::Weak<NativeHtmlEditor>>>,
+    self_weak: RefCell<Option<std::rc::Weak<OHtmlEdit>>>,
     /// Captured `<body>` attributes for round-trip serialization.
     body_attrs: RefCell<parser::BodyAttrs>,
 }
 
-impl NativeHtmlEditor {
+impl OHtmlEdit {
     pub fn new() -> Self {
         let view = gtk::TextView::new();
         view.set_wrap_mode(gtk::WrapMode::Word);
@@ -2958,7 +2958,7 @@ enum TableOp {
     DeleteCol,
 }
 
-impl Default for NativeHtmlEditor {
+impl Default for OHtmlEdit {
     fn default() -> Self {
         Self::new()
     }

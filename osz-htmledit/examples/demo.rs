@@ -1,13 +1,13 @@
 use gtk4 as gtk;
 use gtk::prelude::*;
 use gtk::{Application, ApplicationWindow, Box, Button, Orientation, ScrolledWindow, TextView, Image};
-use gtk4_htmleditor::NativeHtmlEditor;
+use osz_htmledit::OHtmlEdit;
 use std::cell::Cell;
 use std::rc::Rc;
 
 fn main() {
     let app = Application::builder()
-        .application_id("org.example.NativeHtmlEditorDemo")
+        .application_id("org.example.OHtmlEditDemo")
         .build();
 
     app.connect_activate(build_ui);
@@ -17,7 +17,7 @@ fn main() {
 fn build_ui(app: &Application) {
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("Native GTK HTML Editor Demo")
+        .title("OSZ HTML Editor Demo")
         .default_width(600)
         .default_height(500)
         .build();
@@ -28,7 +28,7 @@ fn build_ui(app: &Application) {
     vbox.set_margin_top(12);
     vbox.set_margin_bottom(12);
 
-    let editor = Rc::new(NativeHtmlEditor::new());
+    let editor = Rc::new(OHtmlEdit::new());
     editor.connect_undo_signals();
 
     // Toolbar
